@@ -6,16 +6,17 @@ import { drawMasks, drawPoints } from '../../utils/maskUtils'
 interface Props {
   width: number
   height: number
+  videoRef: React.RefObject<HTMLVideoElement>
 }
 
-export default function AnnotationCanvas({ width, height }: Props) {
+export default function AnnotationCanvas({ width, height, videoRef }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const store = useStore()
   const video = selectCurrentVideo(store)
 
   const {
     project, currentVideoId,
-    currentFrame, currentObjectId, pointMode,
+    currentFrame, setCurrentFrame, currentObjectId, pointMode,
     localAnnotations, addLocalPoint,
     currentFrameMasks, currentFrameMasksFrame, setCurrentFrameMasks,
     savedMaskCache, setSavedMask,
@@ -85,6 +86,20 @@ export default function AnnotationCanvas({ width, height }: Props) {
     const canvas = canvasRef.current
     if (!canvas) return
 
+    // Compute the true frame number from the video element's actual currentTime
+    // at the moment of click, to avoid drift between store.currentFrame and what
+    // the user sees on screen.
+    const videoEl = videoRef.current
+    const fps = video.fps || 30
+    const trueFrame = videoEl
+      ? Math.floor(videoEl.currentTime * fps)
+      : currentFrame
+
+    // Sync the store so the HUD and mask rendering use the same frame
+    if (trueFrame !== currentFrame) {
+      setCurrentFrame(trueFrame)
+    }
+
     const rect = canvas.getBoundingClientRect()
     const scaleX = width / rect.width
     const scaleY = height / rect.height
@@ -94,30 +109,30 @@ export default function AnnotationCanvas({ width, height }: Props) {
     const ny = py / height
     const label: 0 | 1 = pointMode === 'add' ? 1 : 0
 
-    // Add to local state
-    addLocalPoint(currentObjectId, currentFrame, nx, ny, label)
+    // Add to local state (use trueFrame so points line up)
+    addLocalPoint(currentObjectId, trueFrame, nx, ny, label)
 
     // Get all accumulated points for this object on this frame
-    const framePts = useStore.getState().localAnnotations[currentObjectId]?.[String(currentFrame)]
+    const framePts = useStore.getState().localAnnotations[currentObjectId]?.[String(trueFrame)]
     const allPoints: [number, number][] = framePts ? framePts.points.map(p => [p.x, p.y]) : [[nx, ny]]
     const allLabels = framePts ? framePts.points.map(p => p.label as number) : [label]
 
     try {
       // Extract this single frame on the backend (into annotated_frames/)
       // so the SAM session can be initialized with just this frame.
-      await extractFrame(pid, vid, currentFrame)
+      await extractFrame(pid, vid, trueFrame)
 
-      const result = await addPoints(pid, vid, currentObjectId, currentFrame, allPoints, allLabels)
+      const result = await addPoints(pid, vid, currentObjectId, trueFrame, allPoints, allLabels)
       if (result.masks) {
         // Read latest state after async call — only merge masks from the same frame
         const state = useStore.getState()
-        const prevMasks = state.currentFrameMasksFrame === currentFrame ? state.currentFrameMasks : {}
-        setCurrentFrameMasks({ ...prevMasks, ...result.masks }, currentFrame)
+        const prevMasks = state.currentFrameMasksFrame === trueFrame ? state.currentFrameMasks : {}
+        setCurrentFrameMasks({ ...prevMasks, ...result.masks }, trueFrame)
       }
     } catch (err) {
       console.error('Failed to add point:', err)
     }
-  }, [pointMode, currentObjectId, video, currentFrame, width, height, pid, vid, addLocalPoint, setCurrentFrameMasks])
+  }, [pointMode, currentObjectId, video, currentFrame, width, height, pid, vid, addLocalPoint, setCurrentFrameMasks, setCurrentFrame, videoRef])
 
   const cursor = pointMode ? 'crosshair' : 'default'
 

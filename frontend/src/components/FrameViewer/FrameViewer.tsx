@@ -96,13 +96,24 @@ export default function FrameViewer() {
   const onTimeUpdate = useCallback(() => {
     const el = videoRef.current
     if (!el) return
-    const frame = Math.round(el.currentTime * fpsRef.current)
+    const frame = Math.floor(el.currentTime * fpsRef.current)
     videoIsDriving.current = true
     setCurrentFrame(frame)
     requestAnimationFrame(() => { videoIsDriving.current = false })
   }, [setCurrentFrame])
 
   const onEnded = useCallback(() => setPlaying(false), [setPlaying])
+
+  // After a programmatic seek completes, sync the store frame to the exact
+  // time the browser actually decoded (may differ slightly from request).
+  const onSeeked = useCallback(() => {
+    const el = videoRef.current
+    if (!el || isPlaying) return
+    const frame = Math.floor(el.currentTime * fpsRef.current)
+    videoIsDriving.current = true
+    setCurrentFrame(frame)
+    requestAnimationFrame(() => { videoIsDriving.current = false })
+  }, [setCurrentFrame, isPlaying])
 
   const onError = useCallback((e: React.SyntheticEvent<HTMLVideoElement>) => {
     const el = e.currentTarget
@@ -169,6 +180,7 @@ export default function FrameViewer() {
             playsInline
             preload="auto"
             onTimeUpdate={onTimeUpdate}
+            onSeeked={onSeeked}
             onEnded={onEnded}
             onError={onError}
           >
@@ -176,7 +188,7 @@ export default function FrameViewer() {
           </video>
 
           {/* Layer 2: Annotation canvas */}
-          <AnnotationCanvas width={dimensions.width} height={dimensions.height} />
+          <AnnotationCanvas width={dimensions.width} height={dimensions.height} videoRef={videoRef} />
         </div>
       )}
 

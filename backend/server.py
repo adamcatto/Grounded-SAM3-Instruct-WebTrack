@@ -538,17 +538,54 @@ def add_points(pid: str, vid: str, oid: str, req: AddPointsRequest):
     if video is None:
         raise HTTPException(404, "Video not found")
 
-    # Ensure SAM session exists (auto-init from annotated_frames dir)
+    # Ensure SAM session exists and includes the requested frame.
+    # The annotated_frames dir accumulates frames on demand, so whenever
+    # the user annotates a new frame we must re-init the session so SAM
+    # picks up the newly extracted JPG.
+    ann_dir = str(pm.annotated_frames_dir(pid, vid))
+    if not Path(ann_dir).exists() or not list(Path(ann_dir).glob("*.jpg")):
+        raise HTTPException(400, "No annotated frames extracted yet. Extract a frame first.")
+
     session_id = sam.get_session_id(pid, vid)
-    if session_id is None:
-        ann_dir = str(pm.annotated_frames_dir(pid, vid))
-        if not Path(ann_dir).exists() or not list(Path(ann_dir).glob("*.jpg")):
-            raise HTTPException(400, "No annotated frames extracted yet. Extract a frame first.")
+    need_reinit = session_id is None
+
+    if not need_reinit:
+        # Check whether the requested frame is already loaded in the session
+        frame_map = sam._frame_maps.get((pid, vid), [])
+        if req.frame_idx not in frame_map:
+            need_reinit = True
+            logger.info(
+                f"Frame {req.frame_idx} not in current session "
+                f"(loaded: {frame_map}), re-initializing..."
+            )
+
+    if need_reinit:
         try:
             session_id = sam.init_session(pid, vid, ann_dir)
             pm.update_video(pid, vid, {"sam3_session_id": session_id})
         except Exception as e:
             raise HTTPException(500, f"SAM session init failed: {e}")
+
+        # Replay all previously saved point prompts so SAM knows about
+        # every object that was annotated on earlier frames.
+        all_prompts = pm.get_all_point_prompts(pid, vid)
+        frame_map = sam._frame_maps.get((pid, vid), [])
+        for obj_id_str, frame_map_prompts in all_prompts.items():
+            for fidx_str, prompt in frame_map_prompts.items():
+                replay_fidx = int(fidx_str)
+                # Only replay prompts whose frame is in the current session
+                if replay_fidx in frame_map:
+                    try:
+                        sam.add_points(
+                            pid, vid,
+                            frame_idx=replay_fidx,
+                            obj_id=int(obj_id_str),
+                            points=prompt["points"],
+                            labels=prompt["labels"],
+                        )
+                        logger.debug(f"Replayed prompts for obj {obj_id_str} on frame {replay_fidx}")
+                    except Exception as e:
+                        logger.warning(f"Failed to replay prompts for obj {obj_id_str} frame {replay_fidx}: {e}")
 
     # Save prompts to config
     pm.save_point_prompts(pid, vid, oid, req.frame_idx, req.points, req.labels)
