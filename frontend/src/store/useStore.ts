@@ -4,6 +4,7 @@ import type { Project, VideoMeta, ObjectDef, MaskData } from '../types'
 export type PointMode = 'add' | 'remove' | null
 export type PropagationStatus = 'idle' | 'running' | 'done' | 'error'
 export type AppStep = 'upload' | 'annotate' | 'review'
+export type ViewerTab = 'annotate' | 'player'
 
 interface LocalAnnotation {
   points: { x: number; y: number; label: 0 | 1 }[]
@@ -35,6 +36,7 @@ interface AppState {
   propagationStartFrame: number
 
   // UI
+  viewerTab: ViewerTab
   drawerOpen: boolean
   uploadModalOpen: boolean
   sessionInitialized: boolean
@@ -54,6 +56,7 @@ interface AppState {
   setPropagationProgress: (p: number, frame: number) => void
   setDrawerOpen: (v: boolean) => void
   setUploadModalOpen: (v: boolean) => void
+  setViewerTab: (tab: ViewerTab) => void
   setSessionInitialized: (v: boolean) => void
   setPropagationStartFrame: (f: number) => void
   updateVideo: (updates: Partial<VideoMeta>) => void
@@ -77,6 +80,7 @@ export const useStore = create<AppState>((set, get) => ({
   propagationStartFrame: 0,
   drawerOpen: false,
   uploadModalOpen: false,
+  viewerTab: 'annotate' as ViewerTab,
   sessionInitialized: false,
 
   setProject: p => set({ project: p }),
@@ -143,6 +147,7 @@ export const useStore = create<AppState>((set, get) => ({
 
   setDrawerOpen: v => set({ drawerOpen: v }),
   setUploadModalOpen: v => set({ uploadModalOpen: v }),
+  setViewerTab: tab => set({ viewerTab: tab }),
   setSessionInitialized: v => set({ sessionInitialized: v }),
   setPropagationStartFrame: f => set({ propagationStartFrame: f }),
 

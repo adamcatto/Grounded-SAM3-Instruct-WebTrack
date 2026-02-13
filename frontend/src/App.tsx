@@ -1,20 +1,44 @@
 import React, { useEffect, useState, useCallback } from 'react'
 import { useStore, currentVideo as selectCurrentVideo } from './store/useStore'
+import type { ViewerTab } from './store/useStore'
 import { listProjects } from './api/client'
+import { Crosshair, PlayCircle } from 'lucide-react'
 import Header from './components/Header'
 import ProjectDrawer from './components/ProjectDrawer'
 import UploadModal from './components/UploadModal'
 import LeftPanel from './components/LeftPanel/LeftPanel'
 import FrameViewer from './components/FrameViewer/FrameViewer'
+import VideoPlayer from './components/VideoPlayer/VideoPlayer'
 import Timeline from './components/Timeline/Timeline'
 import LoadingScreen from './components/LoadingScreen'
+
+function TabButton({ active, icon, label, onClick }: {
+  active: boolean
+  icon: React.ReactNode
+  label: string
+  onClick: () => void
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={`flex items-center gap-1.5 px-3 py-1 rounded-md text-xs font-medium transition-colors ${
+        active
+          ? 'bg-[#2a2a2a] text-white'
+          : 'text-[#888] hover:text-white hover:bg-[#1a1a1a]'
+      }`}
+    >
+      {icon}
+      {label}
+    </button>
+  )
+}
 
 export default function App() {
   const store = useStore()
   const video = selectCurrentVideo(store)
   const {
-    project, currentVideoId,
-    setProject, setCurrentVideo, setUploadModalOpen, setDrawerOpen,
+    project, currentVideoId, viewerTab,
+    setProject, setCurrentVideo, setUploadModalOpen, setDrawerOpen, setViewerTab,
   } = store
 
   const [backendReady, setBackendReady] = useState(false)
@@ -59,13 +83,31 @@ export default function App() {
           <LeftPanel />
         </div>
 
-        {/* Right: frame viewer + timeline stacked */}
+        {/* Right: tab bar + viewer + timeline stacked */}
         <div className="flex-1 flex flex-col overflow-hidden">
-          {/* Frame viewer (grows to fill) */}
-          <FrameViewer />
+          {/* Tab bar */}
+          {video && (
+            <div className="flex-shrink-0 flex items-center gap-1 px-3 py-1.5 bg-[#111111] border-b border-[#1e1e1e]">
+              <TabButton
+                active={viewerTab === 'annotate'}
+                icon={<Crosshair size={14} />}
+                label="Annotate"
+                onClick={() => setViewerTab('annotate')}
+              />
+              <TabButton
+                active={viewerTab === 'player'}
+                icon={<PlayCircle size={14} />}
+                label="Player"
+                onClick={() => setViewerTab('player')}
+              />
+            </div>
+          )}
+
+          {/* Viewer (grows to fill) */}
+          {viewerTab === 'annotate' ? <FrameViewer /> : <VideoPlayer />}
 
           {/* Timeline (fixed height at bottom) */}
-          {video && (
+          {video && viewerTab === 'annotate' && (
             <div className="flex-shrink-0">
               <Timeline />
             </div>
