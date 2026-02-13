@@ -1,0 +1,290 @@
+import React, { useState } from 'react'
+import { Plus, RotateCcw, ChevronRight, Loader } from 'lucide-react'
+import { useStore, currentVideo as selectCurrentVideo } from '../../store/useStore'
+import { addObject, initSession, startPropagationSSE, getProject } from '../../api/client'
+import { getObjectColor } from '../../utils/colors'
+import ObjectCard from './ObjectCard'
+import StepIndicator from './StepIndicator'
+import type { PropagationEvent } from '../../types'
+
+export default function LeftPanel() {
+  const store = useStore()
+  const video = selectCurrentVideo(store)
+  const {
+    project, currentVideoId,
+    currentObjectId, setCurrentObject,
+    propagationStatus, setPropagationStatus, setPropagationProgress,
+    sessionInitialized, setSessionInitialized,
+    setDrawerOpen, resetVideoState, updateVideo,
+    setProject, setSavedMask,
+  } = store
+
+  const [addingObject, setAddingObject] = useState(false)
+  const [newObjName, setNewObjName] = useState('')
+  const [initializingSession, setInitializingSession] = useState(false)
+  const [trackingError, setTrackingError] = useState('')
+  const [batchStatus, setBatchStatus] = useState('')
+
+  const objects = video ? Object.values(video.objects) : []
+  const pid = project?.id ?? ''
+  const vid = currentVideoId ?? ''
+
+  // ── Add Object ──────────────────────────────────────────────────────────────
+
+  async function handleAddObject() {
+    if (!newObjName.trim()) return
+    const idx = objects.length
+    const color = getObjectColor(idx)
+    const obj = await addObject(pid, vid, newObjName.trim(), color)
+    updateVideo({
+      objects: {
+        ...(video?.objects ?? {}),
+        [obj.id]: obj,
+      },
+    })
+    setCurrentObject(obj.id)
+    setNewObjName('')
+    setAddingObject(false)
+
+    // Auto-init session if not done
+    if (!sessionInitialized) {
+      await handleInitSession()
+    }
+  }
+
+  // ── Init Session ─────────────────────────────────────────────────────────────
+
+  async function handleInitSession() {
+    setInitializingSession(true)
+    try {
+      await initSession(pid, vid)
+      setSessionInitialized(true)
+    } catch (e: unknown) {
+      console.error('Session init failed:', e)
+    } finally {
+      setInitializingSession(false)
+    }
+  }
+
+  // ── Track Objects ─────────────────────────────────────────────────────────────
+
+  async function handleTrack() {
+    setTrackingError('')
+    if (!sessionInitialized) {
+      try {
+        await handleInitSession()
+      } catch {
+        setTrackingError('Failed to initialize SAM session')
+        return
+      }
+    }
+
+    setPropagationStatus('running')
+    setBatchStatus('')
+
+    const es = startPropagationSSE(pid, vid)
+    es.addEventListener('batch_start', (e: MessageEvent) => {
+      const data: PropagationEvent = JSON.parse(e.data)
+      if (data.status === 'extracting') {
+        setBatchStatus(`Extracting frames (batch ${(data.batch ?? 0) + 1}/${data.total_batches ?? '?'})...`)
+      }
+    })
+    es.addEventListener('progress', (e: MessageEvent) => {
+      const data: PropagationEvent = JSON.parse(e.data)
+      setPropagationProgress(data.progress, data.frame)
+      setBatchStatus('')
+    })
+    es.addEventListener('done', async (e: MessageEvent) => {
+      const data: PropagationEvent = JSON.parse(e.data)
+      setPropagationStatus('done')
+      setPropagationProgress(1, data.frame ?? 0)
+      es.close()
+      // Refresh project to get updated propagated_frames
+      const fresh = await getProject(pid)
+      setProject(fresh)
+    })
+    es.addEventListener('error', (e: Event) => {
+      try {
+        const data = JSON.parse((e as MessageEvent).data ?? '{}')
+        setTrackingError(data.error ?? 'Propagation failed')
+      } catch {
+        setTrackingError('Propagation error')
+      }
+      setPropagationStatus('error')
+      es.close()
+    })
+    es.onerror = () => {
+      const status = useStore.getState().propagationStatus
+      if (status !== 'done') {
+        setPropagationStatus('error')
+        setTrackingError('Connection lost during propagation')
+        es.close()
+      }
+    }
+  }
+
+  // ── Start Over ────────────────────────────────────────────────────────────────
+
+  function handleStartOver() {
+    if (!confirm('Clear all annotations and masks for this video?')) return
+    resetVideoState()
+  }
+
+  // ─── Empty state ──────────────────────────────────────────────────────────────
+
+  if (!video) {
+    return (
+      <div className="flex flex-col h-full items-center justify-center p-6 text-center">
+        <p className="text-[#555] text-sm leading-relaxed">
+          Click an object in the video to start
+        </p>
+        <p className="text-[#444] text-xs mt-2 leading-relaxed">
+          You'll be able to label and track objects across all video frames.
+        </p>
+      </div>
+    )
+  }
+
+  const isTracking = propagationStatus === 'running'
+  const isDone = propagationStatus === 'done'
+  const hasObjects = objects.length > 0
+  const hasPrompts = Object.keys(video.point_prompts ?? {}).length > 0
+
+  return (
+    <div className="flex flex-col h-full overflow-hidden">
+      {/* Step indicator */}
+      <StepIndicator
+        step={isDone ? 2 : 1}
+        total={2}
+        title={isDone ? 'Review tracked objects' : 'Select objects'}
+        subtitle={
+          isDone
+            ? 'Review your selected objects across the video. Continue to edit if needed.'
+            : 'Add objects and draw points on the frame. Press "Track objects" to propagate.'
+        }
+      />
+
+      {/* Objects list */}
+      <div className="flex-1 overflow-y-auto p-3 space-y-2">
+        {objects.map(obj => (
+          <ObjectCard
+            key={obj.id}
+            objId={obj.id}
+            name={obj.name}
+            color={obj.color}
+            isActive={currentObjectId === obj.id}
+            onSelect={() => {
+              setCurrentObject(currentObjectId === obj.id ? null : obj.id)
+            }}
+          />
+        ))}
+
+        {/* Add new object */}
+        {addingObject ? (
+          <div className="rounded-xl border border-[#333] bg-[#1a1a1a] p-3">
+            <p className="text-xs text-[#666] mb-2">Name this object</p>
+            <input
+              type="text"
+              value={newObjName}
+              onChange={e => setNewObjName(e.target.value)}
+              onKeyDown={e => {
+                if (e.key === 'Enter') handleAddObject()
+                if (e.key === 'Escape') { setAddingObject(false); setNewObjName('') }
+              }}
+              placeholder="e.g. Person, Car, Ball..."
+              className="w-full mb-2"
+              autoFocus
+            />
+            <div className="flex gap-2">
+              <button
+                onClick={() => { setAddingObject(false); setNewObjName('') }}
+                className="btn btn-secondary flex-1 text-xs py-1"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleAddObject}
+                disabled={!newObjName.trim()}
+                className="btn btn-primary flex-1 text-xs py-1"
+              >
+                Add
+              </button>
+            </div>
+          </div>
+        ) : (
+          <button
+            onClick={() => setAddingObject(true)}
+            disabled={isTracking}
+            className="w-full flex items-center gap-2 px-3 py-2.5 rounded-xl border border-dashed border-[#333] text-[#666] hover:border-[#555] hover:text-[#aaa] transition-colors text-sm"
+          >
+            <div className="w-8 h-8 rounded-lg border border-[#333] flex items-center justify-center">
+              <Plus size={14} />
+            </div>
+            Add another object
+          </button>
+        )}
+      </div>
+
+      {/* Session initializing indicator */}
+      {initializingSession && (
+        <div className="mx-3 mb-2 flex items-center gap-2 text-xs text-[#888]">
+          <Loader size={12} className="animate-spin" />
+          Loading SAM model...
+        </div>
+      )}
+
+      {/* Propagation progress */}
+      {isTracking && (
+        <div className="mx-3 mb-2 space-y-1">
+          <div className="flex justify-between text-xs text-[#888]">
+            <span>{batchStatus || 'Tracking objects...'}</span>
+            <span>{Math.round(store.propagationProgress * 100)}%</span>
+          </div>
+          <div className="h-1.5 bg-[#2a2a2a] rounded-full overflow-hidden">
+            <div
+              className="h-full bg-blue-500 transition-all duration-300"
+              style={{ width: `${store.propagationProgress * 100}%` }}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* Error */}
+      {trackingError && (
+        <p className="mx-3 mb-2 text-xs text-red-400 bg-red-400/10 rounded-lg px-3 py-2">
+          {trackingError}
+        </p>
+      )}
+
+      {/* Bottom buttons */}
+      <div className="flex items-center gap-2 p-3 border-t border-[#2a2a2a] flex-shrink-0">
+        <button
+          onClick={handleStartOver}
+          disabled={isTracking}
+          className="btn btn-ghost flex items-center gap-1.5 text-xs"
+        >
+          <RotateCcw size={12} />
+          Start over
+        </button>
+        <div className="flex-1" />
+        <button
+          onClick={handleTrack}
+          disabled={isTracking || !hasObjects || initializingSession}
+          className="btn btn-primary flex items-center gap-1.5 text-sm px-4 py-2 disabled:opacity-40"
+        >
+          {isTracking ? (
+            <>
+              <Loader size={14} className="animate-spin" />
+              Tracking...
+            </>
+          ) : (
+            <>
+              Track objects
+              <ChevronRight size={14} />
+            </>
+          )}
+        </button>
+      </div>
+    </div>
+  )
+}

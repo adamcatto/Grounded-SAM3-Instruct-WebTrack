@@ -1,0 +1,77 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg-primary: #111111;
+  --bg-secondary: #1a1a1a;
+  --bg-card: #222222;
+  --bg-hover: #2a2a2a;
+  --border: #333333;
+  --text-primary: #f0f0f0;
+  --text-secondary: #999999;
+  --accent: #3b82f6;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #444;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #555;
+}
+
+/* Button base */
+.btn {
+  @apply px-3 py-1.5 rounded-md text-sm font-medium transition-colors duration-150 cursor-pointer;
+}
+.btn:disabled {
+  @apply opacity-40 cursor-not-allowed;
+}
+.btn-primary {
+  @apply bg-blue-600 hover:bg-blue-500 text-white;
+}
+.btn-secondary {
+  @apply bg-[#2a2a2a] hover:bg-[#333] text-[#f0f0f0] border border-[#444];
+}
+.btn-danger {
+  @apply bg-red-600 hover:bg-red-500 text-white;
+}
+.btn-ghost {
+  @apply text-[#999] hover:text-[#f0f0f0] hover:bg-[#2a2a2a];
+}
+
+/* Input */
+input[type="text"], input[type="file"] {
+  @apply bg-[#2a2a2a] border border-[#444] rounded-md px-3 py-2 text-sm text-[#f0f0f0] outline-none;
+}
+input[type="text"]:focus {
+  @apply border-blue-500;
+}
+
+/* Card */
+.card {
+  @apply bg-[#1a1a1a] rounded-xl border border-[#2a2a2a];
+}

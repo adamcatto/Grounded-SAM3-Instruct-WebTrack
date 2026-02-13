@@ -1,0 +1,296 @@
+"""
+Video frame extraction, mask encoding, and output persistence.
+"""
+
+import base64
+import io
+import json
+from pathlib import Path
+from typing import Optional
+
+import cv2
+import numpy as np
+from PIL import Image
+
+
+# ─── Frame Extraction ─────────────────────────────────────────────────────────
+
+def get_video_info(video_path: str) -> dict:
+    """Return num_frames, fps, width, height for a video file."""
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise ValueError(f"Cannot open video: {video_path}")
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+    return {"num_frames": num_frames, "fps": fps, "width": width, "height": height}
+
+
+def extract_frames(video_path: str, out_dir: str, progress_callback=None) -> dict:
+    """
+    Extract all frames from a video as 000000.jpg, 000001.jpg, ...
+    Returns {num_frames, fps, width, height}.
+    """
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise ValueError(f"Cannot open video: {video_path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    frame_idx = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        out_file = out_path / f"{frame_idx:06d}.jpg"
+        cv2.imwrite(str(out_file), frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        frame_idx += 1
+        if progress_callback and frame_idx % 100 == 0:
+            progress_callback(frame_idx, total)
+
+    cap.release()
+    return {"num_frames": frame_idx, "fps": fps, "width": width, "height": height}
+
+
+def extract_preview_frames(
+    video_path: str, out_dir: str, max_preview: int = 80
+) -> dict:
+    """
+    Extract a small set of evenly-spaced preview frames for the video player.
+    These are named by their real frame index (e.g. 000000.jpg, 000050.jpg, ...).
+    Returns {num_frames (total), preview_count, preview_indices, fps, width, height}.
+    """
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise ValueError(f"Cannot open video: {video_path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    if total <= 0:
+        cap.release()
+        raise ValueError("Video has 0 frames")
+
+    # Compute evenly spaced indices
+    if total <= max_preview:
+        indices = list(range(total))
+    else:
+        step = total / max_preview
+        indices = [int(round(i * step)) for i in range(max_preview)]
+        # Ensure last frame is included and no duplicates
+        if indices[-1] != total - 1:
+            indices[-1] = total - 1
+        indices = sorted(set(indices))
+
+    extracted = []
+    for idx in indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        out_file = out_path / f"{idx:06d}.jpg"
+        cv2.imwrite(str(out_file), frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        extracted.append(idx)
+
+    cap.release()
+    return {
+        "num_frames": total,
+        "preview_count": len(extracted),
+        "preview_indices": extracted,
+        "fps": fps,
+        "width": width,
+        "height": height,
+    }
+
+
+def extract_frame_range(
+    video_path: str, out_dir: str, start: int, end: int,
+    progress_callback=None,
+) -> dict:
+    """
+    Extract frames [start, end) from a video.  Skips frames that already exist
+    on disk.  Returns {extracted_count, start, end}.
+    """
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise ValueError(f"Cannot open video: {video_path}")
+
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    end = min(end, total)
+    if start >= end:
+        cap.release()
+        return {"extracted_count": 0, "start": start, "end": end}
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+    extracted = 0
+    for idx in range(start, end):
+        out_file = out_path / f"{idx:06d}.jpg"
+        if out_file.exists():
+            # Already on disk – still need to advance the capture
+            cap.read()
+            continue
+        ret, frame = cap.read()
+        if not ret:
+            break
+        cv2.imwrite(str(out_file), frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        extracted += 1
+        if progress_callback and extracted % 200 == 0:
+            progress_callback(extracted, end - start)
+
+    cap.release()
+    return {"extracted_count": extracted, "start": start, "end": end}
+
+
+def get_frame_path(frames_dir: str, frame_idx: int) -> Path:
+    return Path(frames_dir) / f"{frame_idx:06d}.jpg"
+
+
+# ─── Mask Visualization ───────────────────────────────────────────────────────
+
+def hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
+    hex_color = hex_color.lstrip("#")
+    return tuple(int(hex_color[i : i + 2], 16) for i in (0, 2, 4))
+
+
+def encode_mask_as_png(
+    mask_np: np.ndarray,
+    color_hex: str,
+    alpha_fill: float = 0.45,
+    border_thickness: int = 3,
+) -> str:
+    """
+    Convert a binary (H, W) mask to a base64-encoded RGBA PNG.
+    Visual style: semi-transparent fill + glowing bright border.
+    """
+    H, W = mask_np.shape[:2]
+    r, g, b = hex_to_rgb(color_hex)
+
+    # Create RGBA overlay
+    rgba = np.zeros((H, W, 4), dtype=np.uint8)
+
+    # Semi-transparent fill
+    mask_bool = mask_np.astype(bool)
+    rgba[mask_bool, 0] = r
+    rgba[mask_bool, 1] = g
+    rgba[mask_bool, 2] = b
+    rgba[mask_bool, 3] = int(255 * alpha_fill)
+
+    # Bright border (find contours, draw thick outline)
+    mask_uint8 = (mask_bool.astype(np.uint8)) * 255
+    contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # Draw border on a separate layer
+    border_layer = np.zeros((H, W), dtype=np.uint8)
+    cv2.drawContours(border_layer, contours, -1, 255, border_thickness)
+
+    # Outer glow: dilate contour slightly, lower alpha
+    kernel = np.ones((border_thickness + 2, border_thickness + 2), np.uint8)
+    glow_layer = cv2.dilate(border_layer, kernel, iterations=1)
+    glow_bool = glow_layer.astype(bool) & ~border_layer.astype(bool)
+    rgba[glow_bool, 0] = min(255, r + 60)
+    rgba[glow_bool, 1] = min(255, g + 60)
+    rgba[glow_bool, 2] = min(255, b + 60)
+    rgba[glow_bool, 3] = 80
+
+    # Solid bright border
+    border_bool = border_layer.astype(bool)
+    rgba[border_bool, 0] = min(255, r + 80)
+    rgba[border_bool, 1] = min(255, g + 80)
+    rgba[border_bool, 2] = min(255, b + 80)
+    rgba[border_bool, 3] = 255
+
+    # Encode as PNG
+    img = Image.fromarray(rgba, mode="RGBA")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def composite_masks_as_png(
+    masks: dict,  # {obj_id: binary_mask_HW}
+    colors: dict,  # {obj_id: hex_color}
+    frame_w: int,
+    frame_h: int,
+) -> str:
+    """
+    Composite all object masks into a single RGBA PNG for a frame.
+    Returns base64-encoded PNG.
+    """
+    rgba = np.zeros((frame_h, frame_w, 4), dtype=np.uint8)
+    for obj_id, mask in masks.items():
+        color_hex = colors.get(str(obj_id), "#5B8DD9")
+        r, g, b = hex_to_rgb(color_hex)
+        mask_bool = mask.astype(bool)
+        # Fill
+        rgba[mask_bool, 0] = r
+        rgba[mask_bool, 1] = g
+        rgba[mask_bool, 2] = b
+        rgba[mask_bool, 3] = int(255 * 0.45)
+
+    img = Image.fromarray(rgba, mode="RGBA")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+# ─── Output Persistence ───────────────────────────────────────────────────────
+
+def save_masks_npz(out_path: str, masks: dict):
+    """
+    Save {obj_id: binary_mask_HW (bool/uint8)} to compressed npz.
+    Key format: 'obj_{obj_id}'
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(str(out_path), **{f"obj_{k}": v.astype(np.uint8) for k, v in masks.items()})
+
+
+def save_bboxes_json(out_path: str, bboxes: dict):
+    """
+    Save {obj_id: [x, y, w, h, score]} as json.
+    Coordinates are normalized [0, 1].
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps({str(k): v for k, v in bboxes.items()}, indent=2))
+
+
+def load_masks_npz(npz_path: str) -> dict:
+    """Load masks from npz. Returns {obj_id: binary_mask_HW}."""
+    data = np.load(str(npz_path))
+    return {k.replace("obj_", ""): data[k].astype(bool) for k in data.files}
+
+
+def load_bboxes_json(json_path: str) -> dict:
+    """Load bboxes from json. Returns {obj_id: [x, y, w, h, score]}."""
+    return json.loads(Path(json_path).read_text())
+
+
+# ─── Thumbnail Generation ──────────────────────────────────────────────────────
+
+def generate_thumbnail(frame_path: str, height: int = 60) -> Optional[bytes]:
+    """Generate a small JPEG thumbnail for the frame strip."""
+    img = cv2.imread(str(frame_path))
+    if img is None:
+        return None
+    h, w = img.shape[:2]
+    new_w = int(w * height / h)
+    thumb = cv2.resize(img, (new_w, height), interpolation=cv2.INTER_AREA)
+    _, buf = cv2.imencode(".jpg", thumb, [cv2.IMWRITE_JPEG_QUALITY, 70])
+    return bytes(buf)
