@@ -46,11 +46,7 @@ export default function LeftPanel() {
     setCurrentObject(obj.id)
     setNewObjName('')
     setAddingObject(false)
-
-    // Auto-init session if not done
-    if (!sessionInitialized) {
-      await handleInitSession()
-    }
+    // Session is auto-initialized on first annotation click (no need here)
   }
 
   // ── Init Session ─────────────────────────────────────────────────────────────

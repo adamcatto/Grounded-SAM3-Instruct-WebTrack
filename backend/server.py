@@ -24,7 +24,6 @@ from video_processor import (
     encode_mask_as_png,
     ensure_faststart,
     extract_frames,
-    extract_preview_frames,
     extract_frame_range,
     get_video_info,
     load_bboxes_json,
@@ -35,7 +34,7 @@ from video_processor import (
     composite_masks_as_png,
 )
 
-STREAM_BATCH_SIZE = 150  # frames extracted per streaming mini-batch
+STREAM_BATCH_SIZE = 1000  # frames extracted per streaming mini-batch
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -188,20 +187,12 @@ async def add_video(
             ensure_faststart(str(perm_path))
         except Exception as e:
             logger.warning(f"faststart failed for {pid}/{vid}: {e}")
-        try:
-            result = extract_preview_frames(str(perm_path), frames_dir, max_preview=80)
-            pm.update_video(pid, vid, {
-                "num_frames": result["num_frames"],
-                "preview_indices": result["preview_indices"],
-                "frames_extracted": True,           # preview frames ready
-                "all_frames_extracted": False,       # full extraction not done
-            })
-            logger.info(
-                f"Extracted {result['preview_count']} preview frames "
-                f"(of {result['num_frames']} total) for {pid}/{vid}"
-            )
-        except Exception as e:
-            logger.error(f"Preview frame extraction failed for {pid}/{vid}: {e}")
+        # No longer extracting preview frames — frames are extracted on
+        # demand when the user annotates.
+        pm.update_video(pid, vid, {
+            "frames_extracted": True,
+            "all_frames_extracted": False,
+        })
 
     background_tasks.add_task(do_post_upload)
 
@@ -256,29 +247,17 @@ async def import_video(
     shutil.copy2(str(src), str(perm_path))
     pm.update_video(pid, vid, {"source_path": str(perm_path)})
 
-    # Apply faststart and extract preview frames in background
-    frames_dir = str(pm.frames_dir(pid, vid))
-
+    # Apply faststart in background (no preview extraction — on-demand)
     def do_post_import():
         try:
             # Apply faststart so browser can stream the MP4 immediately
             ensure_faststart(str(perm_path))
         except Exception as e:
             logger.warning(f"faststart failed for imported {pid}/{vid}: {e}")
-        try:
-            result = extract_preview_frames(str(perm_path), frames_dir, max_preview=80)
-            pm.update_video(pid, vid, {
-                "num_frames": result["num_frames"],
-                "preview_indices": result["preview_indices"],
-                "frames_extracted": True,
-                "all_frames_extracted": False,
-            })
-            logger.info(
-                f"Imported & extracted {result['preview_count']} preview frames "
-                f"(of {result['num_frames']} total) for {pid}/{vid}"
-            )
-        except Exception as e:
-            logger.error(f"Preview frame extraction failed for imported {pid}/{vid}: {e}")
+        pm.update_video(pid, vid, {
+            "frames_extracted": True,
+            "all_frames_extracted": False,
+        })
 
     background_tasks.add_task(do_post_import)
 
@@ -363,6 +342,38 @@ def get_frame(pid: str, vid: str, fidx: int, thumb: bool = False):
         if data:
             return StreamingResponse(iter([data]), media_type="image/jpeg")
     return FileResponse(str(frame_path), media_type="image/jpeg")
+
+
+# ─── Extract single frame for annotation ─────────────────────────────────────
+
+@app.post("/api/projects/{pid}/videos/{vid}/extract_frame/{fidx}")
+def extract_annotated_frame(pid: str, vid: str, fidx: int):
+    """
+    Extract a single frame from the source video into annotated_frames/.
+    Used when the user clicks to annotate — we only extract frames on demand.
+    Returns the path info so the caller knows it's ready.
+    """
+    video = pm.get_video(pid, vid)
+    if video is None:
+        raise HTTPException(404, "Video not found")
+    source_path = video.get("source_path", "")
+    if not source_path or not Path(source_path).exists():
+        raise HTTPException(400, "Video source file not found")
+
+    ann_dir = pm.annotated_frames_dir(pid, vid)
+    ann_dir.mkdir(parents=True, exist_ok=True)
+    frame_path = ann_dir / f"{fidx:06d}.jpg"
+
+    if not frame_path.exists():
+        try:
+            extract_frame_range(source_path, str(ann_dir), fidx, fidx + 1)
+        except Exception as e:
+            raise HTTPException(500, f"Failed to extract frame {fidx}: {e}")
+
+    if not frame_path.exists():
+        raise HTTPException(500, f"Frame {fidx} could not be extracted")
+
+    return {"status": "ok", "frame_idx": fidx, "path": str(frame_path)}
 
 
 # ─── Video source (mp4 streaming with Range support) ─────────────────────────
@@ -453,9 +464,14 @@ def init_session(pid: str, vid: str):
     video = pm.get_video(pid, vid)
     if video is None:
         raise HTTPException(404, "Video not found")
-    frames_dir = str(pm.frames_dir(pid, vid))
-    if not Path(frames_dir).exists() or not list(Path(frames_dir).glob("*.jpg")):
-        raise HTTPException(400, "Frames not yet extracted. Wait for frame extraction to complete.")
+    # Prefer annotated_frames dir (single-frame annotation workflow)
+    ann_dir = pm.annotated_frames_dir(pid, vid)
+    if ann_dir.exists() and list(ann_dir.glob("*.jpg")):
+        frames_dir = str(ann_dir)
+    else:
+        frames_dir = str(pm.frames_dir(pid, vid))
+        if not Path(frames_dir).exists() or not list(Path(frames_dir).glob("*.jpg")):
+            raise HTTPException(400, "No frames available. Extract a frame first.")
     try:
         session_id = sam.init_session(pid, vid, frames_dir)
         pm.update_video(pid, vid, {"sam3_session_id": session_id})
@@ -522,14 +538,14 @@ def add_points(pid: str, vid: str, oid: str, req: AddPointsRequest):
     if video is None:
         raise HTTPException(404, "Video not found")
 
-    # Ensure SAM session exists (auto-init if needed)
+    # Ensure SAM session exists (auto-init from annotated_frames dir)
     session_id = sam.get_session_id(pid, vid)
     if session_id is None:
-        frames_dir = str(pm.frames_dir(pid, vid))
-        if not Path(frames_dir).exists() or not list(Path(frames_dir).glob("*.jpg")):
-            raise HTTPException(400, "Frames not yet extracted")
+        ann_dir = str(pm.annotated_frames_dir(pid, vid))
+        if not Path(ann_dir).exists() or not list(Path(ann_dir).glob("*.jpg")):
+            raise HTTPException(400, "No annotated frames extracted yet. Extract a frame first.")
         try:
-            session_id = sam.init_session(pid, vid, frames_dir)
+            session_id = sam.init_session(pid, vid, ann_dir)
             pm.update_video(pid, vid, {"sam3_session_id": session_id})
         except Exception as e:
             raise HTTPException(500, f"SAM session init failed: {e}")

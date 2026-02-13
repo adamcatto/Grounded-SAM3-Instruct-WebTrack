@@ -218,6 +218,9 @@ class ProjectManager:
     def frames_dir(self, pid: str, vid: str) -> Path:
         return BASE_DIR / pid / "videos" / vid / "frames"
 
+    def annotated_frames_dir(self, pid: str, vid: str) -> Path:
+        return BASE_DIR / pid / "videos" / vid / "annotated_frames"
+
     def masks_dir(self, pid: str, vid: str) -> Path:
         return BASE_DIR / pid / "videos" / vid / "masks"
 

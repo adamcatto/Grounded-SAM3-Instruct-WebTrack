@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef } from 'react'
 import { useStore, currentVideo as selectCurrentVideo } from '../../store/useStore'
-import { addPoints, getSavedMask } from '../../api/client'
+import { extractFrame, addPoints, getSavedMask } from '../../api/client'
 import { drawMasks, drawPoints } from '../../utils/maskUtils'
 
 interface Props {
@@ -103,6 +103,10 @@ export default function AnnotationCanvas({ width, height }: Props) {
     const allLabels = framePts ? framePts.points.map(p => p.label as number) : [label]
 
     try {
+      // Extract this single frame on the backend (into annotated_frames/)
+      // so the SAM session can be initialized with just this frame.
+      await extractFrame(pid, vid, currentFrame)
+
       const result = await addPoints(pid, vid, currentObjectId, currentFrame, allPoints, allLabels)
       if (result.masks) {
         // Read latest state after async call — only merge masks from the same frame

@@ -64,9 +64,6 @@ export const removeVideo = (pid: string, vid: string) =>
 export const frameUrl = (pid: string, vid: string, fidx: number) =>
   `/api/projects/${pid}/videos/${vid}/frames/${fidx}`
 
-export const thumbUrl = (pid: string, vid: string, fidx: number) =>
-  `/api/projects/${pid}/videos/${vid}/frames/${fidx}?thumb=true`
-
 // Video needs HTTP Range request support for seeking.  Vite's dev proxy
 // re-chunks streaming responses and can break 206 Partial Content replies,
 // so in dev we hit the backend directly (CORS is allow_origins=["*"]).
@@ -76,6 +73,13 @@ const BACKEND = import.meta.env.DEV
 
 export const videoSourceUrl = (pid: string, vid: string) =>
   `${BACKEND}/api/projects/${pid}/videos/${vid}/source`
+
+// ─── Extract single frame (on-demand for annotation) ─────────────────────────
+
+export const extractFrame = (pid: string, vid: string, frameIdx: number) =>
+  api.post<{ status: string; frame_idx: number; path: string }>(
+    `/projects/${pid}/videos/${vid}/extract_frame/${frameIdx}`
+  ).then(r => r.data)
 
 // ─── SAM3 Session ─────────────────────────────────────────────────────────────
 

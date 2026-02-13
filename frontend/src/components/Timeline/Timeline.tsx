@@ -2,7 +2,6 @@ import React, { useEffect } from 'react'
 import { Play, Pause, SkipBack, SkipForward } from 'lucide-react'
 import { useStore, currentVideo as selectCurrentVideo } from '../../store/useStore'
 import { getSavedMask } from '../../api/client'
-import FrameStrip from './FrameStrip'
 import ObjectTrackRow from './ObjectTrackRow'
 
 export default function Timeline() {
@@ -107,9 +106,6 @@ export default function Timeline() {
           <SkipForward size={13} />
         </button>
       </div>
-
-      {/* Frame strip */}
-      <FrameStrip />
 
       {/* Object track rows */}
       <ObjectTrackRow />

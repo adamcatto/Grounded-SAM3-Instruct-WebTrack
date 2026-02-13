@@ -1,19 +1,19 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react'
 import { Info } from 'lucide-react'
 import { useStore, currentVideo as selectCurrentVideo } from '../../store/useStore'
-import { videoSourceUrl, frameUrl } from '../../api/client'
+import { videoSourceUrl } from '../../api/client'
 import AnnotationCanvas from './AnnotationCanvas'
 
 /**
- * FrameViewer — displays the current video frame.
+ * FrameViewer — video-based annotation viewer.
  *
  * Stack (bottom to top):
- *   1. JPEG <img> — always visible, shows the current frame for annotation
- *   2. <video>   — on top, fades in when playing, fades out when paused
- *   3. AnnotationCanvas — transparent click overlay for point prompts
+ *   1. <video>           — always visible, shows the MP4 video
+ *   2. AnnotationCanvas  — transparent click overlay for point prompts + mask rendering
  *
- * The video src hits the backend directly (bypassing Vite's dev proxy)
- * so HTTP Range requests work for MP4 streaming.
+ * When the user is annotating (paused), the video stays paused on the current
+ * frame.  Clicking on the canvas extracts that frame on the backend and runs
+ * single-frame segmentation.
  */
 export default function FrameViewer() {
   const store = useStore()
@@ -156,20 +156,7 @@ export default function FrameViewer() {
             flexShrink: 0,
           }}
         >
-          {/* Layer 1: JPEG frame (always visible, under video) */}
-          <img
-            src={frameUrl(pid, vid, currentFrame)}
-            alt={`Frame ${currentFrame}`}
-            style={{
-              position: 'absolute', top: 0, left: 0,
-              width: '100%', height: '100%',
-              objectFit: 'contain',
-              userSelect: 'none', pointerEvents: 'none',
-            }}
-            draggable={false}
-          />
-
-          {/* Layer 2: HTML5 video (on top, visible only while playing) */}
+          {/* Layer 1: HTML5 video (always visible) */}
           <video
             ref={videoRef}
             style={{
@@ -177,8 +164,6 @@ export default function FrameViewer() {
               width: '100%', height: '100%',
               objectFit: 'contain',
               userSelect: 'none', pointerEvents: 'none',
-              opacity: isPlaying ? 1 : 0,
-              transition: 'opacity 0.15s ease',
             }}
             muted
             playsInline
@@ -190,7 +175,7 @@ export default function FrameViewer() {
             <source src={videoSrc} type="video/mp4" />
           </video>
 
-          {/* Layer 3: Annotation canvas */}
+          {/* Layer 2: Annotation canvas */}
           <AnnotationCanvas width={dimensions.width} height={dimensions.height} />
         </div>
       )}
