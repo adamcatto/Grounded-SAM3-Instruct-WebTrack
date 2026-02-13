@@ -22,6 +22,7 @@ from project_manager import ProjectManager
 from sam_predictor import SAMPredictor
 from video_processor import (
     encode_mask_as_png,
+    ensure_faststart,
     extract_frames,
     extract_preview_frames,
     extract_frame_range,
@@ -34,7 +35,7 @@ from video_processor import (
     composite_masks_as_png,
 )
 
-BATCH_SIZE = 1000  # frames extracted per batch for SAM inference
+STREAM_BATCH_SIZE = 150  # frames extracted per streaming mini-batch
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -46,6 +47,7 @@ app.add_middleware(
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Range", "Accept-Ranges", "Content-Length", "Content-Type"],
 )
 
 pm = ProjectManager()
@@ -177,10 +179,15 @@ async def add_video(
     shutil.move(tmp_path, str(perm_path))
     pm.update_video(pid, vid, {"source_path": str(perm_path)})
 
-    # Extract preview frames in background (small set for the player)
+    # Extract preview frames and apply faststart in background
     frames_dir = str(pm.frames_dir(pid, vid))
 
-    def do_extract_preview():
+    def do_post_upload():
+        try:
+            # Apply faststart so browser can stream the MP4 immediately
+            ensure_faststart(str(perm_path))
+        except Exception as e:
+            logger.warning(f"faststart failed for {pid}/{vid}: {e}")
         try:
             result = extract_preview_frames(str(perm_path), frames_dir, max_preview=80)
             pm.update_video(pid, vid, {
@@ -196,7 +203,7 @@ async def add_video(
         except Exception as e:
             logger.error(f"Preview frame extraction failed for {pid}/{vid}: {e}")
 
-    background_tasks.add_task(do_extract_preview)
+    background_tasks.add_task(do_post_upload)
 
     return video_meta
 
@@ -243,19 +250,21 @@ async def import_video(
     )
     vid = video_meta["id"]
 
-    # Symlink the source video into the project directory
+    # Copy the source video into the project directory (we need our own copy
+    # so we can apply faststart without modifying the original).
     perm_path = BASE_PROJECTS / pid / "videos" / vid / f"source{src.suffix}"
-    try:
-        perm_path.symlink_to(src)
-    except OSError:
-        # If symlink fails (e.g. cross-device), copy instead
-        shutil.copy2(str(src), str(perm_path))
+    shutil.copy2(str(src), str(perm_path))
     pm.update_video(pid, vid, {"source_path": str(perm_path)})
 
-    # Extract preview frames in background
+    # Apply faststart and extract preview frames in background
     frames_dir = str(pm.frames_dir(pid, vid))
 
-    def do_extract_preview():
+    def do_post_import():
+        try:
+            # Apply faststart so browser can stream the MP4 immediately
+            ensure_faststart(str(perm_path))
+        except Exception as e:
+            logger.warning(f"faststart failed for imported {pid}/{vid}: {e}")
         try:
             result = extract_preview_frames(str(perm_path), frames_dir, max_preview=80)
             pm.update_video(pid, vid, {
@@ -271,7 +280,7 @@ async def import_video(
         except Exception as e:
             logger.error(f"Preview frame extraction failed for imported {pid}/{vid}: {e}")
 
-    background_tasks.add_task(do_extract_preview)
+    background_tasks.add_task(do_post_import)
 
     return video_meta
 
@@ -282,6 +291,25 @@ def get_video(pid: str, vid: str):
     if video is None:
         raise HTTPException(404, "Video not found")
     return video
+
+
+@app.post("/api/projects/{pid}/videos/{vid}/faststart")
+def apply_faststart(pid: str, vid: str):
+    """Manually apply MP4 faststart optimization to an existing video."""
+    video = pm.get_video(pid, vid)
+    if video is None:
+        raise HTTPException(404, "Video not found")
+    source_path = video.get("source_path", "")
+    if not source_path or not Path(source_path).exists():
+        raise HTTPException(404, "Video source file not found")
+    # If it's a symlink, replace with a copy first (can't modify original)
+    p = Path(source_path)
+    if p.is_symlink():
+        real = p.resolve()
+        p.unlink()
+        shutil.copy2(str(real), str(p))
+    result = ensure_faststart(source_path)
+    return {"status": "ok", "path": result}
 
 
 @app.get("/api/projects/{pid}/videos/{vid}/info")
@@ -353,7 +381,9 @@ async def get_video_source(pid: str, vid: str, request: Request):
     if not source_path or not Path(source_path).exists():
         raise HTTPException(404, "Video source file not found")
 
-    file_path = Path(source_path)
+    file_path = Path(source_path).resolve()  # resolve symlinks
+    if not file_path.exists():
+        raise HTTPException(404, "Video source file not found (resolved)")
     file_size = file_path.stat().st_size
     suffix = file_path.suffix.lower()
     media_types = {
@@ -407,23 +437,12 @@ async def get_video_source(pid: str, vid: str, request: Request):
             },
         )
     else:
-        # No range requested — stream the whole file
-        def iter_file():
-            CHUNK = 1024 * 1024
-            with open(file_path, "rb") as f:
-                while True:
-                    data = f.read(CHUNK)
-                    if not data:
-                        break
-                    yield data
-
-        return StreamingResponse(
-            iter_file(),
+        # No Range header: use Starlette's FileResponse which efficiently
+        # serves the whole file and handles etag / last-modified / conditional.
+        return FileResponse(
+            path=str(file_path),
             media_type=content_type,
-            headers={
-                "Accept-Ranges": "bytes",
-                "Content-Length": str(file_size),
-            },
+            headers={"Accept-Ranges": "bytes"},
         )
 
 
@@ -619,20 +638,22 @@ def get_composite_mask(pid: str, vid: str, fidx: int):
     return StreamingResponse(io.BytesIO(png_bytes), media_type="image/png")
 
 
-# ─── Propagation (SSE) — batched frame extraction ────────────────────────────
+# ─── Propagation (SSE) — streaming mini-batch frame processing ───────────────
 
 @app.get("/api/projects/{pid}/videos/{vid}/propagate")
-async def propagate_video(pid: str, vid: str):
+async def propagate_video(pid: str, vid: str, start_frame: int = 0):
     """
-    Stream propagation progress as Server-Sent Events.
-    Extracts frames in batches of BATCH_SIZE (1000) on the fly and runs
-    SAM inference per batch, saving masks (.npz) and bboxes (.json) to disk.
+    Stream propagation results as Server-Sent Events.
+
+    Frames are decoded from the source video in mini-batches of STREAM_BATCH_SIZE
+    into a *temporary directory* that is deleted after each batch.  This means
+    SAM only loads ~150 frames per session init (seconds) instead of the entire
+    video (potentially tens of minutes).
 
     Cross-batch identity tracking:
       • At the end of batch N the last frame's per-object masks are kept.
-      • Batch N+1 re-initialises the SAM session, then seeds it with those
-        masks via ``add_mask_prompt`` on the first frame of the new batch so
-        that object IDs are carried over.
+      • Batch N+1 re-initialises a fresh SAM session on the new temp dir, then
+        seeds it with those masks via add_mask_prompt so object IDs carry over.
     """
     video = pm.get_video(pid, vid)
     if video is None:
@@ -644,30 +665,39 @@ async def propagate_video(pid: str, vid: str):
 
     num_frames = video["num_frames"]
     source_path = video.get("source_path", "")
-    frames_dir_path = pm.frames_dir(pid, vid)
-    frames_dir = str(frames_dir_path)
     masks_dir = pm.masks_dir(pid, vid)
     bboxes_dir = pm.bboxes_dir(pid, vid)
     objects = video["objects"]
+    is_sam3 = sam.model_name() == "sam3"
 
-    # Compute batch ranges
+    # Find the earliest annotated frame so the first batch always contains it.
+    all_prompts = pm.get_all_point_prompts(pid, vid)
+    first_ann_frame: int | None = None
+    for obj_id_str, frame_map in all_prompts.items():
+        for fidx_str in frame_map:
+            fidx = int(fidx_str)
+            if first_ann_frame is None or fidx < first_ann_frame:
+                first_ann_frame = fidx
+    # Clamp: start no later than the earliest annotated frame
+    actual_start = min(start_frame, first_ann_frame) if first_ann_frame is not None else start_frame
+
+    # Build mini-batch ranges starting from actual_start
     batches: list[tuple[int, int]] = []
-    for start in range(0, num_frames, BATCH_SIZE):
-        end = min(start + BATCH_SIZE, num_frames)
-        batches.append((start, end))
+    for s in range(actual_start, num_frames, STREAM_BATCH_SIZE):
+        batches.append((s, min(s + STREAM_BATCH_SIZE, num_frames)))
+
+    import concurrent.futures
 
     async def event_generator():
         loop = asyncio.get_event_loop()
         total_propagated = 0
-
-        # Carry-over masks from the last frame of the previous batch.
-        # Dict[int_obj_id, np.ndarray(H, W, dtype=uint8)]
-        prev_batch_last_masks: dict | None = None
+        prev_batch_last_masks: dict | None = None  # obj_id(int) -> np.ndarray
+        sam3_annotated_frame: int | None = None
 
         for batch_idx, (batch_start, batch_end) in enumerate(batches):
             batch_len = batch_end - batch_start
 
-            # ── 1. Extract this batch of frames ──────────────────────────
+            # ── 1. Yield "extracting" event ───────────────────────────────
             yield {
                 "event": "batch_start",
                 "data": json.dumps({
@@ -679,41 +709,61 @@ async def propagate_video(pid: str, vid: str):
                 }),
             }
 
+            # ── 2. Extract this batch into a fresh temp directory ─────────
+            tmp_dir = tempfile.mkdtemp(prefix=f"sam3wt_{pid}_{vid}_b{batch_idx}_")
             try:
-                await loop.run_in_executor(
-                    None,
-                    extract_frame_range,
-                    source_path, frames_dir, batch_start, batch_end,
-                )
-            except Exception as e:
-                logger.error(f"Batch frame extraction failed: {e}", exc_info=True)
+                try:
+                    await loop.run_in_executor(
+                        None,
+                        extract_frame_range,
+                        source_path, tmp_dir, batch_start, batch_end,
+                    )
+                except Exception as e:
+                    logger.error(f"Frame extraction failed for batch {batch_idx}: {e}", exc_info=True)
+                    yield {"event": "error", "data": json.dumps({"error": f"Frame extraction failed: {e}"})}
+                    return
+
+                # ── 3. Yield "initializing" event ─────────────────────────
                 yield {
-                    "event": "error",
-                    "data": json.dumps({"error": f"Frame extraction failed: {e}"}),
+                    "event": "batch_start",
+                    "data": json.dumps({
+                        "batch": batch_idx,
+                        "batch_start": batch_start,
+                        "batch_end": batch_end,
+                        "total_batches": len(batches),
+                        "status": "initializing_session",
+                    }),
                 }
-                return
 
-            # ── 2. (Re-)initialise SAM session for this batch ────────────
-            try:
-                new_sid = sam.init_session(pid, vid, frames_dir)
-                pm.update_video(pid, vid, {"sam3_session_id": new_sid})
+                # ── 4. Init SAM session on just this batch's temp dir ─────
+                try:
+                    new_sid = sam.init_session(pid, vid, tmp_dir)
+                    pm.update_video(pid, vid, {"sam3_session_id": new_sid})
+                except Exception as e:
+                    logger.error(f"Session init failed for batch {batch_idx}: {e}", exc_info=True)
+                    yield {"event": "error", "data": json.dumps({"error": f"Session init failed: {e}"})}
+                    return
 
-                if batch_idx == 0:
-                    # First batch: replay the user's original point prompts
-                    all_prompts = pm.get_all_point_prompts(pid, vid)
-                    for obj_id_str, frame_map in all_prompts.items():
-                        for fidx_str, prompt in frame_map.items():
-                            sam.add_points(
-                                pid, vid,
-                                frame_idx=int(fidx_str),
-                                obj_id=int(obj_id_str),
-                                points=prompt["points"],
-                                labels=prompt["labels"],
-                            )
-                else:
-                    # Subsequent batch: seed with masks from the last frame
-                    # of the previous batch so object IDs carry over.
-                    if prev_batch_last_masks:
+                # ── 5. Add prompts ────────────────────────────────────────
+                try:
+                    if prev_batch_last_masks is None:
+                        # First batch that has frame data: replay point prompts
+                        # for any annotated frame that falls within this batch.
+                        for obj_id_str, frame_map in all_prompts.items():
+                            for fidx_str, prompt in frame_map.items():
+                                real_fidx = int(fidx_str)
+                                if batch_start <= real_fidx < batch_end:
+                                    sam.add_points(
+                                        pid, vid,
+                                        frame_idx=real_fidx,
+                                        obj_id=int(obj_id_str),
+                                        points=prompt["points"],
+                                        labels=prompt["labels"],
+                                    )
+                                    if sam3_annotated_frame is None or real_fidx < sam3_annotated_frame:
+                                        sam3_annotated_frame = real_fidx
+                    else:
+                        # Subsequent batches: seed from previous batch's last masks
                         for obj_id_int, mask_np in prev_batch_last_masks.items():
                             sam.add_mask_prompt(
                                 pid, vid,
@@ -725,128 +775,151 @@ async def propagate_video(pid: str, vid: str):
                             f"Batch {batch_idx}: seeded {len(prev_batch_last_masks)} "
                             f"object mask(s) on frame {batch_start}"
                         )
+                except Exception as e:
+                    logger.error(f"Prompt setup failed for batch {batch_idx}: {e}", exc_info=True)
+                    yield {"event": "error", "data": json.dumps({"error": f"Prompt setup failed: {e}"})}
+                    return
 
-            except Exception as e:
-                logger.error(f"Session init for batch {batch_idx} failed: {e}", exc_info=True)
-                yield {
-                    "event": "error",
-                    "data": json.dumps({"error": f"Session init failed: {e}"}),
-                }
-                return
+                # ── 6. Run propagation ────────────────────────────────────
+                queue: asyncio.Queue = asyncio.Queue(maxsize=50)
+                last_frame_masks: dict = {}
+                batch_frame_count = 0
 
-            # ── 3. Run propagation on this batch ─────────────────────────
-            queue: asyncio.Queue = asyncio.Queue(maxsize=50)
+                # SAM3: bidirectional from annotated frame in first batch,
+                # forward-only in subsequent batches.
+                # SAM2: always forward from batch_start.
+                if is_sam3:
+                    _start = sam3_annotated_frame if (batch_idx == 0 and sam3_annotated_frame is not None) else batch_start
+                    _direction = "both" if batch_idx == 0 else "forward"
+                else:
+                    _start = batch_start
+                    _direction = "forward"
 
-            def _run_propagation(b_start=batch_start, b_len=batch_len):
+                def _run_propagation(
+                    b_start=batch_start, b_len=batch_len,
+                    s3_start=_start, direction=_direction,
+                ):
+                    try:
+                        if is_sam3:
+                            prop_iter = sam.propagate_stream(
+                                pid, vid,
+                                start_frame_idx=s3_start,
+                                propagation_direction=direction,
+                            )
+                        else:
+                            prop_iter = sam.propagate_stream(
+                                pid, vid,
+                                start_frame_idx=b_start,
+                                max_frame_num_to_track=b_len,
+                            )
+                        for item in prop_iter:
+                            asyncio.run_coroutine_threadsafe(
+                                queue.put(("frame", item)), loop
+                            ).result()
+                    except Exception as exc:
+                        asyncio.run_coroutine_threadsafe(
+                            queue.put(("error", exc)), loop
+                        ).result()
+                    finally:
+                        asyncio.run_coroutine_threadsafe(
+                            queue.put(("done", None)), loop
+                        ).result()
+
+                executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                loop.run_in_executor(executor, _run_propagation)
+
                 try:
-                    for item in sam.propagate_stream(
-                        pid, vid,
-                        start_frame_idx=b_start,
-                        max_frame_num_to_track=b_len,
-                    ):
-                        asyncio.run_coroutine_threadsafe(queue.put(("frame", item)), loop).result()
-                except Exception as exc:
-                    asyncio.run_coroutine_threadsafe(queue.put(("error", exc)), loop).result()
-                finally:
-                    asyncio.run_coroutine_threadsafe(queue.put(("done", None)), loop).result()
+                    while True:
+                        msg_type, payload = await queue.get()
+                        if msg_type == "error":
+                            raise payload
+                        if msg_type == "done":
+                            break
 
-            import concurrent.futures
-            executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-            loop.run_in_executor(executor, _run_propagation)
+                        # ── Translate SAM's internal sequential index → real frame index
+                        item = payload
+                        sam_idx = item.get("frame_index", batch_frame_count)
+                        real_frame_idx = sam.to_real_idx(pid, vid, sam_idx)
 
-            # Track the very last frame's masks for cross-batch handoff
-            last_frame_masks: dict = {}   # obj_id(int) -> mask(np.ndarray)
-            batch_frame_count = 0
+                        frame_outputs = item.get("outputs", {})
+                        if isinstance(frame_outputs, dict):
+                            # SAM3 keys outputs by its internal index; try both forms
+                            fo = (frame_outputs.get(sam_idx)
+                                  or frame_outputs.get(str(sam_idx))
+                                  or frame_outputs.get(real_frame_idx)
+                                  or frame_outputs.get(str(real_frame_idx))
+                                  or frame_outputs)
+                        else:
+                            fo = {}
 
-            try:
-                while True:
-                    msg_type, payload = await queue.get()
+                        obj_ids = fo.get("out_obj_ids", [])
+                        masks_raw = fo.get("out_binary_masks", [])
+                        boxes_raw = fo.get("out_boxes_xywh", [])
+                        probs_raw = fo.get("out_probs", [])
 
-                    if msg_type == "error":
-                        raise payload
+                        masks_to_save: dict = {}
+                        bboxes_to_save: dict = {}
+                        current_frame_masks: dict = {}
 
-                    if msg_type == "done":
-                        break
+                        for i, oid in enumerate(obj_ids):
+                            if i < len(masks_raw):
+                                mask = masks_raw[i]
+                                if hasattr(mask, "numpy"):
+                                    mask = mask.numpy()
+                                mask = np.squeeze(mask).astype(np.uint8)
+                                masks_to_save[str(oid)] = mask
+                                current_frame_masks[int(oid)] = mask
+                            if i < len(boxes_raw):
+                                box = boxes_raw[i]
+                                if hasattr(box, "tolist"):
+                                    box = box.tolist()
+                                score = float(probs_raw[i]) if i < len(probs_raw) else 1.0
+                                bboxes_to_save[str(oid)] = list(box) + [score]
 
-                    # msg_type == "frame"
-                    item = payload
-                    frame_idx = item.get("frame_index", item.get("frame_idx", batch_start + batch_frame_count))
-                    frame_outputs = item.get("outputs", {})
+                        if current_frame_masks:
+                            last_frame_masks = current_frame_masks
 
-                    if isinstance(frame_outputs, dict):
-                        fo = frame_outputs.get(frame_idx, frame_outputs.get(str(frame_idx), frame_outputs))
-                    else:
-                        fo = {}
+                        if masks_to_save:
+                            save_masks_npz(str(masks_dir / f"{real_frame_idx:06d}.npz"), masks_to_save)
+                        if bboxes_to_save:
+                            save_bboxes_json(str(bboxes_dir / f"{real_frame_idx:06d}.json"), bboxes_to_save)
 
-                    obj_ids = fo.get("out_obj_ids", [])
-                    masks_raw = fo.get("out_binary_masks", [])
-                    boxes_raw = fo.get("out_boxes_xywh", [])
-                    probs_raw = fo.get("out_probs", [])
+                        pm.mark_frame_propagated(pid, vid, real_frame_idx)
+                        batch_frame_count += 1
+                        total_propagated += 1
+                        progress = total_propagated / num_frames if num_frames > 0 else 1.0
 
-                    masks_to_save: dict = {}
-                    bboxes_to_save: dict = {}
-                    current_frame_masks: dict = {}  # for handoff tracking
+                        yield {
+                            "event": "progress",
+                            "data": json.dumps({
+                                "frame": real_frame_idx,
+                                "progress": round(progress, 4),
+                                "done": False,
+                                "batch": batch_idx,
+                                "batch_start": batch_start,
+                                "batch_end": batch_end,
+                                "obj_ids": [str(o) for o in obj_ids],
+                            }),
+                        }
 
-                    for i, oid in enumerate(obj_ids):
-                        if i < len(masks_raw):
-                            mask = masks_raw[i]
-                            if hasattr(mask, "numpy"):
-                                mask = mask.numpy()
-                            mask = np.squeeze(mask).astype(np.uint8)
-                            masks_to_save[str(oid)] = mask
-                            current_frame_masks[int(oid)] = mask
-                        if i < len(boxes_raw):
-                            box = boxes_raw[i]
-                            if hasattr(box, "tolist"):
-                                box = box.tolist()
-                            score = float(probs_raw[i]) if i < len(probs_raw) else 1.0
-                            bboxes_to_save[str(oid)] = list(box) + [score]
+                except Exception as e:
+                    logger.error(f"Propagation error in batch {batch_idx}: {e}", exc_info=True)
+                    yield {"event": "error", "data": json.dumps({"error": str(e)})}
+                    return
 
-                    # Always update last_frame_masks to the most recent frame
-                    if current_frame_masks:
-                        last_frame_masks = current_frame_masks
+                # ── 7. Carry masks forward for the next batch ─────────────
+                prev_batch_last_masks = last_frame_masks if last_frame_masks else prev_batch_last_masks
+                logger.info(
+                    f"Batch {batch_idx} done: {batch_frame_count} frames, "
+                    f"{len(last_frame_masks)} object mask(s) carried forward"
+                )
 
-                    if masks_to_save:
-                        save_masks_npz(str(masks_dir / f"{frame_idx:06d}.npz"), masks_to_save)
-                    if bboxes_to_save:
-                        save_bboxes_json(str(bboxes_dir / f"{frame_idx:06d}.json"), bboxes_to_save)
-
-                    pm.mark_frame_propagated(pid, vid, frame_idx)
-                    batch_frame_count += 1
-                    total_propagated += 1
-                    progress = total_propagated / num_frames if num_frames > 0 else 1.0
-
-                    yield {
-                        "event": "progress",
-                        "data": json.dumps({
-                            "frame": frame_idx,
-                            "progress": round(progress, 4),
-                            "done": False,
-                            "batch": batch_idx,
-                            "batch_start": batch_start,
-                            "batch_end": batch_end,
-                            "obj_ids": [str(o) for o in obj_ids],
-                        }),
-                    }
-
-            except Exception as e:
-                logger.error(f"Propagation error in batch {batch_idx}: {e}", exc_info=True)
-                yield {
-                    "event": "error",
-                    "data": json.dumps({"error": str(e)}),
-                }
-                return
-
-            # ── 4. Carry masks forward for the next batch ────────────────
-            prev_batch_last_masks = last_frame_masks if last_frame_masks else None
-            logger.info(
-                f"Batch {batch_idx} done: {batch_frame_count} frames propagated, "
-                f"{len(last_frame_masks)} object mask(s) carried to next batch"
-            )
+            finally:
+                # Always delete the temp directory for this batch
+                shutil.rmtree(tmp_dir, ignore_errors=True)
 
         # ── All batches done ──────────────────────────────────────────────
         pm.mark_propagation_complete(pid, vid)
-        pm.update_video(pid, vid, {"all_frames_extracted": True})
         yield {
             "event": "done",
             "data": json.dumps({

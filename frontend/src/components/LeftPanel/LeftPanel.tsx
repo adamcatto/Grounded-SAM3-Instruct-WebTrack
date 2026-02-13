@@ -15,6 +15,7 @@ export default function LeftPanel() {
     currentObjectId, setCurrentObject,
     propagationStatus, setPropagationStatus, setPropagationProgress,
     sessionInitialized, setSessionInitialized,
+    propagationStartFrame, setPropagationStartFrame,
     setDrawerOpen, resetVideoState, updateVideo,
     setProject, setSavedMask,
   } = store
@@ -82,11 +83,13 @@ export default function LeftPanel() {
     setPropagationStatus('running')
     setBatchStatus('')
 
-    const es = startPropagationSSE(pid, vid)
+    const es = startPropagationSSE(pid, vid, propagationStartFrame)
     es.addEventListener('batch_start', (e: MessageEvent) => {
       const data: PropagationEvent = JSON.parse(e.data)
       if (data.status === 'extracting') {
         setBatchStatus(`Extracting frames (batch ${(data.batch ?? 0) + 1}/${data.total_batches ?? '?'})...`)
+      } else if (data.status === 'initializing_session') {
+        setBatchStatus('Loading frames into SAM model...')
       }
     })
     es.addEventListener('progress', (e: MessageEvent) => {
@@ -255,6 +258,20 @@ export default function LeftPanel() {
           {trackingError}
         </p>
       )}
+
+      {/* Start frame */}
+      <div className="px-3 pb-2 flex items-center gap-2 flex-shrink-0">
+        <label className="text-xs text-[#666] whitespace-nowrap">Start frame</label>
+        <input
+          type="number"
+          min={0}
+          max={video.num_frames - 1}
+          value={propagationStartFrame}
+          onChange={e => setPropagationStartFrame(Math.max(0, parseInt(e.target.value) || 0))}
+          disabled={isTracking}
+          className="w-full text-xs py-1 px-2 rounded bg-[#1a1a1a] border border-[#333] text-[#ccc] disabled:opacity-40"
+        />
+      </div>
 
       {/* Bottom buttons */}
       <div className="flex items-center gap-2 p-3 border-t border-[#2a2a2a] flex-shrink-0">

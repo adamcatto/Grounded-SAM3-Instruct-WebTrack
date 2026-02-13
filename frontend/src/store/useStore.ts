@@ -22,6 +22,7 @@ interface AppState {
 
   // Mask cache: frameIdx → objId → base64 PNG
   currentFrameMasks: MaskData
+  currentFrameMasksFrame: number | null   // which frame currentFrameMasks belongs to
   savedMaskCache: Record<number, MaskData>
 
   // Playback
@@ -31,6 +32,7 @@ interface AppState {
   propagationStatus: PropagationStatus
   propagationProgress: number
   propagationCurrentFrame: number
+  propagationStartFrame: number
 
   // UI
   drawerOpen: boolean
@@ -45,7 +47,7 @@ interface AppState {
   setPointMode: (m: PointMode) => void
   addLocalPoint: (objId: string, frameIdx: number, x: number, y: number, label: 0 | 1) => void
   clearLocalPoints: (objId: string) => void
-  setCurrentFrameMasks: (masks: MaskData) => void
+  setCurrentFrameMasks: (masks: MaskData, frame?: number | null) => void
   setSavedMask: (fidx: number, masks: MaskData) => void
   setPlaying: (v: boolean) => void
   setPropagationStatus: (s: PropagationStatus) => void
@@ -53,6 +55,7 @@ interface AppState {
   setDrawerOpen: (v: boolean) => void
   setUploadModalOpen: (v: boolean) => void
   setSessionInitialized: (v: boolean) => void
+  setPropagationStartFrame: (f: number) => void
   updateVideo: (updates: Partial<VideoMeta>) => void
   resetVideoState: () => void
 }
@@ -65,11 +68,13 @@ export const useStore = create<AppState>((set, get) => ({
   pointMode: null,
   localAnnotations: {},
   currentFrameMasks: {},
+  currentFrameMasksFrame: null,
   savedMaskCache: {},
   isPlaying: false,
   propagationStatus: 'idle',
   propagationProgress: 0,
   propagationCurrentFrame: 0,
+  propagationStartFrame: 0,
   drawerOpen: false,
   uploadModalOpen: false,
   sessionInitialized: false,
@@ -86,6 +91,7 @@ export const useStore = create<AppState>((set, get) => ({
         pointMode: null,
         localAnnotations: {},
         currentFrameMasks: {},
+        currentFrameMasksFrame: null,
         savedMaskCache: {},
         isPlaying: false,
         propagationStatus: 'idle',
@@ -121,7 +127,7 @@ export const useStore = create<AppState>((set, get) => ({
     set({ localAnnotations: updated })
   },
 
-  setCurrentFrameMasks: masks => set({ currentFrameMasks: masks }),
+  setCurrentFrameMasks: (masks, frame) => set({ currentFrameMasks: masks, currentFrameMasksFrame: frame ?? null }),
 
   setSavedMask: (fidx, masks) => {
     const { savedMaskCache } = get()
@@ -138,6 +144,7 @@ export const useStore = create<AppState>((set, get) => ({
   setDrawerOpen: v => set({ drawerOpen: v }),
   setUploadModalOpen: v => set({ uploadModalOpen: v }),
   setSessionInitialized: v => set({ sessionInitialized: v }),
+  setPropagationStartFrame: f => set({ propagationStartFrame: f }),
 
   updateVideo: updates => {
     const { project, currentVideoId } = get()
@@ -162,6 +169,7 @@ export const useStore = create<AppState>((set, get) => ({
     pointMode: null,
     localAnnotations: {},
     currentFrameMasks: {},
+    currentFrameMasksFrame: null,
     savedMaskCache: {},
     isPlaying: false,
     propagationStatus: 'idle',

@@ -17,7 +17,7 @@ export default function AnnotationCanvas({ width, height }: Props) {
     project, currentVideoId,
     currentFrame, currentObjectId, pointMode,
     localAnnotations, addLocalPoint,
-    currentFrameMasks, setCurrentFrameMasks,
+    currentFrameMasks, currentFrameMasksFrame, setCurrentFrameMasks,
     savedMaskCache, setSavedMask,
     propagationStatus,
   } = store
@@ -38,10 +38,13 @@ export default function AnnotationCanvas({ width, height }: Props) {
     ctx.clearRect(0, 0, width, height)
 
     // Determine which masks to show
-    let masksToShow = currentFrameMasks
+    let masksToShow: typeof currentFrameMasks = {}
     if (propagationStatus === 'done' || propagationStatus === 'running') {
       const saved = savedMaskCache[currentFrame]
       if (saved) masksToShow = saved
+    } else if (currentFrameMasksFrame === currentFrame) {
+      // Only show live annotation masks for the frame they were computed on
+      masksToShow = currentFrameMasks
     }
 
     // Draw masks
@@ -58,7 +61,7 @@ export default function AnnotationCanvas({ width, height }: Props) {
       }
     }
     drawPoints(ctx, allPoints, width, height)
-  }, [width, height, currentFrameMasks, localAnnotations, currentFrame, savedMaskCache, propagationStatus])
+  }, [width, height, currentFrameMasks, currentFrameMasksFrame, localAnnotations, currentFrame, savedMaskCache, propagationStatus])
 
   // ── Load saved masks when frame changes (post-propagation) ────────────────
 
@@ -102,12 +105,15 @@ export default function AnnotationCanvas({ width, height }: Props) {
     try {
       const result = await addPoints(pid, vid, currentObjectId, currentFrame, allPoints, allLabels)
       if (result.masks) {
-        setCurrentFrameMasks({ ...currentFrameMasks, ...result.masks })
+        // Read latest state after async call — only merge masks from the same frame
+        const state = useStore.getState()
+        const prevMasks = state.currentFrameMasksFrame === currentFrame ? state.currentFrameMasks : {}
+        setCurrentFrameMasks({ ...prevMasks, ...result.masks }, currentFrame)
       }
     } catch (err) {
       console.error('Failed to add point:', err)
     }
-  }, [pointMode, currentObjectId, video, currentFrame, width, height, pid, vid, addLocalPoint, currentFrameMasks, setCurrentFrameMasks])
+  }, [pointMode, currentObjectId, video, currentFrame, width, height, pid, vid, addLocalPoint, setCurrentFrameMasks])
 
   const cursor = pointMode ? 'crosshair' : 'default'
 

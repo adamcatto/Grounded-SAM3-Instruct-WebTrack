@@ -4,6 +4,17 @@ import { useStore, currentVideo as selectCurrentVideo } from '../../store/useSto
 import { videoSourceUrl, frameUrl } from '../../api/client'
 import AnnotationCanvas from './AnnotationCanvas'
 
+/**
+ * FrameViewer — displays the current video frame.
+ *
+ * Stack (bottom to top):
+ *   1. JPEG <img> — always visible, shows the current frame for annotation
+ *   2. <video>   — on top, fades in when playing, fades out when paused
+ *   3. AnnotationCanvas — transparent click overlay for point prompts
+ *
+ * The video src hits the backend directly (bypassing Vite's dev proxy)
+ * so HTTP Range requests work for MP4 streaming.
+ */
 export default function FrameViewer() {
   const store = useStore()
   const video = selectCurrentVideo(store)
@@ -12,21 +23,22 @@ export default function FrameViewer() {
   const containerRef = useRef<HTMLDivElement>(null)
   const videoRef = useRef<HTMLVideoElement>(null)
   const [dimensions, setDimensions] = useState({ width: 0, height: 0 })
-  const [videoReady, setVideoReady] = useState(false)
   const [showTip, setShowTip] = useState(true)
 
-  // Suppress store→video seek while the video element itself is driving frames
-  const seekLock = useRef(false)
+  // Prevent feedback loop: video timeupdate -> setCurrentFrame -> seek effect
+  const videoIsDriving = useRef(false)
+  const fpsRef = useRef(video?.fps || 30)
 
   const pid = project?.id ?? ''
   const vid = currentVideoId ?? ''
   const fps = video?.fps || 30
 
+  useEffect(() => { fpsRef.current = fps }, [fps])
+
   // ── Compute displayed dimensions ──────────────────────────────────────────
 
   useEffect(() => {
     if (!video || !containerRef.current) return
-
     const updateDims = () => {
       const container = containerRef.current
       if (!container || !video) return
@@ -38,74 +50,80 @@ export default function FrameViewer() {
       if (h > cH) { h = cH; w = h * aspect }
       setDimensions({ width: Math.floor(w), height: Math.floor(h) })
     }
-
     updateDims()
     const ro = new ResizeObserver(updateDims)
     ro.observe(containerRef.current)
     return () => ro.disconnect()
   }, [video])
 
-  // ── Reset video element when video changes ────────────────────────────────
-
-  useEffect(() => {
-    setVideoReady(false)
-  }, [vid])
-
-  // ── Sync video element play/pause with store ──────────────────────────────
+  // ── Reload video element when video changes ───────────────────────────────
 
   useEffect(() => {
     const el = videoRef.current
-    if (!el || !videoReady) return
+    if (el) el.load()
+  }, [vid])
+
+  // ── Play / Pause ──────────────────────────────────────────────────────────
+
+  useEffect(() => {
+    const el = videoRef.current
+    if (!el) return
     if (isPlaying) {
-      el.play().catch(() => {})
+      const p = el.play()
+      if (p) p.catch(err => {
+        console.error('[FrameViewer] play() rejected:', err)
+        setPlaying(false)
+      })
     } else {
       el.pause()
     }
-  }, [isPlaying, videoReady])
+  }, [isPlaying, setPlaying])
 
-  // ── When store.currentFrame changes (e.g. scrubber), seek video ───────────
+  // ── Seek video when store.currentFrame changes (scrubber / skip) ──────────
 
   useEffect(() => {
     const el = videoRef.current
-    if (!el || !videoReady || seekLock.current) return
-    const targetTime = currentFrame / fps
-    // Only seek if the difference is significant (avoids feedback loops)
-    if (Math.abs(el.currentTime - targetTime) > 0.5 / fps) {
-      el.currentTime = targetTime
+    // Only seek when paused — while playing, the video drives the frame
+    if (!el || videoIsDriving.current || isPlaying) return
+    const target = currentFrame / fps
+    if (Math.abs(el.currentTime - target) > 0.5 / fps) {
+      el.currentTime = target
     }
-  }, [currentFrame, videoReady, fps])
+  }, [currentFrame, fps, isPlaying])
 
   // ── Video event handlers ──────────────────────────────────────────────────
 
-  const handleTimeUpdate = useCallback(() => {
+  const onTimeUpdate = useCallback(() => {
     const el = videoRef.current
     if (!el) return
-    const frame = Math.round(el.currentTime * fps)
-    seekLock.current = true
+    const frame = Math.round(el.currentTime * fpsRef.current)
+    videoIsDriving.current = true
     setCurrentFrame(frame)
-    requestAnimationFrame(() => { seekLock.current = false })
-  }, [fps, setCurrentFrame])
+    requestAnimationFrame(() => { videoIsDriving.current = false })
+  }, [setCurrentFrame])
 
-  const handleLoadedData = useCallback(() => {
-    setVideoReady(true)
-    const el = videoRef.current
-    if (el) {
-      el.currentTime = currentFrame / fps
-    }
-  }, [currentFrame, fps])
+  const onEnded = useCallback(() => setPlaying(false), [setPlaying])
 
-  const handleEnded = useCallback(() => {
-    setPlaying(false)
-  }, [setPlaying])
+  const onError = useCallback((e: React.SyntheticEvent<HTMLVideoElement>) => {
+    const el = e.currentTarget
+    const err = el.error
+    console.error(
+      '[FrameViewer] video error:',
+      err ? `code=${err.code} message="${err.message}"` : 'unknown',
+      'src=', el.currentSrc,
+      'networkState=', el.networkState,
+      'readyState=', el.readyState,
+    )
+  }, [])
 
-  // ── Time formatting ───────────────────────────────────────────────────────
+  // ── Helpers ───────────────────────────────────────────────────────────────
 
-  function formatTime(frame: number, fps: number): string {
-    const secs = Math.floor(frame / fps)
-    const m = Math.floor(secs / 60)
-    const s = secs % 60
-    return `${m}:${s.toString().padStart(2, '0')}`
+  function fmt(frame: number, fps: number) {
+    const s = Math.floor(frame / fps)
+    return `${Math.floor(s / 60)}:${(s % 60).toString().padStart(2, '0')}`
   }
+
+  // ── Empty state ───────────────────────────────────────────────────────────
 
   if (!video) {
     return (
@@ -122,15 +140,13 @@ export default function FrameViewer() {
     )
   }
 
-  const src = videoSourceUrl(pid, vid)
-  const fallbackSrc = frameUrl(pid, vid, currentFrame)
+  const videoSrc = videoSourceUrl(pid, vid)
 
   return (
     <div
       ref={containerRef}
       className="flex-1 relative bg-black overflow-hidden flex items-center justify-center"
     >
-      {/* Video element + frame fallback + annotation overlay */}
       {dimensions.width > 0 && (
         <div
           style={{
@@ -140,56 +156,53 @@ export default function FrameViewer() {
             flexShrink: 0,
           }}
         >
-          {/* Fallback: frame image shown instantly while video buffers */}
-          {!videoReady && (
-            <img
-              src={fallbackSrc}
-              alt={`Frame ${currentFrame}`}
-              style={{
-                position: 'absolute',
-                top: 0,
-                left: 0,
-                width: '100%',
-                height: '100%',
-                objectFit: 'contain',
-                userSelect: 'none',
-                pointerEvents: 'none',
-              }}
-              draggable={false}
-            />
-          )}
+          {/* Layer 1: JPEG frame (always visible, under video) */}
+          <img
+            src={frameUrl(pid, vid, currentFrame)}
+            alt={`Frame ${currentFrame}`}
+            style={{
+              position: 'absolute', top: 0, left: 0,
+              width: '100%', height: '100%',
+              objectFit: 'contain',
+              userSelect: 'none', pointerEvents: 'none',
+            }}
+            draggable={false}
+          />
 
-          {/* HTML5 video element — streams via Range requests */}
+          {/* Layer 2: HTML5 video (on top, visible only while playing) */}
           <video
             ref={videoRef}
-            src={src}
             style={{
-              display: videoReady ? 'block' : 'none',
-              width: '100%',
-              height: '100%',
+              position: 'absolute', top: 0, left: 0,
+              width: '100%', height: '100%',
               objectFit: 'contain',
-              userSelect: 'none',
-              pointerEvents: 'none',
+              userSelect: 'none', pointerEvents: 'none',
+              opacity: isPlaying ? 1 : 0,
+              transition: 'opacity 0.15s ease',
             }}
             muted
             playsInline
-            preload="metadata"
-            onLoadedData={handleLoadedData}
-            onTimeUpdate={handleTimeUpdate}
-            onEnded={handleEnded}
-          />
+            preload="auto"
+            onTimeUpdate={onTimeUpdate}
+            onEnded={onEnded}
+            onError={onError}
+          >
+            <source src={videoSrc} type="video/mp4" />
+          </video>
 
-          {/* Annotation canvas overlay — show immediately so clicks work */}
+          {/* Layer 3: Annotation canvas */}
           <AnnotationCanvas width={dimensions.width} height={dimensions.height} />
         </div>
       )}
 
-      {/* Frame timestamp (top-right) */}
-      <div className="absolute top-3 right-3 bg-black/60 rounded-lg px-2 py-1 text-xs text-[#ccc] font-mono pointer-events-none">
-        {formatTime(currentFrame, fps)}
+      {/* Frame info (top-right) */}
+      <div className="absolute top-3 right-3 bg-black/60 rounded-lg px-2 py-1 text-xs text-[#ccc] font-mono pointer-events-none flex items-center gap-1.5">
+        <span>{fmt(currentFrame, fps)}</span>
+        <span className="text-[#666]">&middot;</span>
+        <span>#{currentFrame}</span>
       </div>
 
-      {/* Tip tooltip (top-right area) */}
+      {/* Tip tooltip */}
       {showTip && video && Object.keys(video.objects).length === 1 && (
         <div className="absolute top-12 right-3 bg-[#1a1a1a] border border-[#333] rounded-xl p-3 max-w-[220px] shadow-xl">
           <div className="flex items-start gap-2">

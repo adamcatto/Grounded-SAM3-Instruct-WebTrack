@@ -117,6 +117,17 @@ class SAMPredictor:
             f"last={real_indices[-3:] if real_indices else []})"
         )
 
+    def to_real_idx(self, pid: str, vid: str, sam_idx: int) -> int:
+        """
+        Translate SAM's internal 0-based sequential frame index back to the
+        real video frame index (i.e. the number in the jpg filename).
+        Falls back to sam_idx itself if no map is recorded.
+        """
+        frame_list = self._frame_maps.get((pid, vid))
+        if frame_list and sam_idx < len(frame_list):
+            return frame_list[sam_idx]
+        return sam_idx
+
     def _to_sam_idx(self, pid: str, vid: str, real_idx: int) -> int:
         """
         Translate a real video frame index to SAM's internal 0-based sequential
@@ -225,17 +236,14 @@ class SAMPredictor:
         if _model_name == "sam2":
             import torch, numpy as np
             state = self._sam2_states[(pid, vid)]
+            sam_frame_idx = self._to_sam_idx(pid, vid, frame_idx)
             with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-                # SAM2 expects pixel-space coords — we pass normalized, set normalize_coords=True
-                # and let SAM2 handle the denorm using video_height/video_width.
-                # SAM2 actually normalizes relative to video_width/video_height when
-                # normalize_coords=True, so we pass absolute pixel coords instead.
                 video_h = state["video_height"]
                 video_w = state["video_width"]
                 abs_points = [[x * video_w, y * video_h] for x, y in points]
                 frame_out_idx, obj_ids, masks = predictor.add_new_points_or_box(
                     inference_state=state,
-                    frame_idx=frame_idx,
+                    frame_idx=sam_frame_idx,
                     obj_id=obj_id,
                     points=abs_points,
                     labels=labels,
@@ -295,10 +303,11 @@ class SAMPredictor:
         if _model_name == "sam2":
             import torch
             state = self._sam2_states[(pid, vid)]
+            sam_frame_idx = self._to_sam_idx(pid, vid, frame_idx)
             with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
                 frame_out_idx, obj_ids, masks = predictor.add_new_mask(
                     inference_state=state,
-                    frame_idx=frame_idx,
+                    frame_idx=sam_frame_idx,
                     obj_id=obj_id,
                     mask=mask,
                 )
@@ -373,6 +382,7 @@ class SAMPredictor:
         vid: str,
         start_frame_idx: int | None = None,
         max_frame_num_to_track: int | None = None,
+        propagation_direction: str = "both",
     ):
         """
         Generator that yields per-frame propagation results.
@@ -390,10 +400,12 @@ class SAMPredictor:
         if _model_name == "sam2":
             import torch
             state = self._sam2_states[(pid, vid)]
+            # Translate real frame indices → SAM's internal sequential indices
+            sam_start = self._to_sam_idx(pid, vid, start_frame_idx) if start_frame_idx is not None else None
             with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
                 for frame_idx, obj_ids, masks in predictor.propagate_in_video(
                     state,
-                    start_frame_idx=start_frame_idx,
+                    start_frame_idx=sam_start,
                     max_frame_num_to_track=max_frame_num_to_track,
                 ):
                     masks_np = [(m > 0.0).cpu().numpy() for m in masks]
@@ -410,12 +422,24 @@ class SAMPredictor:
                     }
         else:
             import torch
+            # Translate real frame indices → SAM's internal sequential indices.
+            # With temp-dir-per-batch, SAM's internal index 0 is NOT necessarily
+            # real frame 0 — it's the first jpg in the temp dir.
+            sam_start = self._to_sam_idx(pid, vid, start_frame_idx) if start_frame_idx is not None else None
+            # Pre-seed the start frame's cache so SAM3's propagation assertion passes.
+            # add_points already seeds the annotated frame; this covers the case where
+            # start_frame_idx differs (e.g. frame 0) or propagation is called directly.
+            if sam_start is not None:
+                state = predictor._ALL_INFERENCE_STATES[session_id]["state"]
+                if sam_start not in state.get("cached_frame_outputs", {}):
+                    state.setdefault("cached_frame_outputs", {})[sam_start] = {}
             req = {
                 "type": "propagate_in_video",
                 "session_id": session_id,
+                "propagation_direction": propagation_direction,
             }
-            if start_frame_idx is not None:
-                req["start_frame_index"] = start_frame_idx
+            if sam_start is not None:
+                req["start_frame_index"] = sam_start
             if max_frame_num_to_track is not None:
                 req["max_frame_num_to_track"] = max_frame_num_to_track
             with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):

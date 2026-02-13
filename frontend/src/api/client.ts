@@ -67,8 +67,15 @@ export const frameUrl = (pid: string, vid: string, fidx: number) =>
 export const thumbUrl = (pid: string, vid: string, fidx: number) =>
   `/api/projects/${pid}/videos/${vid}/frames/${fidx}?thumb=true`
 
+// Video needs HTTP Range request support for seeking.  Vite's dev proxy
+// re-chunks streaming responses and can break 206 Partial Content replies,
+// so in dev we hit the backend directly (CORS is allow_origins=["*"]).
+const BACKEND = import.meta.env.DEV
+  ? (import.meta.env.VITE_BACKEND_URL ?? 'http://localhost:8000')
+  : ''
+
 export const videoSourceUrl = (pid: string, vid: string) =>
-  `/api/projects/${pid}/videos/${vid}/source`
+  `${BACKEND}/api/projects/${pid}/videos/${vid}/source`
 
 // ─── SAM3 Session ─────────────────────────────────────────────────────────────
 
@@ -114,5 +121,6 @@ export const getSavedMask = (pid: string, vid: string, fidx: number) =>
 
 // ─── Propagation SSE ─────────────────────────────────────────────────────────
 
-export const startPropagationSSE = (pid: string, vid: string) =>
-  new EventSource(`/api/projects/${pid}/videos/${vid}/propagate`)
+// SSE also benefits from bypassing Vite's proxy to avoid buffering/re-chunking
+export const startPropagationSSE = (pid: string, vid: string, startFrame = 0) =>
+  new EventSource(`${BACKEND}/api/projects/${pid}/videos/${vid}/propagate?start_frame=${startFrame}`)

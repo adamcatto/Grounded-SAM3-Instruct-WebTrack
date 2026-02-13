@@ -61,9 +61,10 @@ export default function Timeline() {
           {isPlaying ? <Pause size={14} fill="currentColor" /> : <Play size={14} fill="currentColor" />}
         </button>
 
-        {/* Timestamp */}
+        {/* Timestamp + frame index */}
         <span className="text-xs font-mono text-[#888] flex-shrink-0">
           {formatTime(currentFrame, fps)}
+          <span className="text-[#555] ml-1">#{currentFrame}</span>
         </span>
 
         {/* Progress scrubber */}

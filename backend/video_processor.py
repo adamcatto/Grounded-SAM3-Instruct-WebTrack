@@ -5,12 +5,105 @@ Video frame extraction, mask encoding, and output persistence.
 import base64
 import io
 import json
+import logging
+import shutil
+import subprocess
+import struct
 from pathlib import Path
 from typing import Optional
 
 import cv2
 import numpy as np
 from PIL import Image
+
+logger = logging.getLogger(__name__)
+
+
+# ─── MP4 web-optimization ─────────────────────────────────────────────────────
+
+def _needs_faststart(video_path: str) -> bool:
+    """
+    Check if an MP4 file has its moov atom at the end (not web-optimized).
+    Returns True if moov comes after mdat, meaning faststart is needed.
+    """
+    try:
+        with open(video_path, "rb") as f:
+            pos = 0
+            found_mdat = False
+            for _ in range(50):  # scan up to 50 top-level atoms
+                f.seek(pos)
+                header = f.read(8)
+                if len(header) < 8:
+                    break
+                size = struct.unpack(">I", header[:4])[0]
+                atom_type = header[4:8]
+                if size == 1:
+                    ext = f.read(8)
+                    if len(ext) < 8:
+                        break
+                    size = struct.unpack(">Q", ext)[0]
+                if size == 0:
+                    break
+                if atom_type == b"mdat":
+                    found_mdat = True
+                if atom_type == b"moov":
+                    # moov found — if mdat was already seen, we need faststart
+                    return found_mdat
+                pos += size
+    except Exception:
+        pass
+    # If we couldn't parse it, assume faststart is needed for safety
+    return True
+
+
+def ensure_faststart(video_path: str) -> str:
+    """
+    If the video is an MP4 without faststart (moov atom at the end),
+    re-mux it with ffmpeg -movflags +faststart.  This is a copy (no
+    re-encoding) and takes just a few seconds even for large files.
+
+    Returns the path to the web-optimized file (may be the same path
+    if no work was needed, or a new path if it was re-muxed in place).
+    """
+    path = Path(video_path)
+    if path.suffix.lower() not in (".mp4", ".mov"):
+        return video_path
+
+    if not _needs_faststart(video_path):
+        logger.info(f"Video already has faststart: {path.name}")
+        return video_path
+
+    logger.info(f"Applying faststart to {path.name} ({path.stat().st_size / 1e6:.1f} MB)...")
+    tmp_out = path.with_suffix(".faststart.mp4")
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-i", str(path),
+                "-c", "copy",                # no re-encoding
+                "-movflags", "+faststart",    # move moov to front
+                str(tmp_out),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300,  # 5 min timeout for very large files
+        )
+        if result.returncode != 0:
+            logger.error(f"ffmpeg faststart failed: {result.stderr[-500:]}")
+            tmp_out.unlink(missing_ok=True)
+            return video_path  # fall back to original
+
+        # Replace original with faststart version
+        tmp_out.replace(path)
+        logger.info(f"Faststart applied successfully: {path.name}")
+        return str(path)
+    except subprocess.TimeoutExpired:
+        logger.error("ffmpeg faststart timed out")
+        tmp_out.unlink(missing_ok=True)
+        return video_path
+    except FileNotFoundError:
+        logger.warning("ffmpeg not found — skipping faststart optimization")
+        return video_path
 
 
 # ─── Frame Extraction ─────────────────────────────────────────────────────────

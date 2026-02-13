@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3:*)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(conda info:*)",
+      "Bash(source:*)",
+      "Bash(chmod:*)",
+      "Bash(npm install)",
+      "Bash(npx tsc:*)",
+      "Bash(npx vite build:*)",
+      "Bash(conda activate:*)",
+      "Bash(python:*)",
+      "Bash(pip install:*)",
+      "Bash(curl:*)",
+      "Bash(lsof:*)",
+      "Bash(node --version:*)",
+      "Bash(conda install:*)",
+      "Bash(nm -D:*)",
+      "Bash(LD_LIBRARY_PATH=\"/home/adam/miniconda3/envs/sam2_app/lib:$LD_LIBRARY_PATH\" /home/adam/miniconda3/envs/sam3/bin/python -c \"import sqlite3; print\\(''sqlite3 OK''\\); import huggingface_hub; print\\(''huggingface_hub OK''\\)\")",
+      "Bash(LD_LIBRARY_PATH=\"/home/adam/miniconda3/envs/sam2_app/lib:$LD_LIBRARY_PATH\" /home/adam/miniconda3/envs/sam3/bin/python -c \"from sam3.model_builder import build_sam3_video_predictor; print\\(''SAM3 import OK''\\)\")",
+      "Bash(LD_LIBRARY_PATH=\"/home/adam/miniconda3/envs/sam2_app/lib:$LD_LIBRARY_PATH\" /home/adam/miniconda3/envs/sam3/bin/pip install einops)",
+      "Bash(export:*)",
+      "Bash(/home/adam/miniconda3/envs/sam3/bin/pip install einops)"
+    ]
+  }
+}
