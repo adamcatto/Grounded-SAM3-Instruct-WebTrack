@@ -612,9 +612,10 @@ def add_points(pid: str, vid: str, oid: str, req: AddPointsRequest):
         logger.error(f"SAM add_points error: {e}\n{traceback.format_exc()}")
         raise HTTPException(500, f"SAM inference error: {e}")
 
-    # Encode masks as base64 PNGs
+    # Encode masks as base64 PNGs and collect raw binary masks for persistence
     objects = video["objects"]
     mask_b64: dict[str, str] = {}
+    raw_masks: dict[str, np.ndarray] = {}
 
     frame_outputs = outputs.get(req.frame_idx, outputs.get(str(req.frame_idx), {}))
     if not frame_outputs and outputs:
@@ -633,8 +634,17 @@ def add_points(pid: str, vid: str, oid: str, req: AddPointsRequest):
         if hasattr(mask, "numpy"):
             mask = mask.numpy()
         mask = np.squeeze(mask)
+        raw_masks[str(obj_id)] = mask
         obj_color = objects.get(str(obj_id), {}).get("color", "#5B8DD9")
         mask_b64[str(obj_id)] = encode_mask_as_png(mask, obj_color)
+
+    # Persist updated masks to disk so they replace any previously propagated
+    # masks for this frame.  Merge with existing npz so objects not yet in the
+    # current session still retain their saved masks.
+    if raw_masks:
+        masks_path = pm.masks_dir(pid, vid) / f"{req.frame_idx:06d}.npz"
+        existing = load_masks_npz(str(masks_path)) if masks_path.exists() else {}
+        save_masks_npz(str(masks_path), {**existing, **raw_masks})
 
     return {"frame_idx": req.frame_idx, "masks": mask_b64}
 

@@ -38,14 +38,16 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
     canvas.height = height
     ctx.clearRect(0, 0, width, height)
 
-    // Determine which masks to show
+    // Determine which masks to show.
+    // Live annotation masks (from a recent SAM inference click) always take
+    // priority over saved propagation masks — the user just re-annotated the
+    // frame and the new result should be immediately visible.
     let masksToShow: typeof currentFrameMasks = {}
-    if (propagationStatus === 'done' || propagationStatus === 'running') {
+    if (currentFrameMasksFrame === currentFrame && Object.keys(currentFrameMasks).length > 0) {
+      masksToShow = currentFrameMasks
+    } else if (propagationStatus === 'done' || propagationStatus === 'running') {
       const saved = savedMaskCache[currentFrame]
       if (saved) masksToShow = saved
-    } else if (currentFrameMasksFrame === currentFrame) {
-      // Only show live annotation masks for the frame they were computed on
-      masksToShow = currentFrameMasks
     }
 
     // Draw masks
@@ -126,8 +128,13 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
       if (result.masks) {
         // Read latest state after async call — only merge masks from the same frame
         const state = useStore.getState()
-        const prevMasks = state.currentFrameMasksFrame === trueFrame ? state.currentFrameMasks : {}
-        setCurrentFrameMasks({ ...prevMasks, ...result.masks }, trueFrame)
+        const prevLive = state.currentFrameMasksFrame === trueFrame ? state.currentFrameMasks : {}
+        const newLive = { ...prevLive, ...result.masks }
+        setCurrentFrameMasks(newLive, trueFrame)
+        // Keep savedMaskCache in sync: merge new masks over the existing saved
+        // ones so that scrubbing away and back shows the updated result.
+        const existingSaved = state.savedMaskCache[trueFrame] ?? {}
+        setSavedMask(trueFrame, { ...existingSaved, ...result.masks })
       }
     } catch (err) {
       console.error('Failed to add point:', err)
