@@ -22,7 +22,8 @@
       "Bash(LD_LIBRARY_PATH=\"/home/adam/miniconda3/envs/sam2_app/lib:$LD_LIBRARY_PATH\" /home/adam/miniconda3/envs/sam3/bin/python -c \"from sam3.model_builder import build_sam3_video_predictor; print\\(''SAM3 import OK''\\)\")",
       "Bash(LD_LIBRARY_PATH=\"/home/adam/miniconda3/envs/sam2_app/lib:$LD_LIBRARY_PATH\" /home/adam/miniconda3/envs/sam3/bin/pip install einops)",
       "Bash(export:*)",
-      "Bash(/home/adam/miniconda3/envs/sam3/bin/pip install einops)"
+      "Bash(/home/adam/miniconda3/envs/sam3/bin/pip install einops)",
+      "Bash(conda run -n sam3 python3 -c \":*)"
     ]
   }
 }

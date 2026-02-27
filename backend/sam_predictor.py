@@ -426,13 +426,39 @@ class SAMPredictor:
             # With temp-dir-per-batch, SAM's internal index 0 is NOT necessarily
             # real frame 0 — it's the first jpg in the temp dir.
             sam_start = self._to_sam_idx(pid, vid, start_frame_idx) if start_frame_idx is not None else None
+            state = predictor._ALL_INFERENCE_STATES[session_id]["state"]
             # Pre-seed the start frame's cache so SAM3's propagation assertion passes.
             # add_points already seeds the annotated frame; this covers the case where
             # start_frame_idx differs (e.g. frame 0) or propagation is called directly.
             if sam_start is not None:
-                state = predictor._ALL_INFERENCE_STATES[session_id]["state"]
                 if sam_start not in state.get("cached_frame_outputs", {}):
                     state.setdefault("cached_frame_outputs", {})[sam_start] = {}
+            # SAM3's parse_action_history_for_propagation checks action_history to decide
+            # the propagation type.  add_prompt populates it with "add" entries, which
+            # causes it to pick propagation_partial — a mode that requires ALL frames to
+            # already be in cached_frame_outputs from a prior full propagation.  Since each
+            # batch opens a fresh session we always want propagation_full, so we clear the
+            # history here before handing off to handle_stream_request.
+            state["action_history"].clear()
+            # add_tracker_new_points (called by add_points) registers objects in the tracker
+            # but never populates rank0_metadata["obj_first_frame_idx"].  That dict is only
+            # filled for detector-found objects inside _process_hotstart.  When a prompted
+            # object is unmatched for hotstart_unmatch_thresh (=8) frames, _process_hotstart
+            # tries obj_first_frame_idx[obj_id] and crashes with KeyError.
+            # Fix: pre-seed all tracked obj_ids with a very negative frame index so that
+            # is_within_hotstart = (very_neg > frame_idx - hotstart_delay) is always False,
+            # preventing both the KeyError and the hotstart-removal heuristic from firing.
+            tracker_meta = state.get("tracker_metadata", {})
+            rank0 = tracker_meta.get("rank0_metadata") if tracker_meta else None
+            if rank0 is not None:
+                first_frame_map = rank0.get("obj_first_frame_idx")
+                if first_frame_map is not None:
+                    for oid in tracker_meta.get("obj_ids_all_gpu", []):
+                        oid_int = int(oid)
+                        if oid_int not in first_frame_map:
+                            first_frame_map[oid_int] = -999999
+                            logger.debug(f"Pre-seeded obj_first_frame_idx[{oid_int}] = -999999")
+
             req = {
                 "type": "propagate_in_video",
                 "session_id": session_id,

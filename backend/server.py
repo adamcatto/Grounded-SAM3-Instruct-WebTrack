@@ -19,7 +19,7 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from project_manager import ProjectManager
-from sam_predictor import SAMPredictor
+from sam_predictor import SAMPredictor, _get_predictor
 from video_processor import (
     encode_mask_as_png,
     ensure_faststart,
@@ -802,10 +802,16 @@ async def propagate_video(pid: str, vid: str, start_frame: int = 0):
                     if prev_batch_last_masks is None:
                         # First batch that has frame data: replay point prompts
                         # for any annotated frame that falls within this batch.
+                        replayed_count = 0
                         for obj_id_str, frame_map in all_prompts.items():
                             for fidx_str, prompt in frame_map.items():
                                 real_fidx = int(fidx_str)
                                 if batch_start <= real_fidx < batch_end:
+                                    logger.info(
+                                        f"Batch {batch_idx}: replaying prompts for "
+                                        f"obj {obj_id_str} on frame {real_fidx} "
+                                        f"(points={len(prompt['points'])})"
+                                    )
                                     sam.add_points(
                                         pid, vid,
                                         frame_idx=real_fidx,
@@ -813,8 +819,25 @@ async def propagate_video(pid: str, vid: str, start_frame: int = 0):
                                         points=prompt["points"],
                                         labels=prompt["labels"],
                                     )
+                                    replayed_count += 1
                                     if sam3_annotated_frame is None or real_fidx < sam3_annotated_frame:
                                         sam3_annotated_frame = real_fidx
+                        logger.info(
+                            f"Batch {batch_idx}: replayed {replayed_count} prompt(s), "
+                            f"annotated_frame={sam3_annotated_frame}"
+                        )
+                        # Verify the cache was populated
+                        if is_sam3 and replayed_count > 0:
+                            try:
+                                sid = sam.get_session_id(pid, vid)
+                                state = _get_predictor()._ALL_INFERENCE_STATES[sid]["state"]
+                                cached = state.get("cached_frame_outputs", {})
+                                logger.info(
+                                    f"Batch {batch_idx}: cached_frame_outputs has "
+                                    f"{len(cached)} frame(s): {list(cached.keys())[:10]}"
+                                )
+                            except Exception as dbg_e:
+                                logger.warning(f"Debug cache check failed: {dbg_e}")
                     else:
                         # Subsequent batches: seed from previous batch's last masks
                         for obj_id_int, mask_np in prev_batch_last_masks.items():
@@ -838,33 +861,29 @@ async def propagate_video(pid: str, vid: str, start_frame: int = 0):
                 last_frame_masks: dict = {}
                 batch_frame_count = 0
 
-                # SAM3: bidirectional from annotated frame in first batch,
-                # forward-only in subsequent batches.
-                # SAM2: always forward from batch_start.
-                if is_sam3:
-                    _start = sam3_annotated_frame if (batch_idx == 0 and sam3_annotated_frame is not None) else batch_start
-                    _direction = "both" if batch_idx == 0 else "forward"
+                # Always propagate forward.  For the first batch, start from
+                # the annotated frame (not frame 0) — SAM needs the prompt
+                # cache at the start frame.  Frames before the annotated
+                # frame in this batch won't get masks, which is fine since
+                # nothing was annotated there.
+                # Subsequent batches start from batch_start (seeded via masks).
+                if batch_idx == 0 and sam3_annotated_frame is not None:
+                    _start = sam3_annotated_frame
                 else:
                     _start = batch_start
-                    _direction = "forward"
+                _direction = "forward"
 
                 def _run_propagation(
                     b_start=batch_start, b_len=batch_len,
                     s3_start=_start, direction=_direction,
                 ):
                     try:
-                        if is_sam3:
-                            prop_iter = sam.propagate_stream(
-                                pid, vid,
-                                start_frame_idx=s3_start,
-                                propagation_direction=direction,
-                            )
-                        else:
-                            prop_iter = sam.propagate_stream(
-                                pid, vid,
-                                start_frame_idx=b_start,
-                                max_frame_num_to_track=b_len,
-                            )
+                        prop_iter = sam.propagate_stream(
+                            pid, vid,
+                            start_frame_idx=s3_start,
+                            max_frame_num_to_track=b_len if not is_sam3 else None,
+                            propagation_direction=direction,
+                        )
                         for item in prop_iter:
                             asyncio.run_coroutine_threadsafe(
                                 queue.put(("frame", item)), loop
