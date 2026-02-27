@@ -568,24 +568,31 @@ def add_points(pid: str, vid: str, oid: str, req: AddPointsRequest):
 
         # Replay all previously saved point prompts so SAM knows about
         # every object that was annotated on earlier frames.
+        # IMPORTANT: collect all items and sort by frame index before replaying.
+        # SAM3 requires frames to be processed in sequential order — replaying
+        # object-by-object (which may put a later frame before an earlier one)
+        # causes "Image features for frame N are not cached" errors.
         all_prompts = pm.get_all_point_prompts(pid, vid)
         frame_map = sam._frame_maps.get((pid, vid), [])
+        replay_items: list[tuple[int, int, dict]] = []
         for obj_id_str, frame_map_prompts in all_prompts.items():
             for fidx_str, prompt in frame_map_prompts.items():
                 replay_fidx = int(fidx_str)
-                # Only replay prompts whose frame is in the current session
                 if replay_fidx in frame_map:
-                    try:
-                        sam.add_points(
-                            pid, vid,
-                            frame_idx=replay_fidx,
-                            obj_id=int(obj_id_str),
-                            points=prompt["points"],
-                            labels=prompt["labels"],
-                        )
-                        logger.debug(f"Replayed prompts for obj {obj_id_str} on frame {replay_fidx}")
-                    except Exception as e:
-                        logger.warning(f"Failed to replay prompts for obj {obj_id_str} frame {replay_fidx}: {e}")
+                    replay_items.append((replay_fidx, int(obj_id_str), prompt))
+        replay_items.sort(key=lambda x: x[0])
+        for replay_fidx, replay_obj_id, prompt in replay_items:
+            try:
+                sam.add_points(
+                    pid, vid,
+                    frame_idx=replay_fidx,
+                    obj_id=replay_obj_id,
+                    points=prompt["points"],
+                    labels=prompt["labels"],
+                )
+                logger.debug(f"Replayed prompts for obj {replay_obj_id} on frame {replay_fidx}")
+            except Exception as e:
+                logger.warning(f"Failed to replay prompts for obj {replay_obj_id} frame {replay_fidx}: {e}")
 
     # Save prompts to config
     pm.save_point_prompts(pid, vid, oid, req.frame_idx, req.points, req.labels)

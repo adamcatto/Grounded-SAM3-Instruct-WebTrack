@@ -88,6 +88,8 @@ export const useStore = create<AppState>((set, get) => ({
   setCurrentVideo: vid => {
     const prev = get().currentVideoId
     if (prev !== vid) {
+      const vidData = vid ? get().project?.videos[vid] : undefined
+      const alreadyPropagated = vidData?.propagation_complete ?? false
       set({
         currentVideoId: vid,
         currentFrame: 0,
@@ -98,8 +100,8 @@ export const useStore = create<AppState>((set, get) => ({
         currentFrameMasksFrame: null,
         savedMaskCache: {},
         isPlaying: false,
-        propagationStatus: 'idle',
-        propagationProgress: 0,
+        propagationStatus: alreadyPropagated ? 'done' : 'idle',
+        propagationProgress: alreadyPropagated ? 1 : 0,
         sessionInitialized: false,
       })
     }
