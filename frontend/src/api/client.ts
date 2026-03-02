@@ -61,6 +61,9 @@ export const getVideoInfo = (pid: string, vid: string) =>
 export const removeVideo = (pid: string, vid: string) =>
   api.delete(`/projects/${pid}/videos/${vid}`)
 
+export const resetVideo = (pid: string, vid: string) =>
+  api.post(`/projects/${pid}/videos/${vid}/reset`).then(r => r.data)
+
 export const frameUrl = (pid: string, vid: string, fidx: number) =>
   `/api/projects/${pid}/videos/${vid}/frames/${fidx}`
 

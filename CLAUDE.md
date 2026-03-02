@@ -31,6 +31,9 @@ uvicorn server:app --host 0.0.0.0 --port 8000 --reload
 ```
 (The start script handles conda activation and LD_LIBRARY_PATH.)
 
+**Environment variables** (frontend):
+- `VITE_BACKEND_URL`: Override the backend URL for video/SSE direct connections (default: `http://localhost:8000`)
+
 There are no automated tests.
 
 ## Architecture
@@ -56,11 +59,25 @@ The app has three phases:
 
 **SAM session lifecycle**: One session per (project, video) pair. Opened on `POST /session`, stays open during annotation and propagation, closed on `DELETE /session`. Sessions hold the inference state and a frame index map.
 
+**Session re-initialization on new frame annotation**: When the user annotates a frame not yet in the current session (e.g. a new frame extracted on-demand), `POST /objects/{oid}/points` detects this and re-inits the session against the full `annotated_frames/` directory. All saved point prompts are then replayed **sorted by frame index** (SAM3 requires sequential order — out-of-order replay triggers "Image features for frame N are not cached" errors).
+
+**Frame directories**: Three distinct directories exist for JPG frames:
+- `frames/` — populated on-demand when the user views a frame; used as the video frame strip in the UI
+- `annotated_frames/` — single frames extracted on-demand when the user annotates; SAM sessions for annotation point at this directory
+- Temp dirs (`/tmp/sam3wt_*`) — created per propagation mini-batch, deleted after each batch completes
+
 **Frame index translation**: Preview frames have gaps (e.g., `000000.jpg`, `001902.jpg`), but SAM expects sequential indices (0, 1, 2…). `sam_predictor._build_frame_map` scans the frames directory and `_to_sam_idx` translates real → SAM indices on every call.
 
 **Cross-batch identity tracking**: Propagation runs in 1000-frame mini-batches (`STREAM_BATCH_SIZE` in `server.py`). Each batch uses a temp directory that is deleted after processing. The last frame's masks from batch N are fed as prompts to seed batch N+1, preserving object IDs across batches.
 
 **Model fallback**: SAM3 is preferred (`pretrained_models/sam3.pt`). If missing, falls back to SAM2 (`pretrained_models/sam2.1_hiera_large.pt`). Both use the same internal API surface in `sam_predictor.py`.
+
+**SAM3 internal state workarounds** (in `sam_predictor.propagate_stream`): SAM3 has several bugs that require direct mutation of its internal state dict (`_ALL_INFERENCE_STATES[sid]["state"]`):
+- `cached_frame_outputs[frame_idx]` must be pre-seeded with `{}` before `add_prompt` or propagation — SAM3 asserts it exists
+- `action_history` must be cleared before propagation — otherwise SAM3 picks `propagation_partial` mode (which requires a prior full propagation) instead of `propagation_full`
+- `rank0_metadata["obj_first_frame_idx"][obj_id]` must be pre-seeded with `-999999` for all tracked objects — without it SAM3's hotstart heuristic crashes with `KeyError` when an object is unmatched for 8+ frames
+
+**SAM3 mask handoff between batches**: SAM3 has no `add_new_mask` API, so cross-batch seeding uses a point prompt at the mask's center-of-mass instead (see `add_mask_prompt`).
 
 ### Frontend (`frontend/src/`)
 
@@ -69,6 +86,7 @@ The app has three phases:
 | `store/useStore.ts` | Zustand global state: current frame, objects, masks, propagation status |
 | `api/client.ts` | Typed Axios wrappers for all backend endpoints + SSE helper |
 | `components/FrameViewer/` | Frame display + `AnnotationCanvas` click-to-annotate overlay |
+| `components/VideoPlayer/` | HTML5 video element wrapper for smooth playback mode |
 | `components/LeftPanel/` | Object list, propagation controls, SSE event handling |
 | `components/Timeline/` | Playback controls, thumbnail strip, per-object progress rows |
 
@@ -77,6 +95,8 @@ The app has three phases:
 **Coordinate system**: Frontend sends normalized [0,1] point coordinates. Backend receives and passes them directly to SAM. Saved masks are full-resolution `(H, W)` binary uint8 arrays.
 
 **Mask rendering**: `maskUtils.ts` caches decoded base64 mask PNGs as `HTMLImageElement` objects. `AnnotationCanvas` composites live (post-click) masks from `currentFrameMasks` and saved (post-propagation) masks from `savedMaskCache`.
+
+**Object IDs**: Assigned by `ProjectManager.add_object` as sequential integers starting at 1, stored as string keys in `config.json` (e.g. `"1"`, `"2"`). SAM receives them as `int`. The same ID string is used in `masks/*.npz` dict keys and bbox JSON keys.
 
 ### Storage Layout
 

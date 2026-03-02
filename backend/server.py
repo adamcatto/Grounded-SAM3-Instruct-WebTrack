@@ -316,6 +316,51 @@ def remove_video(pid: str, vid: str):
     pm.remove_video(pid, vid)
 
 
+@app.post("/api/projects/{pid}/videos/{vid}/reset", status_code=200)
+def reset_video(pid: str, vid: str):
+    """
+    Clear all annotations and tracking data for a video while keeping the
+    video file itself.  Removes:
+      - All objects and point prompts from config.json
+      - Saved masks (masks/*.npz) and bboxes (bboxes/*.json)
+      - Annotated frames (annotated_frames/)
+      - Preview frames (frames/)
+      - Active SAM session
+      - propagation_complete / propagated_frames flags
+    """
+    video = pm.get_video(pid, vid)
+    if video is None:
+        raise HTTPException(404, "Video not found")
+
+    # Close any active SAM session
+    sam.close_session(pid, vid)
+
+    # Wipe masks and bboxes directories
+    masks_dir = pm.masks_dir(pid, vid)
+    bboxes_dir = pm.bboxes_dir(pid, vid)
+    ann_dir = pm.annotated_frames_dir(pid, vid)
+    frames_dir = pm.frames_dir(pid, vid)
+
+    for d in (masks_dir, bboxes_dir, ann_dir, frames_dir):
+        if d.exists():
+            shutil.rmtree(str(d))
+        d.mkdir(parents=True, exist_ok=True)
+
+    # Reset config: clear objects, prompts, propagation state
+    pm.update_video(pid, vid, {
+        "objects": {},
+        "point_prompts": {},
+        "sam3_session_id": None,
+        "propagated_frames": [],
+        "propagation_complete": False,
+        "frames_extracted": False,
+        "all_frames_extracted": False,
+        "preview_indices": [],
+    })
+
+    return {"status": "ok"}
+
+
 # ─── Frames ──────────────────────────────────────────────────────────────────
 
 @app.get("/api/projects/{pid}/videos/{vid}/frames/{fidx}")

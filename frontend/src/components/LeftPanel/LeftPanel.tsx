@@ -1,8 +1,9 @@
 import React, { useState } from 'react'
 import { Plus, RotateCcw, ChevronRight, Loader } from 'lucide-react'
 import { useStore, currentVideo as selectCurrentVideo } from '../../store/useStore'
-import { addObject, initSession, startPropagationSSE, getProject } from '../../api/client'
+import { addObject, initSession, startPropagationSSE, getProject, resetVideo } from '../../api/client'
 import { getObjectColor } from '../../utils/colors'
+import { clearMaskCache } from '../../utils/maskUtils'
 import ObjectCard from './ObjectCard'
 import StepIndicator from './StepIndicator'
 import type { PropagationEvent } from '../../types'
@@ -124,9 +125,19 @@ export default function LeftPanel() {
 
   // ── Start Over ────────────────────────────────────────────────────────────────
 
-  function handleStartOver() {
+  async function handleStartOver() {
     if (!confirm('Clear all annotations and masks for this video?')) return
-    resetVideoState()
+    if (!pid || !currentVideoId) return
+    try {
+      await resetVideo(pid, currentVideoId)
+      clearMaskCache()
+      resetVideoState()
+      // Reload project so objects/prompts are cleared in store
+      const updated = await getProject(pid)
+      setProject(updated)
+    } catch (e) {
+      console.error('Reset failed', e)
+    }
   }
 
   // ─── Empty state ──────────────────────────────────────────────────────────────
