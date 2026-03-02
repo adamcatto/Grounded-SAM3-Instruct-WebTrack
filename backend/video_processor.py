@@ -375,6 +375,175 @@ def load_bboxes_json(json_path: str) -> dict:
     return json.loads(Path(json_path).read_text())
 
 
+# ─── Video Export ─────────────────────────────────────────────────────────────
+
+def overlay_masks_on_frame(
+    frame_bgr: np.ndarray,
+    masks: dict,        # {obj_id_str: binary H×W uint8/bool}
+    colors: dict,       # {obj_id_str: hex_color}
+    labels: dict,       # {obj_id_str: label_text}
+    alpha_fill: float = 0.4,
+    border_thickness: int = 2,
+) -> np.ndarray:
+    """
+    Composite object masks with labels onto a BGR video frame.
+    Returns a new frame; does not modify the input.
+    """
+    out = frame_bgr.copy()
+    H, W = out.shape[:2]
+    overlay = out.copy()
+
+    for obj_id_str, mask in masks.items():
+        if mask is None:
+            continue
+        mask_bool = np.squeeze(np.asarray(mask)).astype(bool)
+        if mask_bool.ndim != 2:
+            continue
+        if mask_bool.shape != (H, W):
+            mask_bool = cv2.resize(
+                mask_bool.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST
+            ).astype(bool)
+        r, g, b = hex_to_rgb(colors.get(str(obj_id_str), "#5B8DD9"))
+        overlay[mask_bool] = (b, g, r)  # OpenCV BGR
+
+    # Blend semi-transparent fill
+    cv2.addWeighted(overlay, alpha_fill, out, 1.0 - alpha_fill, 0.0, out)
+
+    # Draw borders and labels on top (fully opaque)
+    for obj_id_str, mask in masks.items():
+        if mask is None:
+            continue
+        mask_bool = np.squeeze(np.asarray(mask)).astype(bool)
+        if mask_bool.ndim != 2:
+            continue
+        if mask_bool.shape != (H, W):
+            mask_bool = cv2.resize(
+                mask_bool.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST
+            ).astype(bool)
+
+        r, g, b = hex_to_rgb(colors.get(str(obj_id_str), "#5B8DD9"))
+        bright = (min(255, b + 80), min(255, g + 80), min(255, r + 80))
+        mask_u8 = mask_bool.astype(np.uint8) * 255
+        contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(out, contours, -1, bright, border_thickness)
+
+        # Label at centroid
+        label = labels.get(str(obj_id_str), f"Object {obj_id_str}")
+        ys, xs = np.where(mask_bool)
+        if len(ys) == 0:
+            continue
+        cx, cy = int(xs.mean()), int(ys.mean())
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = max(0.35, min(0.65, W / 1920.0))
+        thick = 1
+        (tw, th), baseline = cv2.getTextSize(label, font, scale, thick)
+        tx = max(2, min(cx - tw // 2, W - tw - 4))
+        ty = max(th + baseline + 4, min(cy, H - baseline - 4))
+        pad = 3
+        cv2.rectangle(
+            out,
+            (tx - pad, ty - th - pad),
+            (tx + tw + pad, ty + baseline + pad),
+            (20, 20, 20),
+            -1,
+        )
+        cv2.putText(out, label, (tx, ty), font, scale, (255, 255, 255), thick, cv2.LINE_AA)
+
+    return out
+
+
+def export_video_with_masks(
+    source_path: str,
+    out_path: str,
+    masks_dir: str,
+    colors: dict,       # {obj_id_str: hex_color}
+    labels: dict,       # {obj_id_str: label_text}
+    num_frames_hint: int = 0,
+    progress_callback=None,  # fn(frame_idx: int, total: int)
+) -> dict:
+    """
+    Write source_path to out_path as H.264 MP4, overlaying masks from
+    masks_dir/{frame_idx:06d}.npz for each frame.
+
+    Does NOT read or modify any SAM session state, annotated_frames, or
+    inference data — only reads the source video and masks/*.npz files.
+
+    Returns {"total_frames": N, "fps": fps}.
+    """
+    cap = cv2.VideoCapture(str(source_path))
+    if not cap.isOpened():
+        raise ValueError(f"Cannot open source video: {source_path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or num_frames_hint or 1000
+
+    masks_path = Path(masks_dir)
+    emit_every = max(30, total // 200)
+
+    ffmpeg_proc = subprocess.Popen(
+        [
+            "ffmpeg", "-y",
+            "-f", "rawvideo", "-pixel_format", "bgr24",
+            "-video_size", f"{width}x{height}",
+            "-framerate", str(fps),
+            "-i", "pipe:0",
+            "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+            "-movflags", "+faststart",
+            str(out_path),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+
+    frame_idx = 0
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            npz_path = masks_path / f"{frame_idx:06d}.npz"
+            if npz_path.exists():
+                try:
+                    raw_masks = load_masks_npz(str(npz_path))
+                    if raw_masks:
+                        frame = overlay_masks_on_frame(frame, raw_masks, colors, labels)
+                except Exception as e:
+                    logger.warning(f"Mask overlay failed for frame {frame_idx}: {e}")
+            ffmpeg_proc.stdin.write(frame.tobytes())
+            frame_idx += 1
+            if progress_callback and frame_idx % emit_every == 0:
+                progress_callback(frame_idx, total)
+    except Exception:
+        cap.release()
+        try:
+            ffmpeg_proc.stdin.close()
+        except Exception:
+            pass
+        ffmpeg_proc.wait(timeout=30)
+        raise
+    finally:
+        cap.release()
+
+    # Signal end of input and wait for ffmpeg to finish
+    try:
+        ffmpeg_proc.stdin.close()
+    except Exception:
+        pass
+    ret_code = ffmpeg_proc.wait(timeout=300)
+    if ret_code != 0:
+        stderr_out = ffmpeg_proc.stderr.read().decode(errors="replace")
+        raise RuntimeError(f"ffmpeg encoding failed (exit {ret_code}): {stderr_out[-500:]}")
+
+    # Emit final progress at 100%
+    if progress_callback:
+        progress_callback(frame_idx, frame_idx or 1)
+
+    return {"total_frames": frame_idx, "fps": fps}
+
+
 # ─── Thumbnail Generation ──────────────────────────────────────────────────────
 
 def generate_thumbnail(frame_path: str, height: int = 60) -> Optional[bytes]:

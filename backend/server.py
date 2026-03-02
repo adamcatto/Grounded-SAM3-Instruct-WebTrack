@@ -23,6 +23,7 @@ from sam_predictor import SAMPredictor, _get_predictor
 from video_processor import (
     encode_mask_as_png,
     ensure_faststart,
+    export_video_with_masks,
     extract_frames,
     extract_frame_range,
     get_video_info,
@@ -751,6 +752,83 @@ def get_composite_mask(pid: str, vid: str, fidx: int):
     import base64, io
     png_bytes = base64.b64decode(b64)
     return StreamingResponse(io.BytesIO(png_bytes), media_type="image/png")
+
+
+# ─── Video Export (SSE) ──────────────────────────────────────────────────────
+
+@app.get("/api/projects/{pid}/videos/{vid}/export")
+async def export_video_sse(pid: str, vid: str):
+    """
+    Stream export progress as Server-Sent Events while writing an annotated
+    MP4 to disk.  Reads only the source video and masks/*.npz files — does
+    not touch SAM sessions, annotated_frames, or inference state.
+
+    Progress events: {"frame": N, "total": T, "progress": 0.0-1.0}
+    Done event:      {"path": "/abs/path/export.mp4", "total_frames": N}
+    """
+    video = pm.get_video(pid, vid)
+    if video is None:
+        raise HTTPException(404, "Video not found")
+    source_path = video.get("source_path", "")
+    if not source_path or not Path(source_path).exists():
+        raise HTTPException(400, "Video source file not found")
+
+    objects = video["objects"]
+    colors = {oid: obj.get("color", "#5B8DD9") for oid, obj in objects.items()}
+    labels_map = {oid: obj.get("name", f"Object {oid}") for oid, obj in objects.items()}
+    masks_dir = str(pm.masks_dir(pid, vid))
+    out_path = BASE_PROJECTS / pid / "videos" / vid / "export.mp4"
+
+    async def event_gen():
+        import concurrent.futures
+        loop = asyncio.get_event_loop()
+        queue: asyncio.Queue = asyncio.Queue(maxsize=300)
+
+        def _progress(frame_idx: int, total: int):
+            asyncio.run_coroutine_threadsafe(
+                queue.put(("progress", {
+                    "frame": frame_idx,
+                    "total": total,
+                    "progress": round(min(frame_idx / max(total, 1), 1.0), 4),
+                })),
+                loop,
+            ).result()
+
+        def _run():
+            try:
+                result = export_video_with_masks(
+                    source_path=source_path,
+                    out_path=str(out_path),
+                    masks_dir=masks_dir,
+                    colors=colors,
+                    labels=labels_map,
+                    num_frames_hint=video.get("num_frames", 0),
+                    progress_callback=_progress,
+                )
+                asyncio.run_coroutine_threadsafe(
+                    queue.put(("done", {
+                        "path": str(out_path),
+                        "total_frames": result["total_frames"],
+                    })),
+                    loop,
+                ).result()
+            except Exception as exc:
+                logger.error(f"Video export failed for {pid}/{vid}: {exc}", exc_info=True)
+                asyncio.run_coroutine_threadsafe(
+                    queue.put(("error", {"error": str(exc)})),
+                    loop,
+                ).result()
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        loop.run_in_executor(executor, _run)
+
+        while True:
+            msg_type, payload = await queue.get()
+            yield {"event": msg_type, "data": json.dumps(payload)}
+            if msg_type in ("done", "error"):
+                break
+
+    return EventSourceResponse(event_gen())
 
 
 # ─── Propagation (SSE) — streaming mini-batch frame processing ───────────────

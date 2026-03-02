@@ -11,6 +11,8 @@ import FrameViewer from './components/FrameViewer/FrameViewer'
 import VideoPlayer from './components/VideoPlayer/VideoPlayer'
 import Timeline from './components/Timeline/Timeline'
 import LoadingScreen from './components/LoadingScreen'
+import ResizeHandle from './components/ResizeHandle'
+import { useResizable } from './hooks/useResizable'
 
 function TabButton({ active, icon, label, onClick }: {
   active: boolean
@@ -42,6 +44,15 @@ export default function App() {
   } = store
 
   const [backendReady, setBackendReady] = useState(false)
+
+  // ── Resizable panels ──────────────────────────────────────────────────────
+  const [leftWidth, leftHandleMouseDown] = useResizable(256, { min: 180, max: 450 })
+  const [timelineHeight, timelineHandleMouseDown] = useResizable(130, {
+    min: 70,
+    max: 280,
+    direction: 'vertical',
+    reverse: true,  // drag up → timeline grows
+  })
 
   const handleBackendReady = useCallback(() => {
     setBackendReady(true)
@@ -78,10 +89,16 @@ export default function App() {
 
       {/* Main content area */}
       <div className="flex flex-1 overflow-hidden">
-        {/* Left panel (fixed width) */}
-        <div className="w-64 flex-shrink-0 border-r border-[#1e1e1e] flex flex-col overflow-hidden bg-[#111111]">
+        {/* Left panel (resizable width) */}
+        <div
+          className="flex-shrink-0 flex flex-col overflow-hidden bg-[#111111]"
+          style={{ width: leftWidth }}
+        >
           <LeftPanel />
         </div>
+
+        {/* Vertical resize handle between left panel and center */}
+        <ResizeHandle direction="horizontal" onMouseDown={leftHandleMouseDown} />
 
         {/* Right: tab bar + viewer + timeline stacked */}
         <div className="flex-1 flex flex-col overflow-hidden">
@@ -106,9 +123,14 @@ export default function App() {
           {/* Viewer (grows to fill) */}
           {viewerTab === 'annotate' ? <FrameViewer /> : <VideoPlayer />}
 
-          {/* Timeline (fixed height at bottom) */}
+          {/* Horizontal resize handle between viewer and timeline */}
           {video && viewerTab === 'annotate' && (
-            <div className="flex-shrink-0">
+            <ResizeHandle direction="vertical" onMouseDown={timelineHandleMouseDown} />
+          )}
+
+          {/* Timeline (resizable height) */}
+          {video && viewerTab === 'annotate' && (
+            <div className="flex-shrink-0 overflow-hidden" style={{ height: timelineHeight }}>
               <Timeline />
             </div>
           )}

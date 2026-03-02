@@ -131,3 +131,8 @@ export const getSavedMask = (pid: string, vid: string, fidx: number) =>
 // SSE also benefits from bypassing Vite's proxy to avoid buffering/re-chunking
 export const startPropagationSSE = (pid: string, vid: string, startFrame = 0) =>
   new EventSource(`${BACKEND}/api/projects/${pid}/videos/${vid}/propagate?start_frame=${startFrame}`)
+
+// ─── Export SSE ───────────────────────────────────────────────────────────────
+
+export const startExportSSE = (pid: string, vid: string) =>
+  new EventSource(`${BACKEND}/api/projects/${pid}/videos/${vid}/export`)

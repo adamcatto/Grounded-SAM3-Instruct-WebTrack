@@ -1,7 +1,7 @@
 import React, { useState } from 'react'
-import { Plus, RotateCcw, ChevronRight, Loader } from 'lucide-react'
+import { Plus, RotateCcw, ChevronRight, Loader, Download, X } from 'lucide-react'
 import { useStore, currentVideo as selectCurrentVideo } from '../../store/useStore'
-import { addObject, initSession, startPropagationSSE, getProject, resetVideo } from '../../api/client'
+import { addObject, initSession, startPropagationSSE, startExportSSE, getProject, resetVideo } from '../../api/client'
 import { getObjectColor } from '../../utils/colors'
 import { clearMaskCache } from '../../utils/maskUtils'
 import ObjectCard from './ObjectCard'
@@ -26,6 +26,12 @@ export default function LeftPanel() {
   const [initializingSession, setInitializingSession] = useState(false)
   const [trackingError, setTrackingError] = useState('')
   const [batchStatus, setBatchStatus] = useState('')
+
+  type ExportStatus = 'idle' | 'running' | 'done' | 'error'
+  const [exportStatus, setExportStatus] = useState<ExportStatus>('idle')
+  const [exportProgress, setExportProgress] = useState(0)
+  const [exportPath, setExportPath] = useState<string | null>(null)
+  const [exportError, setExportError] = useState('')
 
   const objects = video ? Object.values(video.objects) : []
   const pid = project?.id ?? ''
@@ -120,6 +126,50 @@ export default function LeftPanel() {
         setTrackingError('Connection lost during propagation')
         es.close()
       }
+    }
+  }
+
+  // ── Export Video ─────────────────────────────────────────────────────────────
+
+  function handleExport() {
+    if (!pid || !vid) return
+    setExportStatus('running')
+    setExportProgress(0)
+    setExportPath(null)
+    setExportError('')
+
+    const es = startExportSSE(pid, vid)
+    es.addEventListener('progress', (e: MessageEvent) => {
+      const data = JSON.parse(e.data)
+      setExportProgress(data.progress ?? 0)
+    })
+    es.addEventListener('done', (e: MessageEvent) => {
+      const data = JSON.parse(e.data)
+      setExportStatus('done')
+      setExportProgress(1)
+      setExportPath(data.path ?? null)
+      es.close()
+    })
+    es.addEventListener('error', (e: Event) => {
+      try {
+        const data = JSON.parse((e as MessageEvent).data ?? '{}')
+        setExportError(data.error ?? 'Export failed')
+      } catch {
+        setExportError('Export failed')
+      }
+      setExportStatus('error')
+      es.close()
+    })
+    es.onerror = () => {
+      // Use functional updater to read current status without stale closure
+      setExportStatus(prev => {
+        if (prev !== 'done') {
+          setExportError('Connection lost during export')
+          es.close()
+          return 'error'
+        }
+        return prev
+      })
     }
   }
 
@@ -266,6 +316,47 @@ export default function LeftPanel() {
         </p>
       )}
 
+      {/* Export progress */}
+      {exportStatus === 'running' && (
+        <div className="mx-3 mb-2 space-y-1">
+          <div className="flex justify-between text-xs text-[#888]">
+            <span>Exporting video...</span>
+            <span>{Math.round(exportProgress * 100)}%</span>
+          </div>
+          <div className="h-1.5 bg-[#2a2a2a] rounded-full overflow-hidden">
+            <div
+              className="h-full bg-emerald-500 transition-all duration-300"
+              style={{ width: `${exportProgress * 100}%` }}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* Export error */}
+      {exportStatus === 'error' && exportError && (
+        <p className="mx-3 mb-2 text-xs text-red-400 bg-red-400/10 rounded-lg px-3 py-2">
+          {exportError}
+        </p>
+      )}
+
+      {/* Export done */}
+      {exportStatus === 'done' && exportPath && (
+        <div className="mx-3 mb-2 rounded-lg bg-emerald-400/10 border border-emerald-400/20 px-3 py-2">
+          <div className="flex items-start gap-2">
+            <div className="flex-1 min-w-0">
+              <p className="text-xs text-emerald-400 font-medium mb-1">Export saved</p>
+              <p className="text-xs text-[#888] break-all font-mono leading-relaxed">{exportPath}</p>
+            </div>
+            <button
+              onClick={() => setExportStatus('idle')}
+              className="text-[#555] hover:text-[#aaa] flex-shrink-0 mt-0.5"
+            >
+              <X size={12} />
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Start frame */}
       <div className="px-3 pb-2 flex items-center gap-2 flex-shrink-0">
         <label className="text-xs text-[#666] whitespace-nowrap">Start frame</label>
@@ -281,30 +372,44 @@ export default function LeftPanel() {
       </div>
 
       {/* Bottom buttons */}
-      <div className="flex items-center gap-2 p-3 border-t border-[#2a2a2a] flex-shrink-0">
+      <div className="flex items-center gap-1 p-2 border-t border-[#2a2a2a] flex-shrink-0">
         <button
           onClick={handleStartOver}
           disabled={isTracking}
-          className="btn btn-ghost flex items-center gap-1.5 text-xs"
+          className="btn btn-ghost flex items-center gap-1 text-xs"
         >
-          <RotateCcw size={12} />
+          <RotateCcw size={11} />
           Start over
         </button>
+        {(video.propagated_frames?.length ?? 0) > 0 && (
+          <button
+            onClick={handleExport}
+            disabled={exportStatus === 'running' || isTracking}
+            className="btn btn-ghost flex items-center gap-1 text-xs disabled:opacity-40"
+            title="Export annotated MP4"
+          >
+            {exportStatus === 'running'
+              ? <Loader size={11} className="animate-spin" />
+              : <Download size={11} />
+            }
+            Export
+          </button>
+        )}
         <div className="flex-1" />
         <button
           onClick={handleTrack}
           disabled={isTracking || !hasObjects || initializingSession}
-          className="btn btn-primary flex items-center gap-1.5 text-sm px-4 py-2 disabled:opacity-40"
+          className="btn btn-primary flex items-center gap-1 text-xs disabled:opacity-40"
         >
           {isTracking ? (
             <>
-              <Loader size={14} className="animate-spin" />
+              <Loader size={11} className="animate-spin" />
               Tracking...
             </>
           ) : (
             <>
               Track objects
-              <ChevronRight size={14} />
+              <ChevronRight size={11} />
             </>
           )}
         </button>

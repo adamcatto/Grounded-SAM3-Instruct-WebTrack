@@ -49,7 +49,7 @@ export default function Timeline() {
   const progress = total > 0 ? (currentFrame / (total - 1)) * 100 : 0
 
   return (
-    <div className="flex-shrink-0 bg-[#0d0d0d] border-t border-[#222]">
+    <div className="flex-shrink-0 bg-[#0d0d0d]">
       {/* Controls row */}
       <div className="flex items-center gap-3 px-3 py-2 border-b border-[#1a1a1a]">
         {/* Play/Pause */}
