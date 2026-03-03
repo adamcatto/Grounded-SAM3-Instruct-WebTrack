@@ -979,8 +979,30 @@ async def propagate_video(pid: str, vid: str, start_frame: int = 0):
                             except Exception as dbg_e:
                                 logger.warning(f"Debug cache check failed: {dbg_e}")
                     else:
-                        # Subsequent batches: seed from previous batch's last masks
-                        for obj_id_int, mask_np in prev_batch_last_masks.items():
+                        # Subsequent batches: seed from the best available mask for
+                        # each object.  Merge two sources (disk wins only when
+                        # in-memory is absent):
+                        #   1. Saved .npz for the last frame of the previous batch —
+                        #      acts as a fallback for objects SAM temporarily lost
+                        #      near the end of that batch (so they didn't end up in
+                        #      prev_batch_last_masks / last_frame_masks).
+                        #   2. In-memory prev_batch_last_masks — more recent, so it
+                        #      overrides the disk value when present.
+                        seed_masks: dict = {}
+                        last_prev_frame = batch_start - 1
+                        prev_npz = masks_dir / f"{last_prev_frame:06d}.npz"
+                        if prev_npz.exists():
+                            try:
+                                saved = load_masks_npz(str(prev_npz))
+                                seed_masks = {int(k): v.astype(np.uint8) for k, v in saved.items()}
+                            except Exception as _e:
+                                logger.warning(
+                                    f"Batch {batch_idx}: could not load disk masks "
+                                    f"for frame {last_prev_frame}: {_e}"
+                                )
+                        # In-memory carry-forward overrides disk (it's more recent)
+                        seed_masks.update(prev_batch_last_masks)
+                        for obj_id_int, mask_np in seed_masks.items():
                             sam.add_mask_prompt(
                                 pid, vid,
                                 frame_idx=batch_start,
@@ -988,8 +1010,10 @@ async def propagate_video(pid: str, vid: str, start_frame: int = 0):
                                 mask=mask_np,
                             )
                         logger.info(
-                            f"Batch {batch_idx}: seeded {len(prev_batch_last_masks)} "
-                            f"object mask(s) on frame {batch_start}"
+                            f"Batch {batch_idx}: seeded {len(seed_masks)} object(s) "
+                            f"on frame {batch_start} "
+                            f"(in-memory: {len(prev_batch_last_masks)}, "
+                            f"disk-backed: {prev_npz.exists()})"
                         )
                 except Exception as e:
                     logger.error(f"Prompt setup failed for batch {batch_idx}: {e}", exc_info=True)
@@ -998,7 +1022,9 @@ async def propagate_video(pid: str, vid: str, start_frame: int = 0):
 
                 # ── 6. Run propagation ────────────────────────────────────
                 queue: asyncio.Queue = asyncio.Queue(maxsize=50)
-                last_frame_masks: dict = {}
+                # Initialise from previous batch so objects that SAM temporarily
+                # loses near the end of a batch still have a carry-forward mask.
+                last_frame_masks: dict = dict(prev_batch_last_masks) if prev_batch_last_masks else {}
                 batch_frame_count = 0
 
                 # Always propagate forward.  For the first batch, start from
@@ -1088,8 +1114,12 @@ async def propagate_video(pid: str, vid: str, start_frame: int = 0):
                                 score = float(probs_raw[i]) if i < len(probs_raw) else 1.0
                                 bboxes_to_save[str(oid)] = list(box) + [score]
 
-                        if current_frame_masks:
-                            last_frame_masks = current_frame_masks
+                        # Per-object update: never replace the whole dict, so an
+                        # object absent from a single frame doesn't drop out of the
+                        # carry-forward state used to seed the next batch.
+                        for _oid, _m in current_frame_masks.items():
+                            if _m.any():
+                                last_frame_masks[_oid] = _m
 
                         if masks_to_save:
                             save_masks_npz(str(masks_dir / f"{real_frame_idx:06d}.npz"), masks_to_save)

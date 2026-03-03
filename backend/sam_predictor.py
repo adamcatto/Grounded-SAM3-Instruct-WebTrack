@@ -322,24 +322,41 @@ class SAMPredictor:
             import torch
             import numpy as np
             # SAM3 doesn't expose add_new_mask via handle_request.
-            # Use center-of-mass of the mask as a point prompt for handoff.
+            # Use multiple representative points spread across the mask so that
+            # large objects (e.g. a blanket) are seeded robustly even if the
+            # center-of-mass happens to fall on another tracked object (e.g. a mouse
+            # sitting in the middle of the blanket).
             mask_np = np.squeeze(mask)
             ys, xs = np.where(mask_np > 0)
             if len(xs) == 0:
                 logger.warning(f"Empty mask for obj {obj_id} on frame {frame_idx}, skipping")
                 return {}
-            # Compute center of mass in relative coords (0-1)
             h, w = mask_np.shape
+            # Always include center-of-mass
             cx = float(xs.mean()) / w
             cy = float(ys.mean()) / h
+            sample_points = [[cx, cy]]
+            # Add up to 4 more points evenly spaced along the mask's main diagonal
+            # (sorted by x+y), giving SAM coverage of the object's spatial extent.
+            N_EXTRA = 4
+            n = len(xs)
+            if n >= N_EXTRA + 1:
+                diag_order = np.argsort(xs + ys)
+                for i in range(1, N_EXTRA + 1):
+                    idx = diag_order[int(i * n / (N_EXTRA + 1))]
+                    sample_points.append([float(xs[idx]) / w, float(ys[idx]) / h])
+            logger.debug(
+                f"add_mask_prompt: obj {obj_id} frame {frame_idx} → "
+                f"{len(sample_points)} seed point(s)"
+            )
             # Translate real video frame index → SAM's internal sequential index
             sam_frame_idx = self._to_sam_idx(pid, vid, frame_idx)
             # Pre-seed cached_frame_outputs so SAM3's assertion passes (same as add_points)
             state = predictor._ALL_INFERENCE_STATES[session_id]["state"]
             if sam_frame_idx not in state["cached_frame_outputs"]:
                 state["cached_frame_outputs"][sam_frame_idx] = {}
-            points_tensor = torch.tensor([[cx, cy]], dtype=torch.float32)
-            labels_tensor = torch.tensor([1], dtype=torch.int32)
+            points_tensor = torch.tensor(sample_points, dtype=torch.float32)
+            labels_tensor = torch.tensor([1] * len(sample_points), dtype=torch.int32)
             with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
                 resp = predictor.handle_request({
                     "type": "add_prompt",
