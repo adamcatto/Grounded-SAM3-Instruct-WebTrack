@@ -92,6 +92,25 @@ export const initSession = (pid: string, vid: string) =>
 export const closeSession = (pid: string, vid: string) =>
   api.delete(`/projects/${pid}/videos/${vid}/session`)
 
+export interface SessionState {
+  session_active: boolean
+  session_id: string | null
+  model: string
+  frame_map: number[]             // real frame indices, indexed by SAM sequential idx
+  cached_sam_indices: number[]    // SAM sequential indices with cached outputs
+  action_history_len: number
+  obj_ids_tracked: number[]
+  point_prompts: Record<string, Record<string, { points: [number, number][]; labels: number[] }>>
+  saved_mask_frames: number[]     // real frame indices with .npz on disk
+  saved_mask_obj_counts: Record<number, number>
+  annotated_frame_files: number[] // real frame indices in annotated_frames/
+  num_frames: number
+  objects: Record<string, { id: string; name: string; color: string }>
+}
+
+export const getSessionState = (pid: string, vid: string) =>
+  api.get<SessionState>(`/projects/${pid}/videos/${vid}/session/state`).then(r => r.data)
+
 // ─── Objects ──────────────────────────────────────────────────────────────────
 
 export const addObject = (pid: string, vid: string, name: string, color?: string) =>

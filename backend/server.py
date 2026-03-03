@@ -532,6 +532,90 @@ def close_session(pid: str, vid: str):
     pm.update_video(pid, vid, {"sam3_session_id": None})
 
 
+@app.get("/api/projects/{pid}/videos/{vid}/session/state")
+def get_session_state(pid: str, vid: str):
+    """
+    Return a diagnostic snapshot of the current SAM inference state for this video.
+    Includes session info, frame map, cached outputs, point prompts, and saved masks.
+    """
+    video = pm.get_video(pid, vid)
+    if video is None:
+        raise HTTPException(404, "Video not found")
+
+    session_id = sam.get_session_id(pid, vid)
+    frame_map: list[int] = list(sam._frame_maps.get((pid, vid), []))  # real idx by SAM position
+    model = sam.model_name()
+
+    # SAM-internal state introspection
+    cached_sam_indices: list[int] = []
+    action_history_len: int = 0
+    obj_ids_tracked: list[int] = []
+
+    if session_id and model == "sam3":
+        try:
+            predictor = _get_predictor()
+            state = predictor._ALL_INFERENCE_STATES.get(session_id, {}).get("state", {})
+            cached_sam_indices = sorted(state.get("cached_frame_outputs", {}).keys())
+            action_history_len = len(state.get("action_history", []))
+            tracker_meta = state.get("tracker_metadata") or {}
+            obj_ids_tracked = [int(o) for o in tracker_meta.get("obj_ids_all_gpu", [])]
+        except Exception as e:
+            logger.warning(f"Could not introspect SAM3 state: {e}")
+
+    elif session_id and model == "sam2":
+        try:
+            state = sam._sam2_states.get((pid, vid))
+            if state is not None:
+                cached_sam_indices = sorted(state.get("cached_features", {}).keys())
+        except Exception as e:
+            logger.warning(f"Could not introspect SAM2 state: {e}")
+
+    # Point prompts from project config
+    point_prompts: dict = video.get("point_prompts", {})
+
+    # Saved masks on disk
+    masks_dir = pm.masks_dir(pid, vid)
+    saved_mask_frames: list[int] = []
+    saved_mask_obj_counts: dict[int, int] = {}
+    if masks_dir.exists():
+        for npz_file in sorted(masks_dir.glob("*.npz")):
+            try:
+                fidx = int(npz_file.stem)
+                saved_mask_frames.append(fidx)
+                # Count how many objects are in each npz
+                import numpy as np
+                data = np.load(str(npz_file))
+                saved_mask_obj_counts[fidx] = len(data.files)
+            except Exception:
+                pass
+
+    # Annotated frames on disk
+    ann_dir = pm.annotated_frames_dir(pid, vid)
+    annotated_frame_files: list[int] = []
+    if ann_dir.exists():
+        for f in sorted(ann_dir.glob("*.jpg")):
+            try:
+                annotated_frame_files.append(int(f.stem))
+            except ValueError:
+                pass
+
+    return {
+        "session_active": session_id is not None,
+        "session_id": session_id,
+        "model": model,
+        "frame_map": frame_map,
+        "cached_sam_indices": cached_sam_indices,
+        "action_history_len": action_history_len,
+        "obj_ids_tracked": obj_ids_tracked,
+        "point_prompts": point_prompts,
+        "saved_mask_frames": saved_mask_frames,
+        "saved_mask_obj_counts": saved_mask_obj_counts,
+        "annotated_frame_files": annotated_frame_files,
+        "num_frames": video.get("num_frames", 0),
+        "objects": video.get("objects", {}),
+    }
+
+
 # ─── Objects ──────────────────────────────────────────────────────────────────
 
 class AddObjectRequest(BaseModel):

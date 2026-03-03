@@ -2,13 +2,14 @@ import React, { useEffect, useState, useCallback } from 'react'
 import { useStore, currentVideo as selectCurrentVideo } from './store/useStore'
 import type { ViewerTab } from './store/useStore'
 import { listProjects } from './api/client'
-import { Crosshair, PlayCircle } from 'lucide-react'
+import { Crosshair, PlayCircle, BrainCircuit } from 'lucide-react'
 import Header from './components/Header'
 import ProjectDrawer from './components/ProjectDrawer'
 import UploadModal from './components/UploadModal'
 import LeftPanel from './components/LeftPanel/LeftPanel'
 import FrameViewer from './components/FrameViewer/FrameViewer'
 import VideoPlayer from './components/VideoPlayer/VideoPlayer'
+import InferenceStatePanel from './components/InferenceStatePanel'
 import Timeline from './components/Timeline/Timeline'
 import LoadingScreen from './components/LoadingScreen'
 import ResizeHandle from './components/ResizeHandle'
@@ -117,11 +118,19 @@ export default function App() {
                 label="Player"
                 onClick={() => setViewerTab('player')}
               />
+              <TabButton
+                active={viewerTab === 'inference'}
+                icon={<BrainCircuit size={14} />}
+                label="Inference State"
+                onClick={() => setViewerTab('inference')}
+              />
             </div>
           )}
 
           {/* Viewer (grows to fill) */}
-          {viewerTab === 'annotate' ? <FrameViewer /> : <VideoPlayer />}
+          {viewerTab === 'annotate' && <FrameViewer />}
+          {viewerTab === 'player' && <VideoPlayer />}
+          {viewerTab === 'inference' && <InferenceStatePanel />}
 
           {/* Horizontal resize handle between viewer and timeline */}
           {video && viewerTab === 'annotate' && (

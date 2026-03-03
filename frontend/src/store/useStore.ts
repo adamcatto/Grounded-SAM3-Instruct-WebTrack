@@ -4,7 +4,7 @@ import type { Project, VideoMeta, ObjectDef, MaskData } from '../types'
 export type PointMode = 'add' | 'remove' | null
 export type PropagationStatus = 'idle' | 'running' | 'done' | 'error'
 export type AppStep = 'upload' | 'annotate' | 'review'
-export type ViewerTab = 'annotate' | 'player'
+export type ViewerTab = 'annotate' | 'player' | 'inference'
 
 interface LocalAnnotation {
   points: { x: number; y: number; label: 0 | 1 }[]
