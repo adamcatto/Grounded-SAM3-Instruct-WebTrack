@@ -52,7 +52,8 @@ export default function ProjectDrawer() {
 
   function handleSelectProject(p: Project) {
     setProject(p)
-    setCurrentVideo(null)
+    const vids = Object.keys(p.videos)
+    setCurrentVideo(vids.length > 0 ? vids[vids.length - 1] : null)
     setDrawerOpen(false)
   }
 

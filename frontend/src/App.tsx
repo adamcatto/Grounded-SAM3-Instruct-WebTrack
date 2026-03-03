@@ -149,8 +149,10 @@ export default function App() {
               {project ? `Project: ${project.name}` : 'Welcome to SAM3 Web Tracker'}
             </h2>
             <p className="text-sm text-[#888] mb-6 leading-relaxed">
-              {project
+              {project && Object.keys(project.videos).length === 0
                 ? 'This project has no videos yet. Import a video to get started, or open the menu to switch projects.'
+                : project
+                ? 'Select a video from the menu to continue, or import a new one.'
                 : 'Import a video to start labeling and tracking objects, or open the menu to browse existing projects.'}
             </p>
             <div className="flex flex-col gap-2">
@@ -164,7 +166,7 @@ export default function App() {
                 onClick={() => setDrawerOpen(true)}
                 className="btn btn-secondary w-full py-2.5 text-sm font-medium"
               >
-                Browse projects
+                {project && Object.keys(project.videos).length > 0 ? 'Switch video' : 'Browse projects'}
               </button>
             </div>
           </div>
