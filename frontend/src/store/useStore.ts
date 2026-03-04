@@ -53,6 +53,7 @@ interface AppState {
   currentFrameMasks: MaskData
   currentFrameMasksFrame: number | null   // which frame currentFrameMasks belongs to
   savedMaskCache: Record<number, MaskData>
+  pendingInferenceFrame: number | null    // frame awaiting "save to inference state" confirmation
 
   // Playback
   isPlaying: boolean
@@ -88,6 +89,7 @@ interface AppState {
   clearLocalPoints: (objId: string) => void
   setCurrentFrameMasks: (masks: MaskData, frame?: number | null) => void
   setSavedMask: (fidx: number, masks: MaskData) => void
+  setPendingInferenceFrame: (f: number | null) => void
   setPlaying: (v: boolean) => void
   setPropagationStatus: (s: PropagationStatus) => void
   setPropagationProgress: (p: number, frame: number) => void
@@ -110,6 +112,7 @@ export const useStore = create<AppState>((set, get) => ({
   currentFrameMasks: {},
   currentFrameMasksFrame: null,
   savedMaskCache: {},
+  pendingInferenceFrame: null,
   isPlaying: false,
   propagationStatus: 'idle',
   propagationProgress: 0,
@@ -129,12 +132,27 @@ export const useStore = create<AppState>((set, get) => ({
     if (prev !== vid) {
       const vidData = vid ? get().project?.videos[vid] : undefined
       const alreadyPropagated = vidData?.propagation_complete ?? false
+
+      // Restore saved point prompts into localAnnotations so annotated frames
+      // show their points immediately without requiring a page session.
+      const localAnnotations: Record<string, Record<string, LocalAnnotation>> = {}
+      if (vidData?.point_prompts) {
+        for (const [objId, framePts] of Object.entries(vidData.point_prompts)) {
+          localAnnotations[objId] = {}
+          for (const [frameIdx, { points, labels }] of Object.entries(framePts)) {
+            localAnnotations[objId][frameIdx] = {
+              points: points.map(([x, y], i) => ({ x, y, label: labels[i] as 0 | 1 })),
+            }
+          }
+        }
+      }
+
       set({
         currentVideoId: vid,
         currentFrame: 0,
         currentObjectId: null,
         pointMode: null,
-        localAnnotations: {},
+        localAnnotations,
         currentFrameMasks: {},
         currentFrameMasksFrame: null,
         savedMaskCache: {},
@@ -178,6 +196,8 @@ export const useStore = create<AppState>((set, get) => ({
     const { savedMaskCache } = get()
     set({ savedMaskCache: { ...savedMaskCache, [fidx]: masks } })
   },
+
+  setPendingInferenceFrame: f => set({ pendingInferenceFrame: f }),
 
   setPlaying: v => set({ isPlaying: v }),
 
@@ -230,6 +250,7 @@ export const useStore = create<AppState>((set, get) => ({
     currentFrameMasks: {},
     currentFrameMasksFrame: null,
     savedMaskCache: {},
+    pendingInferenceFrame: null,
     isPlaying: false,
     propagationStatus: 'idle',
     propagationProgress: 0,

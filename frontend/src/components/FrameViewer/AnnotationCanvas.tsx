@@ -45,17 +45,14 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
     let masksToShow: typeof currentFrameMasks = {}
     if (currentFrameMasksFrame === currentFrame && Object.keys(currentFrameMasks).length > 0) {
       masksToShow = currentFrameMasks
-    } else if (propagationStatus === 'done' || propagationStatus === 'running') {
+    } else {
       const saved = savedMaskCache[currentFrame]
       if (saved) masksToShow = saved
     }
 
-    // Draw masks
-    drawMasks(ctx, masksToShow, width, height)
-
-    // Draw all points for current frame
+    // Collect points for current frame
     const allPoints: { x: number; y: number; label: 0 | 1 }[] = []
-    for (const [objId, framePts] of Object.entries(localAnnotations)) {
+    for (const [, framePts] of Object.entries(localAnnotations)) {
       const pts = framePts[String(currentFrame)]
       if (pts) {
         for (const p of pts.points) {
@@ -63,13 +60,22 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
         }
       }
     }
-    drawPoints(ctx, allPoints, width, height)
-  }, [width, height, currentFrameMasks, currentFrameMasksFrame, localAnnotations, currentFrame, savedMaskCache, propagationStatus])
 
-  // ── Load saved masks when frame changes (post-propagation) ────────────────
+    // Draw masks first (async), then points on top so they are always visible.
+    // The stale flag prevents a superseded async draw from clobbering a newer
+    // render that already ran its cleanup.
+    let stale = false
+    drawMasks(ctx, masksToShow, width, height).then(() => {
+      if (stale) return
+      drawPoints(ctx, allPoints, width, height)
+    })
+    return () => { stale = true }
+  }, [width, height, currentFrameMasks, currentFrameMasksFrame, localAnnotations, currentFrame, savedMaskCache])
+
+  // ── Load saved masks when frame changes ───────────────────────────────────
 
   useEffect(() => {
-    if ((propagationStatus === 'done' || propagationStatus === 'running') && !savedMaskCache[currentFrame]) {
+    if (!savedMaskCache[currentFrame]) {
       getSavedMask(pid, vid, currentFrame)
         .then(data => {
           if (data.masks && Object.keys(data.masks).length > 0) {

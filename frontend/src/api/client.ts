@@ -160,6 +160,11 @@ export const predictFrame = (pid: string, vid: string, frameIdx: number, usePrev
     { use_prev_frame_mask: usePrevFrameMask }
   ).then(r => r.data)
 
+export const saveFrameInference = (pid: string, vid: string, frameIdx: number) =>
+  api.post<{ status: string; frame_idx: number; objects_saved: number }>(
+    `/projects/${pid}/videos/${vid}/frames/${frameIdx}/save_inference`
+  ).then(r => r.data)
+
 // ─── Propagation SSE ─────────────────────────────────────────────────────────
 
 // SSE also benefits from bypassing Vite's proxy to avoid buffering/re-chunking

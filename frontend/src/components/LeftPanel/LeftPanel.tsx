@@ -1,7 +1,7 @@
 import React, { useState } from 'react'
-import { Plus, RotateCcw, ChevronRight, Loader, Download, X, Zap } from 'lucide-react'
+import { Plus, RotateCcw, ChevronRight, Loader, Download, X, Zap, Save } from 'lucide-react'
 import { useStore, currentVideo as selectCurrentVideo } from '../../store/useStore'
-import { addObject, initSession, startPropagationSSE, startExportSSE, getProject, resetVideo, predictFrame } from '../../api/client'
+import { addObject, initSession, startPropagationSSE, startExportSSE, getProject, resetVideo, predictFrame, saveFrameInference } from '../../api/client'
 import { getObjectColor } from '../../utils/colors'
 import { clearMaskCache } from '../../utils/maskUtils'
 import ObjectCard from './ObjectCard'
@@ -19,6 +19,7 @@ export default function LeftPanel() {
     propagationStartFrame, setPropagationStartFrame,
     resetVideoState, updateVideo,
     setProject, setSavedMask,
+    pendingInferenceFrame, setPendingInferenceFrame,
     config, addToast,
   } = store
 
@@ -180,34 +181,36 @@ export default function LeftPanel() {
   async function handlePredictFrame() {
     if (!pid || !vid) return
     setPredictingFrame(true)
-    const frame = store.currentFrame
+    setPendingInferenceFrame(null)
+    const frame = currentFrame
     const usePrev = config.usePrevFrameMask
-
-    if (usePrev) {
-      addToast(`Loading prev-frame mask into inference state for frame ${frame}…`, 'info')
-    } else {
-      addToast(`Predicting frame ${frame}…`, 'info')
-    }
 
     try {
       const result = await predictFrame(pid, vid, frame, usePrev)
-      // Cache the returned masks so the canvas shows them immediately
       if (Object.keys(result.masks).length > 0) {
         setSavedMask(result.frame_idx, result.masks)
-      }
-      if (result.used_prev_frame_mask) {
-        addToast(
-          `Frame ${frame} predicted using mask from frame ${result.prev_frame_idx}. Inference state restored.`,
-          'success'
-        )
+        setPendingInferenceFrame(result.frame_idx)
       } else {
-        addToast(`Frame ${frame} predicted successfully.`, 'success')
+        addToast(`Frame ${frame}: no masks returned from prediction.`, 'error')
       }
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : 'Prediction failed'
       addToast(msg, 'error')
     } finally {
       setPredictingFrame(false)
+    }
+  }
+
+  async function handleSaveInference() {
+    if (!pid || !vid || pendingInferenceFrame === null) return
+    try {
+      await saveFrameInference(pid, vid, pendingInferenceFrame)
+      addToast(`Frame ${pendingInferenceFrame} saved to inference state.`, 'success')
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : 'Save failed'
+      addToast(msg, 'error')
+    } finally {
+      setPendingInferenceFrame(null)
     }
   }
 
@@ -408,6 +411,36 @@ export default function LeftPanel() {
           className="w-full text-xs py-1 px-2 rounded bg-[#1a1a1a] border border-[#333] text-[#ccc] disabled:opacity-40"
         />
       </div>
+
+      {/* Save-to-inference-state prompt */}
+      {pendingInferenceFrame !== null && (
+        <div className="mx-2 mb-2 p-2.5 rounded-lg border border-blue-800/50 bg-[#0d1a2a] flex-shrink-0">
+          <div className="flex items-start justify-between gap-2 mb-2">
+            <p className="text-xs text-[#aaa] leading-snug">
+              <span className="text-blue-400 font-medium">Frame {pendingInferenceFrame} predicted.</span>
+              {' '}Save as a keyframe so it anchors future tracking?
+            </p>
+            <button onClick={() => setPendingInferenceFrame(null)} className="text-[#555] hover:text-[#aaa] flex-shrink-0 mt-0.5">
+              <X size={11} />
+            </button>
+          </div>
+          <div className="flex gap-1.5">
+            <button
+              onClick={handleSaveInference}
+              className="btn btn-primary flex items-center gap-1 text-xs py-1"
+            >
+              <Save size={10} />
+              Save to inference state
+            </button>
+            <button
+              onClick={() => setPendingInferenceFrame(null)}
+              className="btn btn-ghost text-xs py-1"
+            >
+              Dismiss
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Bottom buttons */}
       <div className="flex items-center gap-1 p-2 border-t border-[#2a2a2a] flex-shrink-0">

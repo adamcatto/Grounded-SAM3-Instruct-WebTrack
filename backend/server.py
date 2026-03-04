@@ -1007,6 +1007,46 @@ def predict_single_frame(pid: str, vid: str, frame_idx: int, req: PredictFrameRe
     }
 
 
+# ─── Save frame to inference state ───────────────────────────────────────────
+
+@app.post("/api/projects/{pid}/videos/{vid}/frames/{frame_idx}/save_inference")
+def save_frame_to_inference(pid: str, vid: str, frame_idx: int):
+    """
+    Promote a predicted frame into the session replay chain by saving a
+    synthetic centroid point prompt for each object that has a mask.
+    When the SAM session is next re-initialised these prompts are replayed,
+    making the frame a first-class annotated keyframe.
+    Subsequent real point-prompt clicks on the same frame overwrite the
+    synthetic prompts naturally via save_point_prompts.
+    """
+    video = pm.get_video(pid, vid)
+    if video is None:
+        raise HTTPException(404, "Video not found")
+
+    masks_path = pm.masks_dir(pid, vid) / f"{frame_idx:06d}.npz"
+    if not masks_path.exists():
+        raise HTTPException(404, f"No saved masks for frame {frame_idx}")
+
+    raw_masks = load_masks_npz(str(masks_path))
+    objects = video.get("objects", {})
+    saved_count = 0
+
+    for obj_id_str in objects:
+        mask = raw_masks.get(obj_id_str)
+        if mask is None:
+            continue
+        mask_arr = np.array(mask, dtype=bool)
+        ys, xs = np.where(mask_arr)
+        if len(xs) == 0:
+            continue
+        cx = float(xs.mean()) / mask_arr.shape[1]
+        cy = float(ys.mean()) / mask_arr.shape[0]
+        pm.save_point_prompts(pid, vid, obj_id_str, frame_idx, [[cx, cy]], [1])
+        saved_count += 1
+
+    return {"status": "saved", "frame_idx": frame_idx, "objects_saved": saved_count}
+
+
 # ─── Video Export (SSE) ──────────────────────────────────────────────────────
 
 @app.get("/api/projects/{pid}/videos/{vid}/export")
