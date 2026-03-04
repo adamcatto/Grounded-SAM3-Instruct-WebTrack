@@ -4,11 +4,12 @@ import { useStore, currentVideo as selectCurrentVideo } from '../../store/useSto
 export default function ObjectTrackRow() {
   const store = useStore()
   const video = selectCurrentVideo(store)
-  const { currentFrame, setCurrentFrame } = store
+  const { currentFrame, setCurrentFrame, propagationStartFrame } = store
 
   if (!video || Object.keys(video.objects).length === 0) return null
 
   const total = video.num_frames
+  const startFrame = propagationStartFrame
   const propagatedSet = new Set(video.propagated_frames ?? [])
 
   return (
@@ -26,8 +27,8 @@ export default function ObjectTrackRow() {
           {/* Track bar */}
           <div className="flex-1 relative h-3 bg-[#1a1a1a] rounded overflow-hidden">
             {/* Propagated segments */}
-            {Array.from(propagatedSet).sort((a, b) => a - b).map((f, i) => {
-              const x = (f / total) * 100
+            {Array.from(propagatedSet).sort((a, b) => a - b).filter(f => f >= startFrame).map((f) => {
+              const x = ((f - startFrame) / (total - 1 - startFrame)) * 100
               return (
                 <div
                   key={f}
@@ -44,7 +45,7 @@ export default function ObjectTrackRow() {
             {/* Current frame indicator */}
             <div
               className="absolute top-0 h-full w-0.5 bg-white z-10"
-              style={{ left: `${(currentFrame / total) * 100}%` }}
+              style={{ left: `${((currentFrame - startFrame) / (total - 1 - startFrame)) * 100}%` }}
             />
 
             {/* Click scrubber */}
@@ -53,7 +54,8 @@ export default function ObjectTrackRow() {
               onClick={(e) => {
                 const rect = e.currentTarget.getBoundingClientRect()
                 const pct = (e.clientX - rect.left) / rect.width
-                setCurrentFrame(Math.max(0, Math.min(total - 1, Math.floor(pct * total))))
+                const rangeLen = total - 1 - startFrame
+                setCurrentFrame(Math.max(startFrame, Math.min(total - 1, Math.round(pct * rangeLen + startFrame))))
               }}
             />
           </div>

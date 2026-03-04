@@ -16,7 +16,7 @@ export default function LeftPanel() {
     currentObjectId, setCurrentObject,
     propagationStatus, setPropagationStatus, setPropagationProgress,
     sessionInitialized, setSessionInitialized,
-    propagationStartFrame, setPropagationStartFrame,
+    propagationStartFrame, setPropagationStartFrame, setCurrentFrame,
     resetVideoState, updateVideo,
     setProject, setSavedMask,
     pendingInferenceFrame, setPendingInferenceFrame,
@@ -407,6 +407,13 @@ export default function LeftPanel() {
           max={video.num_frames - 1}
           value={propagationStartFrame}
           onChange={e => setPropagationStartFrame(Math.max(0, parseInt(e.target.value) || 0))}
+          onKeyDown={e => {
+            if (e.key === 'Enter') {
+              const clamped = Math.max(0, Math.min(video.num_frames - 1, propagationStartFrame))
+              setPropagationStartFrame(clamped)
+              setCurrentFrame(clamped)
+            }
+          }}
           disabled={isTracking}
           className="w-full text-xs py-1 px-2 rounded bg-[#1a1a1a] border border-[#333] text-[#ccc] disabled:opacity-40"
         />

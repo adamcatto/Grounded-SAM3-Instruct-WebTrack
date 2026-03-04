@@ -5,7 +5,7 @@ import { thumbUrl } from '../../api/client'
 export default function FrameStrip() {
   const store = useStore()
   const video = selectCurrentVideo(store)
-  const { project, currentVideoId, currentFrame, setCurrentFrame } = store
+  const { project, currentVideoId, currentFrame, setCurrentFrame, propagationStartFrame } = store
 
   const stripRef = useRef<HTMLDivElement>(null)
   const pid = project?.id ?? ''
@@ -35,6 +35,9 @@ export default function FrameStrip() {
       indices.push(i)
     }
   }
+
+  // Hide frames before the propagation start frame
+  indices = indices.filter(i => i >= propagationStartFrame)
 
   // Compute effective step for highlight range
   const step = indices.length > 1

@@ -12,6 +12,7 @@ export default function Timeline() {
     currentFrame, setCurrentFrame,
     isPlaying, setPlaying,
     propagationStatus, savedMaskCache, setSavedMask,
+    propagationStartFrame,
   } = store
 
   const pid = project?.id ?? ''
@@ -46,7 +47,10 @@ export default function Timeline() {
 
   const total = video.num_frames
   const fps = video.fps || 30
-  const progress = total > 0 ? (currentFrame / (total - 1)) * 100 : 0
+  const startFrame = propagationStartFrame
+  const rangeEnd = total - 1
+  const rangeLen = rangeEnd - startFrame
+  const progress = rangeLen > 0 ? ((currentFrame - startFrame) / rangeLen) * 100 : 0
 
   return (
     <div className="flex-shrink-0 bg-[#0d0d0d]">
@@ -72,7 +76,7 @@ export default function Timeline() {
           onClick={e => {
             const rect = e.currentTarget.getBoundingClientRect()
             const pct = (e.clientX - rect.left) / rect.width
-            setCurrentFrame(Math.max(0, Math.min(total - 1, Math.floor(pct * total))))
+            setCurrentFrame(Math.max(startFrame, Math.min(rangeEnd, Math.round(pct * rangeLen + startFrame))))
           }}
         >
           <div
@@ -87,12 +91,12 @@ export default function Timeline() {
 
         {/* Total time */}
         <span className="text-xs font-mono text-[#555] flex-shrink-0">
-          {formatTime(total - 1, fps)}
+          {formatTime(rangeEnd, fps)}
         </span>
 
         {/* Frame skip buttons */}
         <button
-          onClick={() => setCurrentFrame(Math.max(0, currentFrame - 1))}
+          onClick={() => setCurrentFrame(Math.max(startFrame, currentFrame - 1))}
           className="btn btn-ghost p-1"
           title="Previous frame"
         >
