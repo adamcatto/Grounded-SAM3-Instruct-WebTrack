@@ -20,7 +20,7 @@ export default function LeftPanel() {
     resetVideoState, updateVideo,
     setProject, setSavedMask,
     pendingInferenceFrame, setPendingInferenceFrame,
-    config, addToast,
+    config, persistConfig, addToast,
   } = store
 
   const [addingObject, setAddingObject] = useState(false)
@@ -412,6 +412,7 @@ export default function LeftPanel() {
               const clamped = Math.max(0, Math.min(video.num_frames - 1, propagationStartFrame))
               setPropagationStartFrame(clamped)
               setCurrentFrame(clamped)
+              persistConfig()
             }
           }}
           disabled={isTracking}

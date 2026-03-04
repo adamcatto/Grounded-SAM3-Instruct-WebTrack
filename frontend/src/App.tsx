@@ -44,7 +44,17 @@ export default function App() {
   const {
     project, currentVideoId, viewerTab,
     setProject, setCurrentVideo, setUploadModalOpen, setDrawerOpen, setViewerTab,
+    configDirty, revertConfig,
   } = store
+
+  // Guard tab switches away from Settings when there are unsaved changes.
+  const handleSetViewerTab = useCallback((tab: ViewerTab) => {
+    if (viewerTab === 'config' && configDirty && tab !== 'config') {
+      if (!window.confirm('You have unsaved changes in Settings. Discard them?')) return
+      revertConfig()
+    }
+    setViewerTab(tab)
+  }, [viewerTab, configDirty, revertConfig, setViewerTab])
 
   const [backendReady, setBackendReady] = useState(false)
 
@@ -113,19 +123,19 @@ export default function App() {
                   active={viewerTab === 'annotate'}
                   icon={<Crosshair size={14} />}
                   label="Annotate"
-                  onClick={() => setViewerTab('annotate')}
+                  onClick={() => handleSetViewerTab('annotate')}
                 />
                 <TabButton
                   active={viewerTab === 'player'}
                   icon={<PlayCircle size={14} />}
                   label="Player"
-                  onClick={() => setViewerTab('player')}
+                  onClick={() => handleSetViewerTab('player')}
                 />
                 <TabButton
                   active={viewerTab === 'inference'}
                   icon={<BrainCircuit size={14} />}
                   label="Inference State"
-                  onClick={() => setViewerTab('inference')}
+                  onClick={() => handleSetViewerTab('inference')}
                 />
               </>
             )}
@@ -133,8 +143,8 @@ export default function App() {
             <TabButton
               active={viewerTab === 'config'}
               icon={<Settings2 size={14} />}
-              label="Config"
-              onClick={() => setViewerTab('config')}
+              label="Settings"
+              onClick={() => handleSetViewerTab('config')}
             />
           </div>
 

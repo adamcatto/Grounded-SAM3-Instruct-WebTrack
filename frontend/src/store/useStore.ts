@@ -10,19 +10,31 @@ export type ViewerTab = 'annotate' | 'player' | 'inference' | 'config'
 
 export interface AppConfig {
   usePrevFrameMask: boolean
+  showMasks: boolean
+  maskOpacity: number   // 0–1
+  pointSize: number     // scale factor relative to default (1.0)
+  startFrame: number    // persisted propagation start frame
 }
 
 const CONFIG_KEY = 'sam3wt_config'
 
+const CONFIG_DEFAULTS: AppConfig = {
+  usePrevFrameMask: true,
+  showMasks: true,
+  maskOpacity: 0.85,
+  pointSize: 1.0,
+  startFrame: 0,
+}
+
 function loadConfig(): AppConfig {
   try {
     const raw = localStorage.getItem(CONFIG_KEY)
-    if (raw) return { usePrevFrameMask: true, ...JSON.parse(raw) }
+    if (raw) return { ...CONFIG_DEFAULTS, ...JSON.parse(raw) }
   } catch { /* ignore */ }
-  return { usePrevFrameMask: true }
+  return { ...CONFIG_DEFAULTS }
 }
 
-function saveConfig(c: AppConfig) {
+function writeConfig(c: AppConfig) {
   try { localStorage.setItem(CONFIG_KEY, JSON.stringify(c)) } catch { /* ignore */ }
 }
 
@@ -72,7 +84,10 @@ interface AppState {
 
   // Config
   config: AppConfig
+  configDirty: boolean         // true when in-memory config differs from last localStorage save
   setConfig: (updates: Partial<AppConfig>) => void
+  persistConfig: () => void    // write current config + propagationStartFrame to localStorage
+  revertConfig: () => void     // restore config + propagationStartFrame from localStorage
 
   // Toasts
   toasts: Toast[]
@@ -102,6 +117,8 @@ interface AppState {
   resetVideoState: () => void
 }
 
+const _initialConfig = loadConfig()
+
 export const useStore = create<AppState>((set, get) => ({
   project: null,
   currentVideoId: null,
@@ -117,12 +134,14 @@ export const useStore = create<AppState>((set, get) => ({
   propagationStatus: 'idle',
   propagationProgress: 0,
   propagationCurrentFrame: 0,
-  propagationStartFrame: 0,
+  // Initialize from persisted config so it survives page refreshes
+  propagationStartFrame: _initialConfig.startFrame,
   drawerOpen: false,
   uploadModalOpen: false,
   viewerTab: 'annotate' as ViewerTab,
   sessionInitialized: false,
-  config: loadConfig(),
+  config: _initialConfig,
+  configDirty: false,
   toasts: [],
 
   setProject: p => set({ project: p }),
@@ -211,10 +230,26 @@ export const useStore = create<AppState>((set, get) => ({
   setViewerTab: tab => set({ viewerTab: tab }),
   setSessionInitialized: v => set({ sessionInitialized: v }),
 
+  // setConfig: update in-memory only, mark dirty. Does NOT auto-save to localStorage.
   setConfig: updates => {
     const next = { ...get().config, ...updates }
-    saveConfig(next)
-    set({ config: next })
+    set({ config: next, configDirty: true })
+  },
+
+  // persistConfig: capture current in-memory config + live propagationStartFrame,
+  // write to localStorage, and clear the dirty flag.
+  persistConfig: () => {
+    const { config, propagationStartFrame } = get()
+    const toSave: AppConfig = { ...config, startFrame: propagationStartFrame }
+    writeConfig(toSave)
+    set({ config: toSave, configDirty: false })
+  },
+
+  // revertConfig: reload the last saved config from localStorage, restore
+  // propagationStartFrame to the saved startFrame, and clear dirty flag.
+  revertConfig: () => {
+    const saved = loadConfig()
+    set({ config: saved, propagationStartFrame: saved.startFrame, configDirty: false })
   },
 
   addToast: (message, type = 'info') => {
@@ -223,7 +258,9 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   removeToast: id => set(s => ({ toasts: s.toasts.filter(t => t.id !== id) })),
-  setPropagationStartFrame: f => set({ propagationStartFrame: f }),
+
+  // Mark dirty so unsaved-changes guard fires if user tries to leave Settings.
+  setPropagationStartFrame: f => set({ propagationStartFrame: f, configDirty: true }),
 
   updateVideo: updates => {
     const { project, currentVideoId } = get()

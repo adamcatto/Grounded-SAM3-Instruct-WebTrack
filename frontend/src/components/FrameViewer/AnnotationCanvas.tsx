@@ -21,6 +21,7 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
     currentFrameMasks, currentFrameMasksFrame, setCurrentFrameMasks,
     savedMaskCache, setSavedMask,
     propagationStatus,
+    config,
   } = store
 
   const pid = project?.id ?? ''
@@ -65,12 +66,13 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
     // The stale flag prevents a superseded async draw from clobbering a newer
     // render that already ran its cleanup.
     let stale = false
-    drawMasks(ctx, masksToShow, width, height).then(() => {
+    const masksToDraw = config.showMasks ? masksToShow : {}
+    drawMasks(ctx, masksToDraw, width, height, config.maskOpacity).then(() => {
       if (stale) return
-      drawPoints(ctx, allPoints, width, height)
+      drawPoints(ctx, allPoints, width, height, config.pointSize)
     })
     return () => { stale = true }
-  }, [width, height, currentFrameMasks, currentFrameMasksFrame, localAnnotations, currentFrame, savedMaskCache])
+  }, [width, height, currentFrameMasks, currentFrameMasksFrame, localAnnotations, currentFrame, savedMaskCache, config.showMasks, config.maskOpacity, config.pointSize])
 
   // ── Load saved masks when frame changes ───────────────────────────────────
 
