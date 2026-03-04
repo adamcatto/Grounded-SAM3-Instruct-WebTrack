@@ -1,8 +1,9 @@
 """
 Project and video metadata management.
-Projects are stored in /opt/.sam3_projects/<project-id>/config.json
+Projects are stored in /opt/.sam3_projects/<project-id>-<name>/config.json
 """
 
+import re
 import uuid
 import json
 import shutil
@@ -30,6 +31,24 @@ class ProjectManager:
 
     # ─── Projects ────────────────────────────────────────────────────────────
 
+    def _slugify(self, name: str) -> str:
+        """Convert a project name to a filesystem-safe slug."""
+        slug = re.sub(r"[^\w\-.]", "_", name).strip("_.-")
+        return slug[:64]
+
+    def _find_project_dir(self, pid: str) -> Optional[Path]:
+        """Locate the project directory by scanning for dirs starting with pid."""
+        for d in BASE_DIR.iterdir():
+            if d.name == pid or d.name.startswith(pid + "-"):
+                return d
+        return None
+
+    def _project_dir(self, pid: str) -> Path:
+        d = self._find_project_dir(pid)
+        if d is None:
+            raise ValueError(f"Project {pid} not found")
+        return d
+
     def list_projects(self) -> list[dict]:
         projects = []
         for d in sorted(BASE_DIR.iterdir()):
@@ -43,13 +62,14 @@ class ProjectManager:
 
     def create_project(self, name: str) -> dict:
         pid = str(uuid.uuid4())[:8]
-        project_dir = BASE_DIR / pid
+        slug = self._slugify(name)
+        dir_name = f"{pid}-{slug}" if slug else pid
+        project_dir = BASE_DIR / dir_name
         project_dir.mkdir(parents=True)
         (project_dir / "videos").mkdir()
-        display_name = f"{name} - {pid}"
         config = {
             "id": pid,
-            "name": display_name,
+            "name": name,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "videos": {},
         }
@@ -57,7 +77,10 @@ class ProjectManager:
         return config
 
     def get_project(self, pid: str) -> Optional[dict]:
-        cfg = BASE_DIR / pid / "config.json"
+        d = self._find_project_dir(pid)
+        if d is None:
+            return None
+        cfg = d / "config.json"
         if not cfg.exists():
             return None
         return json.loads(cfg.read_text())
@@ -73,9 +96,9 @@ class ProjectManager:
         return config
 
     def delete_project(self, pid: str):
-        project_dir = BASE_DIR / pid
-        if project_dir.exists():
-            shutil.rmtree(project_dir)
+        d = self._find_project_dir(pid)
+        if d is not None:
+            shutil.rmtree(d)
 
     # ─── Videos ──────────────────────────────────────────────────────────────
 
@@ -85,7 +108,7 @@ class ProjectManager:
         if config is None:
             raise ValueError(f"Project {pid} not found")
         vid = str(uuid.uuid4())[:8]
-        video_dir = BASE_DIR / pid / "videos" / vid
+        video_dir = self._project_dir(pid) / "videos" / vid
         video_dir.mkdir(parents=True)
         (video_dir / "frames").mkdir()
         (video_dir / "masks").mkdir()
@@ -131,7 +154,7 @@ class ProjectManager:
             raise ValueError(f"Project {pid} not found")
         config["videos"].pop(vid, None)
         self._save_config(pid, config)
-        video_dir = BASE_DIR / pid / "videos" / vid
+        video_dir = self._project_dir(pid) / "videos" / vid
         if video_dir.exists():
             shutil.rmtree(video_dir)
 
@@ -215,20 +238,23 @@ class ProjectManager:
 
     # ─── Paths ───────────────────────────────────────────────────────────────
 
+    def video_dir(self, pid: str, vid: str) -> Path:
+        return self._project_dir(pid) / "videos" / vid
+
     def frames_dir(self, pid: str, vid: str) -> Path:
-        return BASE_DIR / pid / "videos" / vid / "frames"
+        return self.video_dir(pid, vid) / "frames"
 
     def annotated_frames_dir(self, pid: str, vid: str) -> Path:
-        return BASE_DIR / pid / "videos" / vid / "annotated_frames"
+        return self.video_dir(pid, vid) / "annotated_frames"
 
     def masks_dir(self, pid: str, vid: str) -> Path:
-        return BASE_DIR / pid / "videos" / vid / "masks"
+        return self.video_dir(pid, vid) / "masks"
 
     def bboxes_dir(self, pid: str, vid: str) -> Path:
-        return BASE_DIR / pid / "videos" / vid / "bboxes"
+        return self.video_dir(pid, vid) / "bboxes"
 
     # ─── Internal ────────────────────────────────────────────────────────────
 
     def _save_config(self, pid: str, config: dict):
-        cfg_path = BASE_DIR / pid / "config.json"
+        cfg_path = self._project_dir(pid) / "config.json"
         cfg_path.write_text(json.dumps(config, indent=2))

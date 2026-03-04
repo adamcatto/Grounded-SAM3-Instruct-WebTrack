@@ -2,7 +2,7 @@ import React, { useEffect, useState, useCallback } from 'react'
 import { useStore, currentVideo as selectCurrentVideo } from './store/useStore'
 import type { ViewerTab } from './store/useStore'
 import { listProjects } from './api/client'
-import { Crosshair, PlayCircle, BrainCircuit } from 'lucide-react'
+import { Crosshair, PlayCircle, BrainCircuit, Settings2 } from 'lucide-react'
 import Header from './components/Header'
 import ProjectDrawer from './components/ProjectDrawer'
 import UploadModal from './components/UploadModal'
@@ -10,9 +10,11 @@ import LeftPanel from './components/LeftPanel/LeftPanel'
 import FrameViewer from './components/FrameViewer/FrameViewer'
 import VideoPlayer from './components/VideoPlayer/VideoPlayer'
 import InferenceStatePanel from './components/InferenceStatePanel'
+import ConfigPanel from './components/ConfigPanel'
 import Timeline from './components/Timeline/Timeline'
 import LoadingScreen from './components/LoadingScreen'
 import ResizeHandle from './components/ResizeHandle'
+import ToastContainer from './components/ToastContainer'
 import { useResizable } from './hooks/useResizable'
 
 function TabButton({ active, icon, label, onClick }: {
@@ -103,34 +105,44 @@ export default function App() {
 
         {/* Right: tab bar + viewer + timeline stacked */}
         <div className="flex-1 flex flex-col overflow-hidden">
-          {/* Tab bar */}
-          {video && (
-            <div className="flex-shrink-0 flex items-center gap-1 px-3 py-1.5 bg-[#111111] border-b border-[#1e1e1e]">
-              <TabButton
-                active={viewerTab === 'annotate'}
-                icon={<Crosshair size={14} />}
-                label="Annotate"
-                onClick={() => setViewerTab('annotate')}
-              />
-              <TabButton
-                active={viewerTab === 'player'}
-                icon={<PlayCircle size={14} />}
-                label="Player"
-                onClick={() => setViewerTab('player')}
-              />
-              <TabButton
-                active={viewerTab === 'inference'}
-                icon={<BrainCircuit size={14} />}
-                label="Inference State"
-                onClick={() => setViewerTab('inference')}
-              />
-            </div>
-          )}
+          {/* Tab bar — always visible so Config is accessible without a video */}
+          <div className="flex-shrink-0 flex items-center gap-1 px-3 py-1.5 bg-[#111111] border-b border-[#1e1e1e]">
+            {video && (
+              <>
+                <TabButton
+                  active={viewerTab === 'annotate'}
+                  icon={<Crosshair size={14} />}
+                  label="Annotate"
+                  onClick={() => setViewerTab('annotate')}
+                />
+                <TabButton
+                  active={viewerTab === 'player'}
+                  icon={<PlayCircle size={14} />}
+                  label="Player"
+                  onClick={() => setViewerTab('player')}
+                />
+                <TabButton
+                  active={viewerTab === 'inference'}
+                  icon={<BrainCircuit size={14} />}
+                  label="Inference State"
+                  onClick={() => setViewerTab('inference')}
+                />
+              </>
+            )}
+            <div className="flex-1" />
+            <TabButton
+              active={viewerTab === 'config'}
+              icon={<Settings2 size={14} />}
+              label="Config"
+              onClick={() => setViewerTab('config')}
+            />
+          </div>
 
           {/* Viewer (grows to fill) */}
           {viewerTab === 'annotate' && <FrameViewer />}
           {viewerTab === 'player' && <VideoPlayer />}
           {viewerTab === 'inference' && <InferenceStatePanel />}
+          {viewerTab === 'config' && <ConfigPanel />}
 
           {/* Horizontal resize handle between viewer and timeline */}
           {video && viewerTab === 'annotate' && (
@@ -149,6 +161,7 @@ export default function App() {
       {/* Overlays */}
       <ProjectDrawer />
       <UploadModal />
+      <ToastContainer />
 
       {/* No video selected — welcome prompt (inline, does NOT block header) */}
       {!video && (

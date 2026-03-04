@@ -4,7 +4,35 @@ import type { Project, VideoMeta, ObjectDef, MaskData } from '../types'
 export type PointMode = 'add' | 'remove' | null
 export type PropagationStatus = 'idle' | 'running' | 'done' | 'error'
 export type AppStep = 'upload' | 'annotate' | 'review'
-export type ViewerTab = 'annotate' | 'player' | 'inference'
+export type ViewerTab = 'annotate' | 'player' | 'inference' | 'config'
+
+// ─── App config ───────────────────────────────────────────────────────────────
+
+export interface AppConfig {
+  usePrevFrameMask: boolean
+}
+
+const CONFIG_KEY = 'sam3wt_config'
+
+function loadConfig(): AppConfig {
+  try {
+    const raw = localStorage.getItem(CONFIG_KEY)
+    if (raw) return { usePrevFrameMask: true, ...JSON.parse(raw) }
+  } catch { /* ignore */ }
+  return { usePrevFrameMask: true }
+}
+
+function saveConfig(c: AppConfig) {
+  try { localStorage.setItem(CONFIG_KEY, JSON.stringify(c)) } catch { /* ignore */ }
+}
+
+// ─── Toasts ───────────────────────────────────────────────────────────────────
+
+export interface Toast {
+  id: string
+  message: string
+  type: 'info' | 'success' | 'error'
+}
 
 interface LocalAnnotation {
   points: { x: number; y: number; label: 0 | 1 }[]
@@ -40,6 +68,15 @@ interface AppState {
   drawerOpen: boolean
   uploadModalOpen: boolean
   sessionInitialized: boolean
+
+  // Config
+  config: AppConfig
+  setConfig: (updates: Partial<AppConfig>) => void
+
+  // Toasts
+  toasts: Toast[]
+  addToast: (message: string, type?: Toast['type']) => void
+  removeToast: (id: string) => void
 
   // Actions
   setProject: (p: Project | null) => void
@@ -82,6 +119,8 @@ export const useStore = create<AppState>((set, get) => ({
   uploadModalOpen: false,
   viewerTab: 'annotate' as ViewerTab,
   sessionInitialized: false,
+  config: loadConfig(),
+  toasts: [],
 
   setProject: p => set({ project: p }),
 
@@ -151,6 +190,19 @@ export const useStore = create<AppState>((set, get) => ({
   setUploadModalOpen: v => set({ uploadModalOpen: v }),
   setViewerTab: tab => set({ viewerTab: tab }),
   setSessionInitialized: v => set({ sessionInitialized: v }),
+
+  setConfig: updates => {
+    const next = { ...get().config, ...updates }
+    saveConfig(next)
+    set({ config: next })
+  },
+
+  addToast: (message, type = 'info') => {
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`
+    set(s => ({ toasts: [...s.toasts, { id, message, type }] }))
+  },
+
+  removeToast: id => set(s => ({ toasts: s.toasts.filter(t => t.id !== id) })),
   setPropagationStartFrame: f => set({ propagationStartFrame: f }),
 
   updateVideo: updates => {

@@ -53,8 +53,6 @@ app.add_middleware(
 pm = ProjectManager()
 sam = SAMPredictor()
 
-BASE_PROJECTS = Path("/opt/.sam3_projects")
-
 # Track model loading state
 _model_loading = False
 _model_load_error: str | None = None
@@ -175,7 +173,7 @@ async def add_video(
     vid = video_meta["id"]
 
     # Move upload to permanent location
-    perm_path = BASE_PROJECTS / pid / "videos" / vid / f"source{suffix}"
+    perm_path = pm.video_dir(pid, vid) / f"source{suffix}"
     shutil.move(tmp_path, str(perm_path))
     pm.update_video(pid, vid, {"source_path": str(perm_path)})
 
@@ -244,7 +242,7 @@ async def import_video(
 
     # Copy the source video into the project directory (we need our own copy
     # so we can apply faststart without modifying the original).
-    perm_path = BASE_PROJECTS / pid / "videos" / vid / f"source{src.suffix}"
+    perm_path = pm.video_dir(pid, vid) / f"source{src.suffix}"
     shutil.copy2(str(src), str(perm_path))
     pm.update_video(pid, vid, {"source_path": str(perm_path)})
 
@@ -838,6 +836,177 @@ def get_composite_mask(pid: str, vid: str, fidx: int):
     return StreamingResponse(io.BytesIO(png_bytes), media_type="image/png")
 
 
+# ─── Single-frame prediction ─────────────────────────────────────────────────
+
+class PredictFrameRequest(BaseModel):
+    use_prev_frame_mask: bool = True
+
+
+def _replay_prompts(pid: str, vid: str, all_prompts: dict):
+    """Replay saved point prompts into the current SAM session (sorted by frame index)."""
+    frame_map = sam._frame_maps.get((pid, vid), [])
+    items: list[tuple[int, int, dict]] = []
+    for obj_id_str, fmap in all_prompts.items():
+        for fidx_str, prompt in fmap.items():
+            rf = int(fidx_str)
+            if rf in frame_map:
+                items.append((rf, int(obj_id_str), prompt))
+    items.sort(key=lambda x: x[0])
+    for rf, roid, prompt in items:
+        try:
+            sam.add_points(pid, vid, frame_idx=rf, obj_id=roid,
+                           points=prompt["points"], labels=prompt["labels"])
+        except Exception as e:
+            logger.warning(f"Predict replay: obj {roid} frame {rf}: {e}")
+    return items
+
+
+@app.post("/api/projects/{pid}/videos/{vid}/predict_frame/{frame_idx}")
+def predict_single_frame(pid: str, vid: str, frame_idx: int, req: PredictFrameRequest):
+    """
+    Run single-frame SAM prediction for the given frame.
+
+    If use_prev_frame_mask=true and frame (frame_idx-1) has a saved .npz mask,
+    that mask is temporarily injected as a seed prompt before propagating one
+    frame forward.  The session is re-initialised afterwards to remove the
+    temporary state, leaving only the user's saved point prompts.
+
+    Returns: {frame_idx, masks: {obj_id: base64_png}, used_prev_frame_mask, prev_frame_idx}
+    """
+    video = pm.get_video(pid, vid)
+    if video is None:
+        raise HTTPException(404, "Video not found")
+
+    source_path = video.get("source_path", "")
+    if not source_path or not Path(source_path).exists():
+        raise HTTPException(400, "Video source file not found")
+
+    objects = video.get("objects", {})
+    ann_dir = pm.annotated_frames_dir(pid, vid)
+    ann_dir.mkdir(parents=True, exist_ok=True)
+    masks_dir = pm.masks_dir(pid, vid)
+
+    # 1. Extract frame N to annotated_frames/ if missing
+    frame_n_path = ann_dir / f"{frame_idx:06d}.jpg"
+    if not frame_n_path.exists():
+        try:
+            extract_frame_range(source_path, str(ann_dir), frame_idx, frame_idx + 1)
+        except Exception as e:
+            raise HTTPException(500, f"Failed to extract frame {frame_idx}: {e}")
+    if not frame_n_path.exists():
+        raise HTTPException(500, f"Frame {frame_idx} could not be extracted")
+
+    # 2. Check for previous-frame saved mask
+    used_prev = False
+    prev_frame_idx = frame_idx - 1
+    prev_masks: dict = {}
+
+    if req.use_prev_frame_mask and frame_idx > 0:
+        prev_mask_path = masks_dir / f"{prev_frame_idx:06d}.npz"
+        if prev_mask_path.exists():
+            try:
+                prev_masks = load_masks_npz(str(prev_mask_path))
+            except Exception as e:
+                logger.warning(f"Could not load prev mask at frame {prev_frame_idx}: {e}")
+
+    # 3. If seeding from prev mask, also ensure frame N-1 is extracted
+    if prev_masks:
+        frame_nm1_path = ann_dir / f"{prev_frame_idx:06d}.jpg"
+        if not frame_nm1_path.exists():
+            try:
+                extract_frame_range(source_path, str(ann_dir), prev_frame_idx, prev_frame_idx + 1)
+            except Exception as e:
+                logger.warning(f"Could not extract prev frame {prev_frame_idx}: {e}")
+                prev_masks = {}  # skip seeding if frame unavailable
+
+    # 4. Re-init session so it includes all current annotated frames
+    ann_dir_str = str(ann_dir)
+    try:
+        session_id = sam.init_session(pid, vid, ann_dir_str)
+        pm.update_video(pid, vid, {"sam3_session_id": session_id})
+    except Exception as e:
+        raise HTTPException(500, f"SAM session init failed: {e}")
+
+    all_prompts = pm.get_all_point_prompts(pid, vid)
+    _replay_prompts(pid, vid, all_prompts)
+
+    # 5. Inject prev-frame mask as a temporary seed (not persisted)
+    if prev_masks:
+        frame_map = sam._frame_maps.get((pid, vid), [])
+        if prev_frame_idx in frame_map:
+            for obj_id_str, mask in prev_masks.items():
+                try:
+                    sam.add_mask_prompt(pid, vid, prev_frame_idx, int(obj_id_str), mask)
+                    used_prev = True
+                except Exception as e:
+                    logger.warning(f"Could not seed prev mask obj {obj_id_str}: {e}")
+
+    # 6. Propagate — start from prev frame (if seeded) or earliest available frame
+    frame_map = sam._frame_maps.get((pid, vid), [])
+    start_from = prev_frame_idx if used_prev else (frame_map[0] if frame_map else frame_idx)
+    if start_from not in frame_map and frame_map:
+        start_from = frame_map[0]
+
+    raw_masks: dict = {}
+    try:
+        for item in sam.propagate_stream(pid, vid, start_frame_idx=start_from):
+            sam_idx = item.get("frame_index")
+            real_idx = sam.to_real_idx(pid, vid, sam_idx) if sam_idx is not None else -1
+            # Unify output dict regardless of SAM version key style
+            outputs = item.get("outputs", {})
+            if isinstance(outputs, dict):
+                fo = (outputs.get(sam_idx)
+                      or outputs.get(str(sam_idx))
+                      or outputs.get(real_idx)
+                      or outputs.get(str(real_idx))
+                      or outputs)
+            else:
+                fo = {}
+            if real_idx == frame_idx:
+                obj_ids = fo.get("out_obj_ids", [])
+                masks_list = fo.get("out_binary_masks", [])
+                for i, oid in enumerate(obj_ids):
+                    m = masks_list[i] if i < len(masks_list) else None
+                    if m is None:
+                        continue
+                    if hasattr(m, "numpy"):
+                        m = m.numpy()
+                    raw_masks[str(oid)] = np.squeeze(m)
+                break  # got what we need
+    except Exception as e:
+        logger.error(f"predict_frame propagation failed: {e}", exc_info=True)
+        raise HTTPException(500, f"Prediction failed: {e}")
+
+    # 7. Persist masks for frame N
+    if raw_masks:
+        masks_path = masks_dir / f"{frame_idx:06d}.npz"
+        existing = load_masks_npz(str(masks_path)) if masks_path.exists() else {}
+        save_masks_npz(str(masks_path), {**existing, **raw_masks})
+        pm.mark_frame_propagated(pid, vid, frame_idx)
+
+    # 8. Re-init session to remove the temporary seed (clean state)
+    if used_prev:
+        try:
+            clean_sid = sam.init_session(pid, vid, ann_dir_str)
+            pm.update_video(pid, vid, {"sam3_session_id": clean_sid})
+            _replay_prompts(pid, vid, all_prompts)
+        except Exception as e:
+            logger.warning(f"Session cleanup after predict_frame failed: {e}")
+
+    # 9. Encode masks as base64 PNGs for the frontend
+    mask_b64: dict[str, str] = {}
+    for obj_id, mask in raw_masks.items():
+        obj_color = objects.get(str(obj_id), {}).get("color", "#5B8DD9")
+        mask_b64[str(obj_id)] = encode_mask_as_png(mask, obj_color)
+
+    return {
+        "frame_idx": frame_idx,
+        "masks": mask_b64,
+        "used_prev_frame_mask": used_prev,
+        "prev_frame_idx": prev_frame_idx if used_prev else None,
+    }
+
+
 # ─── Video Export (SSE) ──────────────────────────────────────────────────────
 
 @app.get("/api/projects/{pid}/videos/{vid}/export")
@@ -861,7 +1030,7 @@ async def export_video_sse(pid: str, vid: str):
     colors = {oid: obj.get("color", "#5B8DD9") for oid, obj in objects.items()}
     labels_map = {oid: obj.get("name", f"Object {oid}") for oid, obj in objects.items()}
     masks_dir = str(pm.masks_dir(pid, vid))
-    out_path = BASE_PROJECTS / pid / "videos" / vid / "export.mp4"
+    out_path = pm.video_dir(pid, vid) / "export.mp4"
 
     async def event_gen():
         import concurrent.futures

@@ -1,7 +1,7 @@
 import React, { useState } from 'react'
-import { Plus, RotateCcw, ChevronRight, Loader, Download, X } from 'lucide-react'
+import { Plus, RotateCcw, ChevronRight, Loader, Download, X, Zap } from 'lucide-react'
 import { useStore, currentVideo as selectCurrentVideo } from '../../store/useStore'
-import { addObject, initSession, startPropagationSSE, startExportSSE, getProject, resetVideo } from '../../api/client'
+import { addObject, initSession, startPropagationSSE, startExportSSE, getProject, resetVideo, predictFrame } from '../../api/client'
 import { getObjectColor } from '../../utils/colors'
 import { clearMaskCache } from '../../utils/maskUtils'
 import ObjectCard from './ObjectCard'
@@ -12,13 +12,14 @@ export default function LeftPanel() {
   const store = useStore()
   const video = selectCurrentVideo(store)
   const {
-    project, currentVideoId,
+    project, currentVideoId, currentFrame,
     currentObjectId, setCurrentObject,
     propagationStatus, setPropagationStatus, setPropagationProgress,
     sessionInitialized, setSessionInitialized,
     propagationStartFrame, setPropagationStartFrame,
-    setDrawerOpen, resetVideoState, updateVideo,
+    resetVideoState, updateVideo,
     setProject, setSavedMask,
+    config, addToast,
   } = store
 
   const [addingObject, setAddingObject] = useState(false)
@@ -26,6 +27,7 @@ export default function LeftPanel() {
   const [initializingSession, setInitializingSession] = useState(false)
   const [trackingError, setTrackingError] = useState('')
   const [batchStatus, setBatchStatus] = useState('')
+  const [predictingFrame, setPredictingFrame] = useState(false)
 
   type ExportStatus = 'idle' | 'running' | 'done' | 'error'
   const [exportStatus, setExportStatus] = useState<ExportStatus>('idle')
@@ -170,6 +172,42 @@ export default function LeftPanel() {
         }
         return prev
       })
+    }
+  }
+
+  // ── Predict Frame ────────────────────────────────────────────────────────────
+
+  async function handlePredictFrame() {
+    if (!pid || !vid) return
+    setPredictingFrame(true)
+    const frame = store.currentFrame
+    const usePrev = config.usePrevFrameMask
+
+    if (usePrev) {
+      addToast(`Loading prev-frame mask into inference state for frame ${frame}…`, 'info')
+    } else {
+      addToast(`Predicting frame ${frame}…`, 'info')
+    }
+
+    try {
+      const result = await predictFrame(pid, vid, frame, usePrev)
+      // Cache the returned masks so the canvas shows them immediately
+      if (Object.keys(result.masks).length > 0) {
+        setSavedMask(result.frame_idx, result.masks)
+      }
+      if (result.used_prev_frame_mask) {
+        addToast(
+          `Frame ${frame} predicted using mask from frame ${result.prev_frame_idx}. Inference state restored.`,
+          'success'
+        )
+      } else {
+        addToast(`Frame ${frame} predicted successfully.`, 'success')
+      }
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : 'Prediction failed'
+      addToast(msg, 'error')
+    } finally {
+      setPredictingFrame(false)
     }
   }
 
@@ -396,6 +434,18 @@ export default function LeftPanel() {
           </button>
         )}
         <div className="flex-1" />
+        <button
+          onClick={handlePredictFrame}
+          disabled={predictingFrame || isTracking || !hasObjects}
+          className="btn btn-ghost flex items-center gap-1 text-xs disabled:opacity-40"
+          title={`Predict mask for frame ${store.currentFrame}`}
+        >
+          {predictingFrame
+            ? <Loader size={11} className="animate-spin" />
+            : <Zap size={11} />
+          }
+          Predict
+        </button>
         <button
           onClick={handleTrack}
           disabled={isTracking || !hasObjects || initializingSession}

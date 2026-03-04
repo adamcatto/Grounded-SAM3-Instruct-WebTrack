@@ -145,6 +145,21 @@ export const clearObjectPoints = (pid: string, vid: string, oid: string) =>
 export const getSavedMask = (pid: string, vid: string, fidx: number) =>
   api.get<{ frame_idx: number; masks: MaskData }>(`/projects/${pid}/videos/${vid}/masks/${fidx}`).then(r => r.data)
 
+// ─── Single-frame prediction ──────────────────────────────────────────────────
+
+export interface PredictFrameResult {
+  frame_idx: number
+  masks: MaskData
+  used_prev_frame_mask: boolean
+  prev_frame_idx: number | null
+}
+
+export const predictFrame = (pid: string, vid: string, frameIdx: number, usePrevFrameMask: boolean) =>
+  api.post<PredictFrameResult>(
+    `/projects/${pid}/videos/${vid}/predict_frame/${frameIdx}`,
+    { use_prev_frame_mask: usePrevFrameMask }
+  ).then(r => r.data)
+
 // ─── Propagation SSE ─────────────────────────────────────────────────────────
 
 // SSE also benefits from bypassing Vite's proxy to avoid buffering/re-chunking
