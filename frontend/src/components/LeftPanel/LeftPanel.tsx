@@ -1,7 +1,7 @@
-import React, { useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import { Plus, RotateCcw, ChevronRight, Loader, Download, X, Zap, Save } from 'lucide-react'
 import { useStore, currentVideo as selectCurrentVideo } from '../../store/useStore'
-import { addObject, initSession, startPropagationSSE, startExportSSE, getProject, resetVideo, predictFrame, saveFrameInference } from '../../api/client'
+import { addObject, initSession, startPropagationSSE, startExportSSE, getProject, resetVideo, predictFrame, saveFrameInference, getPropagationStatus } from '../../api/client'
 import { getObjectColor } from '../../utils/colors'
 import { clearMaskCache } from '../../utils/maskUtils'
 import ObjectCard from './ObjectCard'
@@ -27,7 +27,16 @@ export default function LeftPanel() {
   const [newObjName, setNewObjName] = useState('')
   const [initializingSession, setInitializingSession] = useState(false)
   const [trackingError, setTrackingError] = useState('')
-  const [batchStatus, setBatchStatus] = useState('')
+  const [trackingRetryMsg, setTrackingRetryMsg] = useState('')
+  const [extractingPhase, setExtractingPhase] = useState(false)
+  const [trackingOverallProgress, setTrackingOverallProgress] = useState(0)
+  const [totalBatchesRef] = useState({ current: 1 })
+  // extractedUpTo: frames confirmed fully extracted (updated on initializing_session)
+  // extractCurrentEnd: end of the batch currently being extracted (updated on extracting)
+  const [extractedUpTo, setExtractedUpTo] = useState(0)
+  const [extractCurrentEnd, setExtractCurrentEnd] = useState(0)
+  const [trackFrame, setTrackFrame] = useState(0)
+  const activeEsRef = useRef<EventSource | null>(null)
   const [predictingFrame, setPredictingFrame] = useState(false)
 
   type ExportStatus = 'idle' | 'running' | 'done' | 'error'
@@ -39,6 +48,40 @@ export default function LeftPanel() {
   const objects = video ? Object.values(video.objects) : []
   const pid = project?.id ?? ''
   const vid = currentVideoId ?? ''
+
+  // ── Restore progress from server on video load ────────────────────────────
+
+  useEffect(() => {
+    if (!pid || !vid) return
+    getPropagationStatus(pid, vid).then(status => {
+      const startF = status.start_frame || 0
+      const total = status.total_frames || 1
+      const done = status.frames_done || 0
+      const lastFrame = status.last_frame >= 0 ? status.last_frame : startF
+      // Seed progress bars from saved state
+      setTrackFrame(lastFrame + 1)
+      setExtractedUpTo(lastFrame + 1)
+      setExtractCurrentEnd(lastFrame + 1)
+      setTrackingOverallProgress(done / total)
+      totalBatchesRef.current = Math.max(1, Math.ceil((total - startF) / 1000))
+
+      if (status.propagation_complete) {
+        // Already done — make sure store reflects this
+        if (useStore.getState().propagationStatus !== 'done') {
+          setPropagationStatus('done')
+          setPropagationProgress(1, lastFrame)
+        }
+      } else if (status.is_running) {
+        // Propagation running on backend — reconnect SSE
+        setPropagationStatus('running')
+        setTrackingError('')
+        setTrackingRetryMsg('')
+        setExtractingPhase(false)
+        _connectSSE(0)
+      }
+    }).catch(() => { /* status endpoint not yet available or error — ignore */ })
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pid, vid])
 
   // ── Add Object ──────────────────────────────────────────────────────────────
 
@@ -75,40 +118,55 @@ export default function LeftPanel() {
 
   // ── Track Objects ─────────────────────────────────────────────────────────────
 
-  async function handleTrack() {
-    setTrackingError('')
-    if (!sessionInitialized) {
-      try {
-        await handleInitSession()
-      } catch {
-        setTrackingError('Failed to initialize SAM session')
-        return
-      }
-    }
-
-    setPropagationStatus('running')
-    setBatchStatus('')
+  function _connectSSE(retryCount: number) {
+    const MAX_RETRIES = 3
+    // Close any existing connection
+    activeEsRef.current?.close()
 
     const es = startPropagationSSE(pid, vid, propagationStartFrame)
+    activeEsRef.current = es
+
+    es.addEventListener('catch_up', (e: MessageEvent) => {
+      // Server sent current position when reconnecting mid-run
+      const data = JSON.parse(e.data)
+      const done: number = data.frames_done ?? 0
+      const total: number = data.total_frames ?? 1
+      const last: number = data.last_frame ?? -1
+      setTrackFrame(last + 1)
+      setExtractedUpTo(last + 1)
+      setExtractCurrentEnd(last + 1)
+      setTrackingOverallProgress(done / total)
+      totalBatchesRef.current = Math.max(1, Math.ceil(total / 1000))
+    })
     es.addEventListener('batch_start', (e: MessageEvent) => {
       const data: PropagationEvent = JSON.parse(e.data)
+      totalBatchesRef.current = data.total_batches ?? 1
       if (data.status === 'extracting') {
-        setBatchStatus(`Extracting frames (batch ${(data.batch ?? 0) + 1}/${data.total_batches ?? '?'})...`)
+        setExtractingPhase(true)
+        setExtractCurrentEnd(data.batch_end ?? 0)
       } else if (data.status === 'initializing_session') {
-        setBatchStatus('Loading frames into SAM model...')
+        // Extraction for this batch is done — confirm it
+        setExtractedUpTo(data.batch_end ?? 0)
+        setExtractingPhase(false)
       }
     })
     es.addEventListener('progress', (e: MessageEvent) => {
       const data: PropagationEvent = JSON.parse(e.data)
+      setExtractingPhase(false)
+      setTrackFrame(data.frame + 1)
+      // data.progress = total_propagated / num_frames (absolute, not per-batch)
+      setTrackingOverallProgress(data.progress)
       setPropagationProgress(data.progress, data.frame)
-      setBatchStatus('')
     })
     es.addEventListener('done', async (e: MessageEvent) => {
       const data: PropagationEvent = JSON.parse(e.data)
+      setExtractingPhase(false)
+      setTrackingOverallProgress(1)
       setPropagationStatus('done')
       setPropagationProgress(1, data.frame ?? 0)
+      setTrackingRetryMsg('')
       es.close()
-      // Refresh project to get updated propagated_frames
+      activeEsRef.current = null
       const fresh = await getProject(pid)
       setProject(fresh)
     })
@@ -119,17 +177,50 @@ export default function LeftPanel() {
       } catch {
         setTrackingError('Propagation error')
       }
+      setExtractingPhase(false)
       setPropagationStatus('error')
       es.close()
+      activeEsRef.current = null
     })
     es.onerror = () => {
       const status = useStore.getState().propagationStatus
-      if (status !== 'done') {
+      if (status === 'done') return
+      es.close()
+      activeEsRef.current = null
+      setExtractingPhase(false)
+      if (retryCount < MAX_RETRIES) {
+        const attempt = retryCount + 1
+        setTrackingRetryMsg(`Connection lost. Retrying (${attempt}/${MAX_RETRIES})...`)
+        setPropagationStatus('running')
+        setTimeout(() => _connectSSE(attempt), 3000)
+      } else {
         setPropagationStatus('error')
-        setTrackingError('Connection lost during propagation')
-        es.close()
+        setTrackingError(`Connection lost after ${MAX_RETRIES} retries`)
+        setTrackingRetryMsg('')
       }
     }
+  }
+
+  async function handleTrack() {
+    setTrackingError('')
+    setTrackingRetryMsg('')
+    if (!sessionInitialized) {
+      try {
+        await handleInitSession()
+      } catch {
+        setTrackingError('Failed to initialize SAM session')
+        return
+      }
+    }
+
+    setPropagationStatus('running')
+    setExtractingPhase(false)
+    setTrackingOverallProgress(0)
+    setExtractedUpTo(propagationStartFrame)
+    setExtractCurrentEnd(propagationStartFrame)
+    setTrackFrame(propagationStartFrame)
+    totalBatchesRef.current = 1
+    _connectSSE(0)
   }
 
   // ── Export Video ─────────────────────────────────────────────────────────────
@@ -335,20 +426,51 @@ export default function LeftPanel() {
       )}
 
       {/* Propagation progress */}
-      {isTracking && (
-        <div className="mx-3 mb-2 space-y-1">
-          <div className="flex justify-between text-xs text-[#888]">
-            <span>{batchStatus || 'Tracking objects...'}</span>
-            <span>{Math.round(store.propagationProgress * 100)}%</span>
+      {isTracking && (() => {
+        const totalFrames = (video?.num_frames ?? 1) - propagationStartFrame
+        // During extraction: show target batch end; after: show confirmed extracted count
+        const extractDisplayEnd = extractingPhase ? extractCurrentEnd : extractedUpTo
+        const extractDone = Math.max(0, extractDisplayEnd - propagationStartFrame)
+        const extractPct = totalFrames > 0 ? Math.min(1, extractDone / totalFrames) : 0
+        // Tracking: frames processed so far
+        const trackDone = Math.max(0, trackFrame - propagationStartFrame)
+        const trackPct = Math.min(1, trackingOverallProgress)
+        return (
+          <div className="mx-3 mb-2 space-y-2">
+            {/* Extracting frames bar */}
+            <div className="space-y-1">
+              <div className="flex justify-between text-xs text-[#888]">
+                <span>Extracting frames</span>
+                <span className={!extractingPhase && extractDone >= totalFrames ? 'text-emerald-500' : ''}>
+                  {extractDone}/{totalFrames}
+                </span>
+              </div>
+              <div className="h-1.5 bg-[#2a2a2a] rounded-full overflow-hidden">
+                <div
+                  className={`h-full transition-all duration-300 ${extractingPhase ? 'bg-amber-500' : 'bg-emerald-600'}`}
+                  style={{ width: `${extractPct * 100}%` }}
+                />
+              </div>
+            </div>
+            {/* Tracking objects bar */}
+            <div className="space-y-1">
+              <div className="flex justify-between text-xs text-[#888]">
+                <span>Tracking objects</span>
+                <span>{trackDone}/{totalFrames}</span>
+              </div>
+              <div className="h-1.5 bg-[#2a2a2a] rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-blue-500 transition-all duration-300"
+                  style={{ width: `${trackPct * 100}%` }}
+                />
+              </div>
+            </div>
+            {trackingRetryMsg && (
+              <p className="text-xs text-amber-400">{trackingRetryMsg}</p>
+            )}
           </div>
-          <div className="h-1.5 bg-[#2a2a2a] rounded-full overflow-hidden">
-            <div
-              className="h-full bg-blue-500 transition-all duration-300"
-              style={{ width: `${store.propagationProgress * 100}%` }}
-            />
-          </div>
-        </div>
-      )}
+        )
+      })()}
 
       {/* Error */}
       {trackingError && (
@@ -451,56 +573,64 @@ export default function LeftPanel() {
       )}
 
       {/* Bottom buttons */}
-      <div className="flex items-center gap-1 p-2 border-t border-[#2a2a2a] flex-shrink-0">
+      <div
+        className="flex items-stretch gap-1 px-1.5 py-1 border-t border-[#2a2a2a] flex-shrink-0 overflow-hidden"
+        style={{ containerType: 'inline-size' } as React.CSSProperties}
+      >
         <button
           onClick={handleStartOver}
           disabled={isTracking}
-          className="btn btn-ghost flex items-center gap-1 text-xs"
+          className="btn btn-ghost flex-1 min-w-0 flex flex-col items-center justify-center gap-0.5 px-0.5 py-2"
+          style={{ fontSize: 'clamp(7px, 4cqi, 11px)', lineHeight: 1.2 }}
         >
-          <RotateCcw size={11} />
-          Start over
+          <RotateCcw size={10} />
+          <span>Start</span>
+          <span>over</span>
         </button>
         {(video.propagated_frames?.length ?? 0) > 0 && (
           <button
             onClick={handleExport}
             disabled={exportStatus === 'running' || isTracking}
-            className="btn btn-ghost flex items-center gap-1 text-xs disabled:opacity-40"
+            className="btn btn-ghost flex-1 min-w-0 flex flex-col items-center justify-center gap-0.5 px-0.5 py-2 disabled:opacity-40"
+            style={{ fontSize: 'clamp(7px, 4cqi, 11px)', lineHeight: 1.2 }}
             title="Export annotated MP4"
           >
             {exportStatus === 'running'
-              ? <Loader size={11} className="animate-spin" />
-              : <Download size={11} />
+              ? <Loader size={10} className="animate-spin" />
+              : <Download size={10} />
             }
-            Export
+            <span>Export</span>
           </button>
         )}
-        <div className="flex-1" />
         <button
           onClick={handlePredictFrame}
           disabled={predictingFrame || isTracking || !hasObjects}
-          className="btn btn-ghost flex items-center gap-1 text-xs disabled:opacity-40"
+          className="btn btn-ghost flex-1 min-w-0 flex flex-col items-center justify-center gap-0.5 px-0.5 py-2 disabled:opacity-40"
+          style={{ fontSize: 'clamp(7px, 4cqi, 11px)', lineHeight: 1.2 }}
           title={`Predict mask for frame ${store.currentFrame}`}
         >
           {predictingFrame
-            ? <Loader size={11} className="animate-spin" />
-            : <Zap size={11} />
+            ? <Loader size={10} className="animate-spin" />
+            : <Zap size={10} />
           }
-          Predict
+          <span>Predict</span>
         </button>
         <button
           onClick={handleTrack}
           disabled={isTracking || !hasObjects || initializingSession}
-          className="btn btn-primary flex items-center gap-1 text-xs disabled:opacity-40"
+          className="btn btn-primary flex-1 min-w-0 flex flex-col items-center justify-center gap-0.5 px-0.5 py-2 disabled:opacity-40"
+          style={{ fontSize: 'clamp(7px, 4cqi, 11px)', lineHeight: 1.2 }}
         >
           {isTracking ? (
             <>
-              <Loader size={11} className="animate-spin" />
-              Tracking...
+              <Loader size={10} className="animate-spin" />
+              <span>Tracking...</span>
             </>
           ) : (
             <>
-              Track objects
-              <ChevronRight size={11} />
+              <ChevronRight size={10} />
+              <span>Track</span>
+              <span>objects</span>
             </>
           )}
         </button>

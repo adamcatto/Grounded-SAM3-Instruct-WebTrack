@@ -56,6 +56,10 @@ export interface PropagationEvent {
   batch?: number
   batch_start?: number
   batch_end?: number
-  status?: string          // 'extracting' for batch_start events
+  status?: string          // 'extracting' | 'initializing_session' for batch_start events
   total_batches?: number
+  // catch_up event fields (sent when reconnecting to a running propagation)
+  frames_done?: number
+  last_frame?: number
+  start_frame?: number
 }

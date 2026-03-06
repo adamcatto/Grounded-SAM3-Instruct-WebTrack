@@ -167,6 +167,18 @@ export const saveFrameInference = (pid: string, vid: string, frameIdx: number) =
 
 // ─── Propagation SSE ─────────────────────────────────────────────────────────
 
+export interface PropagationStatusResponse {
+  is_running: boolean
+  frames_done: number
+  total_frames: number
+  propagation_complete: boolean
+  last_frame: number
+  start_frame: number
+}
+
+export const getPropagationStatus = (pid: string, vid: string) =>
+  api.get<PropagationStatusResponse>(`/projects/${pid}/videos/${vid}/propagate/status`).then(r => r.data)
+
 // SSE also benefits from bypassing Vite's proxy to avoid buffering/re-chunking
 export const startPropagationSSE = (pid: string, vid: string, startFrame = 0) =>
   new EventSource(`${BACKEND}/api/projects/${pid}/videos/${vid}/propagate?start_frame=${startFrame}`)

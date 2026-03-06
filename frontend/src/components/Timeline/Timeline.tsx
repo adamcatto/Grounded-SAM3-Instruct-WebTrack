@@ -1,8 +1,42 @@
-import React, { useEffect } from 'react'
+import React, { useEffect, useState } from 'react'
 import { Play, Pause, SkipBack, SkipForward } from 'lucide-react'
 import { useStore, currentVideo as selectCurrentVideo } from '../../store/useStore'
 import { getSavedMask } from '../../api/client'
 import ObjectTrackRow from './ObjectTrackRow'
+
+function JumpToFrame({ currentFrame, min, max, onJump }: {
+  currentFrame: number
+  min: number
+  max: number
+  onJump: (f: number) => void
+}) {
+  const [value, setValue] = useState<string | null>(null)
+
+  const commit = (raw: string) => {
+    const n = parseInt(raw, 10)
+    if (!isNaN(n)) onJump(Math.max(min, Math.min(max, n)))
+    setValue(null)
+  }
+
+  return (
+    <input
+      type="number"
+      min={min}
+      max={max}
+      value={value ?? currentFrame}
+      onChange={e => setValue(e.target.value)}
+      onKeyDown={e => {
+        if (e.key === 'Enter') { commit((e.target as HTMLInputElement).value); (e.target as HTMLInputElement).blur() }
+        if (e.key === 'Escape') { setValue(null); (e.target as HTMLInputElement).blur() }
+      }}
+      onBlur={e => commit(e.target.value)}
+      onFocus={e => { setValue(String(currentFrame)); e.target.select() }}
+      title="Jump to frame"
+      className="w-16 bg-[#1a1a1a] border border-[#333] rounded px-1.5 py-0.5 text-xs font-mono text-[#ccc] text-center focus:outline-none focus:border-[#555]"
+      style={{ MozAppearance: 'textfield' } as React.CSSProperties}
+    />
+  )
+}
 
 export default function Timeline() {
   const store = useStore()
@@ -22,16 +56,21 @@ export default function Timeline() {
 
   useEffect(() => {
     if (
-      (propagationStatus === 'done' || propagationStatus === 'running') &&
-      !savedMaskCache[currentFrame] &&
-      video?.propagated_frames?.includes(currentFrame)
-    ) {
-      getSavedMask(pid, vid, currentFrame)
+      !(propagationStatus === 'done' || propagationStatus === 'running') ||
+      savedMaskCache[currentFrame] ||
+      !video?.propagated_frames?.includes(currentFrame)
+    ) return
+
+    const frame = currentFrame
+    const timer = setTimeout(() => {
+      getSavedMask(pid, vid, frame)
         .then(data => {
-          if (data.masks) setSavedMask(currentFrame, data.masks)
+          if (data.masks) setSavedMask(frame, data.masks)
         })
         .catch(() => {})
-    }
+    }, 80)
+
+    return () => clearTimeout(timer)
   }, [currentFrame, propagationStatus])
 
   // ── Time formatting ───────────────────────────────────────────────────────
@@ -109,6 +148,14 @@ export default function Timeline() {
         >
           <SkipForward size={13} />
         </button>
+
+        {/* Jump to frame */}
+        <JumpToFrame
+          currentFrame={currentFrame}
+          min={startFrame}
+          max={total - 1}
+          onJump={setCurrentFrame}
+        />
       </div>
 
       {/* Object track rows */}

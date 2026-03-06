@@ -4,6 +4,7 @@ Supports SAM3 (primary) with SAM2 fallback.
 """
 
 import asyncio
+import functools
 import json
 import logging
 import shutil
@@ -58,6 +59,94 @@ _model_loading = False
 _model_load_error: str | None = None
 
 
+# ─── Propagation state registry ───────────────────────────────────────────────
+
+class PropagationState:
+    """Tracks an active (or recently finished) propagation task for one video."""
+
+    def __init__(self):
+        self.is_running: bool = False
+        self.task: asyncio.Task | None = None
+        self.subscribers: list[asyncio.Queue] = []
+        self.total_frames: int = 0
+        self.start_frame: int = 0
+
+    async def publish(self, event: dict) -> None:
+        dead = []
+        for q in self.subscribers:
+            try:
+                q.put_nowait(event)
+            except asyncio.QueueFull:
+                dead.append(q)
+        for q in dead:
+            try:
+                self.subscribers.remove(q)
+            except ValueError:
+                pass
+
+    def subscribe(self) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue(maxsize=500)
+        self.subscribers.append(q)
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue) -> None:
+        try:
+            self.subscribers.remove(q)
+        except ValueError:
+            pass
+
+
+_prop_registry: dict[str, PropagationState] = {}
+
+# ─── Mask encode cache ────────────────────────────────────────────────────────
+# encode_mask_as_png is expensive (numpy + cv2 contour/dilate + PIL PNG encode).
+# Cache results keyed by (npz_path, mtime_ns) so repeated GET /masks/{fidx}
+# requests (e.g. scrubbing back to a visited frame) are instant.
+
+_mask_encode_cache: dict[tuple, dict] = {}
+_MASK_CACHE_MAX = 2000  # max entries (~2 KB overhead per entry, masks are large)
+
+
+def _get_encoded_masks(masks_path: Path, objects: dict) -> dict:
+    """Load and encode masks with an in-memory cache keyed by (path, mtime)."""
+    if not masks_path.exists():
+        return {}
+    mtime_ns = masks_path.stat().st_mtime_ns
+    key = (str(masks_path), mtime_ns)
+    if key in _mask_encode_cache:
+        return _mask_encode_cache[key]
+
+    raw_masks = load_masks_npz(str(masks_path))
+    mask_b64: dict[str, str] = {}
+    for obj_id, mask in raw_masks.items():
+        obj_color = objects.get(str(obj_id), {}).get("color", "#5B8DD9")
+        mask_b64[str(obj_id)] = encode_mask_as_png(mask, obj_color)
+
+    if len(_mask_encode_cache) >= _MASK_CACHE_MAX:
+        # Evict oldest 10% of entries
+        evict = _MASK_CACHE_MAX // 10
+        for k in list(_mask_encode_cache.keys())[:evict]:
+            del _mask_encode_cache[k]
+
+    _mask_encode_cache[key] = mask_b64
+    return mask_b64
+
+
+def _invalidate_mask_cache(pid: str, vid: str) -> None:
+    """Remove all cached entries for a given video (call after propagation/save)."""
+    prefix = str(pm.masks_dir(pid, vid))
+    for k in [k for k in _mask_encode_cache if k[0].startswith(prefix)]:
+        del _mask_encode_cache[k]
+
+
+
+def _get_prop_state(pid: str, vid: str) -> PropagationState:
+    key = f"{pid}/{vid}"
+    if key not in _prop_registry:
+        _prop_registry[key] = PropagationState()
+    return _prop_registry[key]
+
+
 # ─── Startup: eagerly load SAM model ─────────────────────────────────────────
 
 @app.on_event("startup")
@@ -83,7 +172,7 @@ async def startup_load_model():
 # ─── Health ──────────────────────────────────────────────────────────────────
 
 @app.get("/api/health")
-def health():
+async def health():
     loaded = sam.is_loaded()
     return {
         "status": "ok",
@@ -384,8 +473,10 @@ def get_frame(pid: str, vid: str, fidx: int, thumb: bool = False):
     if thumb:
         data = generate_thumbnail(str(frame_path), height=60)
         if data:
-            return StreamingResponse(iter([data]), media_type="image/jpeg")
-    return FileResponse(str(frame_path), media_type="image/jpeg")
+            return StreamingResponse(iter([data]), media_type="image/jpeg",
+                                     headers={"Cache-Control": "public, max-age=86400, immutable"})
+    return FileResponse(str(frame_path), media_type="image/jpeg",
+                        headers={"Cache-Control": "public, max-age=86400, immutable"})
 
 
 # ─── Extract single frame for annotation ─────────────────────────────────────
@@ -773,6 +864,7 @@ def add_points(pid: str, vid: str, oid: str, req: AddPointsRequest):
         masks_path = pm.masks_dir(pid, vid) / f"{req.frame_idx:06d}.npz"
         existing = load_masks_npz(str(masks_path)) if masks_path.exists() else {}
         save_masks_npz(str(masks_path), {**existing, **raw_masks})
+        _invalidate_mask_cache(pid, vid)
 
     return {"frame_idx": req.frame_idx, "masks": mask_b64}
 
@@ -803,16 +895,11 @@ def get_saved_mask(pid: str, vid: str, fidx: int):
     if not masks_path.exists():
         return JSONResponse({"masks": {}})
 
-    raw_masks = load_masks_npz(str(masks_path))
-    objects = video["objects"]
-
-    # Encode each object mask
-    mask_b64: dict[str, str] = {}
-    for obj_id, mask in raw_masks.items():
-        obj_color = objects.get(str(obj_id), {}).get("color", "#5B8DD9")
-        mask_b64[str(obj_id)] = encode_mask_as_png(mask, obj_color)
-
-    return {"frame_idx": fidx, "masks": mask_b64}
+    mask_b64 = _get_encoded_masks(masks_path, video["objects"])
+    return JSONResponse(
+        {"frame_idx": fidx, "masks": mask_b64},
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
 
 
 @app.get("/api/projects/{pid}/videos/{vid}/masks/{fidx}/composite")
@@ -982,6 +1069,7 @@ def predict_single_frame(pid: str, vid: str, frame_idx: int, req: PredictFrameRe
         masks_path = masks_dir / f"{frame_idx:06d}.npz"
         existing = load_masks_npz(str(masks_path)) if masks_path.exists() else {}
         save_masks_npz(str(masks_path), {**existing, **raw_masks})
+        _invalidate_mask_cache(pid, vid)
         pm.mark_frame_propagated(pid, vid, frame_idx)
 
     # 8. Re-init session to remove the temporary seed (clean state)
@@ -1124,57 +1212,30 @@ async def export_video_sse(pid: str, vid: str):
     return EventSourceResponse(event_gen())
 
 
-# ─── Propagation (SSE) — streaming mini-batch frame processing ───────────────
+# ─── Propagation background task ─────────────────────────────────────────────
 
-@app.get("/api/projects/{pid}/videos/{vid}/propagate")
-async def propagate_video(pid: str, vid: str, start_frame: int = 0):
+async def _run_propagation_bg(
+    pid: str,
+    vid: str,
+    actual_start: int,
+    batches: list[tuple[int, int]],
+    all_prompts: dict,
+    num_frames: int,
+    source_path: str,
+    masks_dir,
+    bboxes_dir,
+    objects: dict,
+    is_sam3: bool,
+    state: PropagationState,
+) -> None:
     """
-    Stream propagation results as Server-Sent Events.
-
-    Frames are decoded from the source video in mini-batches of STREAM_BATCH_SIZE
-    into a *temporary directory* that is deleted after each batch.  This means
-    SAM only loads ~150 frames per session init (seconds) instead of the entire
-    video (potentially tens of minutes).
-
-    Cross-batch identity tracking:
-      • At the end of batch N the last frame's per-object masks are kept.
-      • Batch N+1 re-initialises a fresh SAM session on the new temp dir, then
-        seeds it with those masks via add_mask_prompt so object IDs carry over.
+    Run propagation as a true background task, publishing SSE events to all
+    subscribers in `state`.  Survives client disconnects — new SSE connections
+    to /propagate will join the running task via the subscriber queue.
     """
-    video = pm.get_video(pid, vid)
-    if video is None:
-        raise HTTPException(404, "Video not found")
-
-    session_id = sam.get_session_id(pid, vid)
-    if session_id is None:
-        raise HTTPException(400, "No active SAM session. Initialize session and add prompts first.")
-
-    num_frames = video["num_frames"]
-    source_path = video.get("source_path", "")
-    masks_dir = pm.masks_dir(pid, vid)
-    bboxes_dir = pm.bboxes_dir(pid, vid)
-    objects = video["objects"]
-    is_sam3 = sam.model_name() == "sam3"
-
-    # Find the earliest annotated frame so the first batch always contains it.
-    all_prompts = pm.get_all_point_prompts(pid, vid)
-    first_ann_frame: int | None = None
-    for obj_id_str, frame_map in all_prompts.items():
-        for fidx_str in frame_map:
-            fidx = int(fidx_str)
-            if first_ann_frame is None or fidx < first_ann_frame:
-                first_ann_frame = fidx
-    # Clamp: start no later than the earliest annotated frame
-    actual_start = min(start_frame, first_ann_frame) if first_ann_frame is not None else start_frame
-
-    # Build mini-batch ranges starting from actual_start
-    batches: list[tuple[int, int]] = []
-    for s in range(actual_start, num_frames, STREAM_BATCH_SIZE):
-        batches.append((s, min(s + STREAM_BATCH_SIZE, num_frames)))
-
     import concurrent.futures
 
-    async def event_generator():
+    async def run():
         loop = asyncio.get_event_loop()
         total_propagated = 0
         prev_batch_last_masks: dict | None = None  # obj_id(int) -> np.ndarray
@@ -1223,7 +1284,7 @@ async def propagate_video(pid: str, vid: str, start_frame: int = 0):
 
                 # ── 4. Init SAM session on just this batch's temp dir ─────
                 try:
-                    new_sid = sam.init_session(pid, vid, tmp_dir)
+                    new_sid = await loop.run_in_executor(None, sam.init_session, pid, vid, tmp_dir)
                     pm.update_video(pid, vid, {"sam3_session_id": new_sid})
                 except Exception as e:
                     logger.error(f"Session init failed for batch {batch_idx}: {e}", exc_info=True)
@@ -1245,13 +1306,13 @@ async def propagate_video(pid: str, vid: str, start_frame: int = 0):
                                         f"obj {obj_id_str} on frame {real_fidx} "
                                         f"(points={len(prompt['points'])})"
                                     )
-                                    sam.add_points(
-                                        pid, vid,
+                                    await loop.run_in_executor(None, functools.partial(
+                                        sam.add_points, pid, vid,
                                         frame_idx=real_fidx,
                                         obj_id=int(obj_id_str),
                                         points=prompt["points"],
                                         labels=prompt["labels"],
-                                    )
+                                    ))
                                     replayed_count += 1
                                     if sam3_annotated_frame is None or real_fidx < sam3_annotated_frame:
                                         sam3_annotated_frame = real_fidx
@@ -1296,12 +1357,12 @@ async def propagate_video(pid: str, vid: str, start_frame: int = 0):
                         # In-memory carry-forward overrides disk (it's more recent)
                         seed_masks.update(prev_batch_last_masks)
                         for obj_id_int, mask_np in seed_masks.items():
-                            sam.add_mask_prompt(
-                                pid, vid,
+                            await loop.run_in_executor(None, functools.partial(
+                                sam.add_mask_prompt, pid, vid,
                                 frame_idx=batch_start,
                                 obj_id=obj_id_int,
                                 mask=mask_np,
-                            )
+                            ))
                         logger.info(
                             f"Batch {batch_idx}: seeded {len(seed_masks)} object(s) "
                             f"on frame {batch_start} "
@@ -1443,6 +1504,8 @@ async def propagate_video(pid: str, vid: str, start_frame: int = 0):
                     return
 
                 # ── 7. Carry masks forward for the next batch ─────────────
+                # Invalidate encode cache so scrubbing after propagation gets fresh masks
+                _invalidate_mask_cache(pid, vid)
                 prev_batch_last_masks = last_frame_masks if last_frame_masks else prev_batch_last_masks
                 logger.info(
                     f"Batch {batch_idx} done: {batch_frame_count} frames, "
@@ -1465,4 +1528,116 @@ async def propagate_video(pid: str, vid: str, start_frame: int = 0):
             }),
         }
 
-    return EventSourceResponse(event_generator())
+    try:
+        async for event in run():
+            await state.publish(event)
+    except Exception as e:
+        logger.error(f"Propagation background task crashed: {e}", exc_info=True)
+        await state.publish({"event": "error", "data": json.dumps({"error": str(e)})})
+    finally:
+        state.is_running = False
+
+
+# ─── Propagation SSE endpoint ─────────────────────────────────────────────────
+
+@app.get("/api/projects/{pid}/videos/{vid}/propagate")
+async def propagate_video(pid: str, vid: str, start_frame: int = 0):
+    """
+    Stream propagation results as Server-Sent Events.
+
+    Propagation runs as a background task so client reconnects join the
+    existing run rather than restarting it from scratch.
+    """
+    video = pm.get_video(pid, vid)
+    if video is None:
+        raise HTTPException(404, "Video not found")
+
+    state = _get_prop_state(pid, vid)
+    q = state.subscribe()
+
+    if not state.is_running:
+        session_id = sam.get_session_id(pid, vid)
+        if session_id is None:
+            state.unsubscribe(q)
+            raise HTTPException(400, "No active SAM session. Initialize session and add prompts first.")
+
+        num_frames = video["num_frames"]
+        source_path = video.get("source_path", "")
+        masks_dir = pm.masks_dir(pid, vid)
+        bboxes_dir = pm.bboxes_dir(pid, vid)
+        objects = video["objects"]
+        is_sam3 = sam.model_name() == "sam3"
+
+        all_prompts = pm.get_all_point_prompts(pid, vid)
+        first_ann_frame: int | None = None
+        for obj_id_str, frame_map in all_prompts.items():
+            for fidx_str in frame_map:
+                fidx = int(fidx_str)
+                if first_ann_frame is None or fidx < first_ann_frame:
+                    first_ann_frame = fidx
+        actual_start = min(start_frame, first_ann_frame) if first_ann_frame is not None else start_frame
+
+        batches: list[tuple[int, int]] = []
+        for s in range(actual_start, num_frames, STREAM_BATCH_SIZE):
+            batches.append((s, min(s + STREAM_BATCH_SIZE, num_frames)))
+
+        state.total_frames = num_frames
+        state.start_frame = actual_start
+        state.is_running = True
+        state.task = asyncio.create_task(
+            _run_propagation_bg(
+                pid, vid, actual_start, batches, all_prompts,
+                num_frames, source_path, masks_dir, bboxes_dir,
+                objects, is_sam3, state,
+            )
+        )
+    else:
+        # Propagation already running — send a catch_up event so the newly
+        # connected client knows where we are without waiting for the next frame.
+        video_fresh = pm.get_video(pid, vid)
+        propagated = video_fresh.get("propagated_frames", []) if video_fresh else []
+        await q.put({
+            "event": "catch_up",
+            "data": json.dumps({
+                "frames_done": len(propagated),
+                "total_frames": state.total_frames,
+                "last_frame": max(propagated) if propagated else -1,
+                "start_frame": state.start_frame,
+            }),
+        })
+
+    async def event_gen():
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(q.get(), timeout=30)
+                except asyncio.TimeoutError:
+                    yield {"event": "heartbeat", "data": "{}"}
+                    continue
+                yield event
+                if event.get("event") in ("done", "error"):
+                    break
+        except asyncio.CancelledError:
+            pass
+        finally:
+            state.unsubscribe(q)
+
+    return EventSourceResponse(event_gen())
+
+
+@app.get("/api/projects/{pid}/videos/{vid}/propagate/status")
+def get_propagation_status(pid: str, vid: str):
+    """Return current propagation progress for a video."""
+    video = pm.get_video(pid, vid)
+    if video is None:
+        raise HTTPException(404, "Video not found")
+    state = _get_prop_state(pid, vid)
+    propagated = video.get("propagated_frames", [])
+    return {
+        "is_running": state.is_running,
+        "frames_done": len(propagated),
+        "total_frames": video["num_frames"],
+        "propagation_complete": video.get("propagation_complete", False),
+        "last_frame": max(propagated) if propagated else -1,
+        "start_frame": state.start_frame if state.is_running else 0,
+    }

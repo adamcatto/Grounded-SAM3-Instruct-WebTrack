@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react'
 import { Info } from 'lucide-react'
 import { useStore, currentVideo as selectCurrentVideo } from '../../store/useStore'
-import { videoSourceUrl } from '../../api/client'
+import { videoSourceUrl, frameUrl } from '../../api/client'
 import AnnotationCanvas from './AnnotationCanvas'
 
 /**
@@ -127,6 +127,23 @@ export default function FrameViewer() {
     )
   }, [])
 
+  // ── Arrow key frame navigation ────────────────────────────────────────────
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
+      e.preventDefault()
+      const delta = e.key === 'ArrowRight' ? 1 : -1
+      const minFrame = store.propagationStartFrame
+      const maxFrame = (video?.num_frames ?? 1) - 1
+      const next = Math.max(minFrame, Math.min(maxFrame, currentFrame + delta))
+      setCurrentFrame(next)
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [currentFrame, video, setCurrentFrame, store.propagationStartFrame])
+
   // ── Helpers ───────────────────────────────────────────────────────────────
 
   function fmt(frame: number, fps: number) {
@@ -167,7 +184,7 @@ export default function FrameViewer() {
             flexShrink: 0,
           }}
         >
-          {/* Layer 1: HTML5 video (always visible) */}
+          {/* Layer 1: HTML5 video (visible during playback; hidden when paused) */}
           <video
             ref={videoRef}
             style={{
@@ -175,6 +192,7 @@ export default function FrameViewer() {
               width: '100%', height: '100%',
               objectFit: 'contain',
               userSelect: 'none', pointerEvents: 'none',
+              display: isPlaying ? 'block' : 'none',
             }}
             muted
             playsInline
@@ -186,6 +204,21 @@ export default function FrameViewer() {
           >
             <source src={videoSrc} type="video/mp4" />
           </video>
+
+          {/* Layer 1b: JPEG frame (shown when paused — instant vs. video seek latency) */}
+          {!isPlaying && pid && vid && (
+            <img
+              src={frameUrl(pid, vid, currentFrame)}
+              style={{
+                position: 'absolute', top: 0, left: 0,
+                width: '100%', height: '100%',
+                objectFit: 'contain',
+                userSelect: 'none', pointerEvents: 'none',
+              }}
+              draggable={false}
+              alt=""
+            />
+          )}
 
           {/* Layer 2: Annotation canvas */}
           <AnnotationCanvas width={dimensions.width} height={dimensions.height} videoRef={videoRef} />

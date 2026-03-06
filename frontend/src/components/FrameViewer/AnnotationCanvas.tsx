@@ -1,7 +1,7 @@
-import React, { useCallback, useEffect, useRef } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useStore, currentVideo as selectCurrentVideo } from '../../store/useStore'
 import { extractFrame, addPoints, getSavedMask } from '../../api/client'
-import { drawMasks, drawPoints } from '../../utils/maskUtils'
+import { drawMasks, drawPoints, loadMaskImage } from '../../utils/maskUtils'
 
 interface Props {
   width: number
@@ -24,8 +24,40 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
     config,
   } = store
 
+  const [hoverLabel, setHoverLabel] = useState<string | null>(null)
+  const [hoverPos, setHoverPos] = useState<{ x: number; y: number } | null>(null)
+  const maskPixelDataRef = useRef<Map<string, ImageData>>(new Map())
+
   const pid = project?.id ?? ''
   const vid = currentVideoId ?? ''
+
+  // ── Derive masks to show ──────────────────────────────────────────────────
+
+  const masksToShow = useMemo(() => {
+    if (currentFrameMasksFrame === currentFrame && Object.keys(currentFrameMasks).length > 0) {
+      return currentFrameMasks
+    }
+    return savedMaskCache[currentFrame] ?? {}
+  }, [currentFrame, currentFrameMasks, currentFrameMasksFrame, savedMaskCache])
+
+  // ── Cache per-mask ImageData for hover hit-testing ────────────────────────
+
+  useEffect(() => {
+    if (width === 0 || height === 0) return
+    const cache = maskPixelDataRef.current
+    cache.clear()
+    for (const [objId, b64] of Object.entries(masksToShow)) {
+      loadMaskImage(b64).then(img => {
+        const c = document.createElement('canvas')
+        c.width = width
+        c.height = height
+        const ctx2 = c.getContext('2d')
+        if (!ctx2) return
+        ctx2.drawImage(img, 0, 0, width, height)
+        cache.set(objId, ctx2.getImageData(0, 0, width, height))
+      })
+    }
+  }, [masksToShow, width, height])
 
   // ── Render loop: draw masks + points onto canvas ──────────────────────────
 
@@ -39,17 +71,7 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
     canvas.height = height
     ctx.clearRect(0, 0, width, height)
 
-    // Determine which masks to show.
-    // Live annotation masks (from a recent SAM inference click) always take
-    // priority over saved propagation masks — the user just re-annotated the
-    // frame and the new result should be immediately visible.
-    let masksToShow: typeof currentFrameMasks = {}
-    if (currentFrameMasksFrame === currentFrame && Object.keys(currentFrameMasks).length > 0) {
-      masksToShow = currentFrameMasks
-    } else {
-      const saved = savedMaskCache[currentFrame]
-      if (saved) masksToShow = saved
-    }
+    const masksToDraw = config.showMasks ? masksToShow : {}
 
     // Collect points for current frame
     const allPoints: { x: number; y: number; label: 0 | 1 }[] = []
@@ -66,27 +88,55 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
     // The stale flag prevents a superseded async draw from clobbering a newer
     // render that already ran its cleanup.
     let stale = false
-    const masksToDraw = config.showMasks ? masksToShow : {}
     drawMasks(ctx, masksToDraw, width, height, config.maskOpacity).then(() => {
       if (stale) return
       drawPoints(ctx, allPoints, width, height, config.pointSize)
     })
     return () => { stale = true }
-  }, [width, height, currentFrameMasks, currentFrameMasksFrame, localAnnotations, currentFrame, savedMaskCache, config.showMasks, config.maskOpacity, config.pointSize])
+  }, [width, height, masksToShow, localAnnotations, currentFrame, config.showMasks, config.maskOpacity, config.pointSize])
 
   // ── Load saved masks when frame changes ───────────────────────────────────
+  // Debounced: when holding arrow keys, only fetch for the frame the user
+  // pauses on, not every intermediate frame (which would flood the backend).
 
   useEffect(() => {
-    if (!savedMaskCache[currentFrame]) {
-      getSavedMask(pid, vid, currentFrame)
+    if (savedMaskCache[currentFrame]) return  // already in memory
+
+    const frame = currentFrame
+    const timer = setTimeout(() => {
+      getSavedMask(pid, vid, frame)
         .then(data => {
           if (data.masks && Object.keys(data.masks).length > 0) {
-            setSavedMask(currentFrame, data.masks)
+            setSavedMask(frame, data.masks)
           }
         })
         .catch(() => { /* no mask for this frame yet */ })
-    }
+    }, 80)
+
+    return () => clearTimeout(timer)
   }, [currentFrame, propagationStatus])
+
+  // ── Hover: show mask label tooltip ───────────────────────────────────────
+
+  const handleMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const rect = canvas.getBoundingClientRect()
+    const px = Math.floor((e.clientX - rect.left) * (width / rect.width))
+    const py = Math.floor((e.clientY - rect.top) * (height / rect.height))
+    if (px < 0 || py < 0 || px >= width || py >= height) {
+      setHoverLabel(null); setHoverPos(null); return
+    }
+    for (const [objId, imageData] of maskPixelDataRef.current) {
+      const alpha = imageData.data[(py * width + px) * 4 + 3]
+      if (alpha > 30) {
+        setHoverLabel(video?.objects[objId]?.name ?? objId)
+        setHoverPos({ x: e.clientX - rect.left, y: e.clientY - rect.top })
+        return
+      }
+    }
+    setHoverLabel(null); setHoverPos(null)
+  }, [video, width, height])
 
   // ── Click to add point ────────────────────────────────────────────────────
 
@@ -152,20 +202,38 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
   const cursor = pointMode ? 'crosshair' : 'default'
 
   return (
-    <canvas
-      ref={canvasRef}
-      width={width}
-      height={height}
-      onClick={handleClick}
-      style={{
-        position: 'absolute',
-        top: 0,
-        left: 0,
-        width: '100%',
-        height: '100%',
-        cursor,
-        display: 'block',
-      }}
-    />
+    <>
+      <canvas
+        ref={canvasRef}
+        width={width}
+        height={height}
+        onClick={handleClick}
+        onMouseMove={handleMouseMove}
+        onMouseLeave={() => { setHoverLabel(null); setHoverPos(null) }}
+        style={{
+          position: 'absolute',
+          top: 0,
+          left: 0,
+          width: '100%',
+          height: '100%',
+          cursor,
+          display: 'block',
+        }}
+      />
+      {hoverLabel && hoverPos && (
+        <div
+          style={{
+            position: 'absolute',
+            left: hoverPos.x + 14,
+            top: hoverPos.y - 28,
+            pointerEvents: 'none',
+            zIndex: 10,
+          }}
+          className="bg-black/80 text-white text-xs px-2 py-1 rounded whitespace-nowrap"
+        >
+          {hoverLabel}
+        </div>
+      )}
+    </>
   )
 }
