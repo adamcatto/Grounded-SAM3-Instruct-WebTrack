@@ -95,7 +95,9 @@ export default function FrameViewer() {
 
   const onTimeUpdate = useCallback(() => {
     const el = videoRef.current
-    if (!el) return
+    // Only let the video drive currentFrame during actual playback.
+    // While paused (including during seeks), onSeeked handles the update.
+    if (!el || el.paused) return
     const frame = Math.floor(el.currentTime * fpsRef.current)
     videoIsDriving.current = true
     setCurrentFrame(frame)
@@ -184,7 +186,11 @@ export default function FrameViewer() {
             flexShrink: 0,
           }}
         >
-          {/* Layer 1: HTML5 video (visible during playback; hidden when paused) */}
+          {/* Layer 1: HTML5 video — always visible so it acts as an instant
+              placeholder while the JPEG frame (layer 1b) loads from the backend.
+              During playback it IS the primary display. When paused, the JPEG
+              overlays it once it arrives; until then the video shows the last
+              seeked frame without any network round-trip. */}
           <video
             ref={videoRef}
             style={{
@@ -192,7 +198,6 @@ export default function FrameViewer() {
               width: '100%', height: '100%',
               objectFit: 'contain',
               userSelect: 'none', pointerEvents: 'none',
-              display: isPlaying ? 'block' : 'none',
             }}
             muted
             playsInline

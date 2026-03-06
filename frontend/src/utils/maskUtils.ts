@@ -1,22 +1,46 @@
 /**
  * Utilities for rendering base64 mask PNGs onto a canvas.
+ *
+ * Uses ImageBitmap (instead of HTMLImageElement) so that evicted entries can
+ * be explicitly freed with .close(), releasing GPU/CPU memory immediately.
+ * The cache is bounded to MAX_IMAGE_CACHE entries (FIFO eviction).
  */
 
-const imageCache = new Map<string, HTMLImageElement>()
+const MAX_IMAGE_CACHE = 100  // decoded bitmaps; each full-res RGBA mask is ~8 MB
+const imageCache = new Map<string, ImageBitmap>()
 
-export function loadMaskImage(b64: string): Promise<HTMLImageElement> {
-  if (imageCache.has(b64)) {
-    return Promise.resolve(imageCache.get(b64)!)
-  }
-  return new Promise((resolve, reject) => {
-    const img = new Image()
-    img.onload = () => {
-      imageCache.set(b64, img)
-      resolve(img)
+function b64ToBlob(b64: string): Blob {
+  const binary = atob(b64)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return new Blob([bytes], { type: 'image/png' })
+}
+
+export async function loadMaskBitmap(b64: string): Promise<ImageBitmap> {
+  const cached = imageCache.get(b64)
+  if (cached) return cached
+
+  const bitmap = await createImageBitmap(b64ToBlob(b64))
+
+  // Evict the oldest entry when at capacity (Map preserves insertion order)
+  if (imageCache.size >= MAX_IMAGE_CACHE) {
+    const oldestKey = imageCache.keys().next().value
+    if (oldestKey !== undefined) {
+      imageCache.get(oldestKey)?.close()
+      imageCache.delete(oldestKey)
     }
-    img.onerror = reject
-    img.src = `data:image/png;base64,${b64}`
-  })
+  }
+
+  imageCache.set(b64, bitmap)
+  return bitmap
+}
+
+/** Explicitly close and remove specific bitmaps by their b64 keys. */
+export function evictMaskImages(b64s: string[]) {
+  for (const b64 of b64s) {
+    imageCache.get(b64)?.close()
+    imageCache.delete(b64)
+  }
 }
 
 export async function drawMasks(
@@ -30,8 +54,8 @@ export async function drawMasks(
   ctx.globalAlpha = Math.max(0, Math.min(1, opacity))
   for (const [, b64] of Object.entries(masks)) {
     try {
-      const img = await loadMaskImage(b64)
-      ctx.drawImage(img, 0, 0, width, height)
+      const bitmap = await loadMaskBitmap(b64)
+      ctx.drawImage(bitmap, 0, 0, width, height)
     } catch (e) {
       console.warn('Failed to draw mask:', e)
     }
@@ -95,5 +119,6 @@ export function drawPoints(
 }
 
 export function clearMaskCache() {
+  for (const bitmap of imageCache.values()) bitmap.close()
   imageCache.clear()
 }

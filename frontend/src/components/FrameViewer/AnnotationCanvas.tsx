@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useStore, currentVideo as selectCurrentVideo } from '../../store/useStore'
 import { extractFrame, addPoints, getSavedMask } from '../../api/client'
-import { drawMasks, drawPoints, loadMaskImage } from '../../utils/maskUtils'
+import { drawMasks, drawPoints, loadMaskBitmap } from '../../utils/maskUtils'
 
 interface Props {
   width: number
@@ -47,13 +47,13 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
     const cache = maskPixelDataRef.current
     cache.clear()
     for (const [objId, b64] of Object.entries(masksToShow)) {
-      loadMaskImage(b64).then(img => {
+      loadMaskBitmap(b64).then(bitmap => {
         const c = document.createElement('canvas')
         c.width = width
         c.height = height
         const ctx2 = c.getContext('2d')
         if (!ctx2) return
-        ctx2.drawImage(img, 0, 0, width, height)
+        ctx2.drawImage(bitmap, 0, 0, width, height)
         cache.set(objId, ctx2.getImageData(0, 0, width, height))
       })
     }
@@ -96,8 +96,10 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
   }, [width, height, masksToShow, localAnnotations, currentFrame, config.showMasks, config.maskOpacity, config.pointSize])
 
   // ── Load saved masks when frame changes ───────────────────────────────────
-  // Debounced: when holding arrow keys, only fetch for the frame the user
-  // pauses on, not every intermediate frame (which would flood the backend).
+  // No debounce: start the fetch on the very next event loop tick.
+  // The effect cleanup cancels the pending fetch for superseded frames,
+  // so rapid arrow-key navigation only fires a request for each frame
+  // the user briefly settles on (not every intermediate frame).
 
   useEffect(() => {
     if (savedMaskCache[currentFrame]) return  // already in memory
@@ -111,7 +113,7 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
           }
         })
         .catch(() => { /* no mask for this frame yet */ })
-    }, 80)
+    }, 0)
 
     return () => clearTimeout(timer)
   }, [currentFrame, propagationStatus])

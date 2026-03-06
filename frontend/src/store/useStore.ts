@@ -1,5 +1,15 @@
 import { create } from 'zustand'
 import type { Project, VideoMeta, ObjectDef, MaskData } from '../types'
+import { evictMaskImages } from '../utils/maskUtils'
+
+// Max number of frames to keep in the in-memory mask cache.
+// Each frame holds N base64-encoded PNGs (~50 KB each compressed).
+// The corresponding decoded ImageBitmaps are bounded separately in maskUtils.
+const MAX_SAVED_MASK_FRAMES = 200
+
+// Insertion-order tracking for FIFO eviction of savedMaskCache.
+// Module-level (not in Zustand state) since it's purely an implementation detail.
+let _savedMaskCacheOrder: number[] = []
 
 export type PointMode = 'add' | 'remove' | null
 export type PropagationStatus = 'idle' | 'running' | 'done' | 'error'
@@ -166,6 +176,7 @@ export const useStore = create<AppState>((set, get) => ({
         }
       }
 
+      _savedMaskCacheOrder = []
       set({
         currentVideoId: vid,
         currentFrame: 0,
@@ -213,7 +224,26 @@ export const useStore = create<AppState>((set, get) => ({
 
   setSavedMask: (fidx, masks) => {
     const { savedMaskCache } = get()
-    set({ savedMaskCache: { ...savedMaskCache, [fidx]: masks } })
+
+    // Remove fidx from order tracking if already present (re-insert at end)
+    _savedMaskCacheOrder = _savedMaskCacheOrder.filter(f => f !== fidx)
+    _savedMaskCacheOrder.push(fidx)
+
+    const newCache = { ...savedMaskCache, [fidx]: masks }
+
+    // Evict oldest frames when over the limit
+    const b64sToEvict: string[] = []
+    while (_savedMaskCacheOrder.length > MAX_SAVED_MASK_FRAMES) {
+      const oldest = _savedMaskCacheOrder.shift()!
+      const oldMasks = newCache[oldest]
+      if (oldMasks) {
+        b64sToEvict.push(...Object.values(oldMasks))
+        delete newCache[oldest]
+      }
+    }
+    if (b64sToEvict.length > 0) evictMaskImages(b64sToEvict)
+
+    set({ savedMaskCache: newCache })
   },
 
   setPendingInferenceFrame: f => set({ pendingInferenceFrame: f }),
@@ -279,20 +309,23 @@ export const useStore = create<AppState>((set, get) => ({
     })
   },
 
-  resetVideoState: () => set({
-    currentFrame: 0,
-    currentObjectId: null,
-    pointMode: null,
-    localAnnotations: {},
-    currentFrameMasks: {},
-    currentFrameMasksFrame: null,
-    savedMaskCache: {},
-    pendingInferenceFrame: null,
-    isPlaying: false,
-    propagationStatus: 'idle',
-    propagationProgress: 0,
-    sessionInitialized: false,
-  }),
+  resetVideoState: () => {
+    _savedMaskCacheOrder = []
+    set({
+      currentFrame: 0,
+      currentObjectId: null,
+      pointMode: null,
+      localAnnotations: {},
+      currentFrameMasks: {},
+      currentFrameMasksFrame: null,
+      savedMaskCache: {},
+      pendingInferenceFrame: null,
+      isPlaying: false,
+      propagationStatus: 'idle',
+      propagationProgress: 0,
+      sessionInitialized: false,
+    })
+  },
 }))
 
 // Derived selectors
