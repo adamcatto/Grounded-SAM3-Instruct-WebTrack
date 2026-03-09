@@ -622,6 +622,122 @@ class IdentityTracker:
             logger.info(f"No identity swap detected for pair {pair} post-occlusion")
         return window.identity_map
 
+    def _com_translated_fallback(
+        self,
+        frame_idx: int,
+        sam_masks: dict[int, np.ndarray],
+        display: dict[int, np.ndarray],
+        tracking: dict[int, np.ndarray],
+        rejections: dict[int, str],
+        frame_shape: tuple[int, int],
+    ) -> None:
+        """
+        Phase 1.5: For similar nearby pairs where a mask has a drastic area change
+        (< 0.5× or > 2× vs previous frame), translate both previous-frame masks
+        toward the combined center-of-mass of the current SAM predictions.
+
+        This catches the case where SAM collapses two nearby objects into a single
+        merged blob (or drops one to zero) without an explicit occlusion window open.
+        Modifies display/tracking/rejections in-place.
+        """
+        H, W = frame_shape
+        AREA_LOW = 0.5
+        AREA_HIGH = 2.0
+        PROXIMITY = 0.30  # normalized centroid distance in prev frame
+
+        for (a, b), sim in self.text_similarity.items():
+            if a >= b:
+                continue
+            if sim < self.text_similarity_threshold:
+                continue
+            # Skip pairs already in an active ghost propagation window
+            key = (min(a, b), max(a, b))
+            if key in self.occlusion_windows and self.occlusion_windows[key].end_frame == -1:
+                continue
+
+            prev_a = self._prev_masks.get(a)
+            prev_b = self._prev_masks.get(b)
+            if prev_a is None or prev_b is None:
+                continue
+            stats_pa = compute_mask_stats(prev_a)
+            stats_pb = compute_mask_stats(prev_b)
+            if stats_pa is None or stats_pb is None:
+                continue
+
+            # Check proximity in previous frame
+            dx = stats_pa.centroid[0] - stats_pb.centroid[0]
+            dy = stats_pa.centroid[1] - stats_pb.centroid[1]
+            if float(np.sqrt(dx * dx + dy * dy)) > PROXIMITY:
+                continue
+
+            # Check area ratios for both objects (using current display masks)
+            def _area(m: Optional[np.ndarray]) -> float:
+                return float(m.astype(bool).sum()) if m is not None else 0.0
+
+            prev_area_a = _area(prev_a)
+            prev_area_b = _area(prev_b)
+            curr_area_a = _area(display.get(a))
+            curr_area_b = _area(display.get(b))
+
+            ratio_a = curr_area_a / prev_area_a if prev_area_a > 0 else float("inf")
+            ratio_b = curr_area_b / prev_area_b if prev_area_b > 0 else float("inf")
+            bad_a = ratio_a < AREA_LOW or ratio_a > AREA_HIGH or curr_area_a == 0
+            bad_b = ratio_b < AREA_LOW or ratio_b > AREA_HIGH or curr_area_b == 0
+            if not (bad_a or bad_b):
+                continue
+
+            # Combined CoM in previous frame (area-weighted)
+            total_prev = prev_area_a + prev_area_b
+            if total_prev == 0:
+                continue
+            prev_com_x = (stats_pa.centroid[0] * prev_area_a + stats_pb.centroid[0] * prev_area_b) / total_prev
+            prev_com_y = (stats_pa.centroid[1] * prev_area_a + stats_pb.centroid[1] * prev_area_b) / total_prev
+
+            # Combined CoM in current frame — from raw SAM output (non-empty masks)
+            sam_a = sam_masks.get(a)
+            sam_b = sam_masks.get(b)
+            s_a = compute_mask_stats(sam_a) if sam_a is not None else None
+            s_b = compute_mask_stats(sam_b) if sam_b is not None else None
+
+            curr_wts: list[float] = []
+            curr_cxs: list[float] = []
+            curr_cys: list[float] = []
+            if s_a is not None:
+                w = _area(sam_a)
+                if w > 0:
+                    curr_wts.append(w); curr_cxs.append(s_a.centroid[0]); curr_cys.append(s_a.centroid[1])
+            if s_b is not None:
+                w = _area(sam_b)
+                if w > 0:
+                    curr_wts.append(w); curr_cxs.append(s_b.centroid[0]); curr_cys.append(s_b.centroid[1])
+            if not curr_wts:
+                continue  # Both SAM outputs empty — can't determine direction
+
+            total_curr = sum(curr_wts)
+            curr_com_x = sum(wt * cx for wt, cx in zip(curr_wts, curr_cxs)) / total_curr
+            curr_com_y = sum(wt * cy for wt, cy in zip(curr_wts, curr_cys)) / total_curr
+
+            # Translation vector
+            shift_x = int(round((curr_com_x - prev_com_x) * W))
+            shift_y = int(round((curr_com_y - prev_com_y) * H))
+
+            logger.info(
+                f"Frame {frame_idx}: pair ({a},{b}) CoM-translated "
+                f"shift=({shift_x}px,{shift_y}px), bad_a={bad_a}, bad_b={bad_b}"
+            )
+
+            for obj_id, prev_m in ((a, prev_a), (b, prev_b)):
+                translated = np.zeros((H, W), dtype=np.uint8)
+                ys, xs = np.where(prev_m.astype(bool))
+                dst_xs = xs + shift_x
+                dst_ys = ys + shift_y
+                valid = (dst_xs >= 0) & (dst_xs < W) & (dst_ys >= 0) & (dst_ys < H)
+                translated[dst_ys[valid], dst_xs[valid]] = 1
+                display[obj_id] = translated
+                tracking[obj_id] = translated
+                existing = rejections.get(obj_id, "")
+                rejections[obj_id] = (existing + "|com_translated").lstrip("|")
+
     def get_retroactive_corrections(
         self, pair: tuple[int, int]
     ) -> list[tuple[int, dict[int, np.ndarray]]]:
@@ -875,6 +991,17 @@ class IdentityTracker:
                 self._consecutive_rejects[oid] = 0
                 continue
 
+            # Empty mask: always fall back — never force-accept a zero-area mask.
+            # These don't count toward consecutive_rejects so they don't
+            # eventually trigger the force-accept escape hatch.
+            if not new_mask.astype(bool).any():
+                if prev_mask is not None:
+                    display[oid] = prev_mask.copy()
+                    tracking[oid] = prev_mask.copy()
+                    rejections[oid] = "empty_mask"
+                    logger.debug(f"Frame {frame_idx}, obj {oid}: empty mask, using prev")
+                continue
+
             is_valid, reason, _ = self.validate_temporal_consistency(oid, new_mask, prev_mask)
 
             if is_valid:
@@ -906,6 +1033,14 @@ class IdentityTracker:
                     )
                     display[oid] = new_mask
                     tracking[oid] = new_mask
+
+        # ── Phase 1.5: CoM-translation fallback for drastic area changes ─────
+        # Runs before Phase 2 so that the corrected masks feed into overlap
+        # detection. Skipped for pairs already in an active ghost window.
+        if not force_accept and frame_shape is not None and len(self.text_similarity) > 0:
+            self._com_translated_fallback(
+                frame_idx, sam_masks, display, tracking, rejections, frame_shape
+            )
 
         # ── Phase 2: overlap-confusion validation ─────────────────────────────
         # Only run when there are at least 2 similar objects tracked.

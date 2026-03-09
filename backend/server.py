@@ -80,7 +80,8 @@ class PropagationState:
         self.task: asyncio.Task | None = None
         self.subscribers: list[asyncio.Queue] = []
         self.total_frames: int = 0
-        self.start_frame: int = 0
+        self.start_frame: int = 0       # actual_start (earliest annotated frame)
+        self.user_start_frame: int = 0  # user's requested start frame (for progress display)
 
     async def publish(self, event: dict) -> None:
         dead = []
@@ -2016,6 +2017,7 @@ async def _run_propagation_bg(
     is_sam3: bool,
     state: PropagationState,
     seed_frame: int = -1,
+    user_start_frame: int = 0,
 ) -> None:
     """
     Run propagation as a true background task, publishing SSE events to all
@@ -2028,7 +2030,9 @@ async def _run_propagation_bg(
         loop = asyncio.get_event_loop()
         total_propagated = 0
         sam3_annotated_frame: int | None = None
-        frames_to_process = num_frames - actual_start
+        # frames_to_process is relative to the user's requested start (not the
+        # internal actual_start which may be earlier due to annotation frames).
+        frames_to_process = num_frames - user_start_frame
 
         # ── Emit init event so clients know the true total frames ─────────
         yield {
@@ -2717,6 +2721,7 @@ async def propagate_video(pid: str, vid: str, start_frame: int = 0, resume_from:
 
         state.total_frames = num_frames
         state.start_frame = actual_start
+        state.user_start_frame = start_frame
         state.is_running = True
         state.is_paused = False
         state.task = asyncio.create_task(
@@ -2725,6 +2730,7 @@ async def propagate_video(pid: str, vid: str, start_frame: int = 0, resume_from:
                 num_frames, source_path, masks_dir, bboxes_dir,
                 objects, is_sam3, state,
                 seed_frame=seed_frame,
+                user_start_frame=start_frame,
             )
         )
     else:
@@ -2738,7 +2744,10 @@ async def propagate_video(pid: str, vid: str, start_frame: int = 0, resume_from:
                 "frames_done": len(propagated),
                 "total_frames": state.total_frames,
                 "last_frame": max(propagated) if propagated else -1,
-                "start_frame": state.start_frame,
+                # Use user_start_frame (not actual_start) so the client shows
+                # the correct remaining-frames count relative to the user's
+                # selected start, not the internal SAM annotation start.
+                "start_frame": state.user_start_frame,
             }),
         })
 
