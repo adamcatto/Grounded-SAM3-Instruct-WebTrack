@@ -9,8 +9,8 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-SAM3_CHECKPOINT = Path("/opt/software/SAM3WebTrack/pretrained_models/sam3.pt")
-SAM2_CHECKPOINT = Path("/opt/software/SAM3WebTrack/pretrained_models/sam2.1_hiera_large.pt")
+SAM3_CHECKPOINT = Path("/opt/software/Grounded-SAM3-Instruct-WebTrack/pretrained_models/sam3.pt")
+SAM2_CHECKPOINT = Path("/opt/software/Grounded-SAM3-Instruct-WebTrack/pretrained_models/sam2.1_hiera_large.pt")
 SAM2_CONFIG = "sam2.1_hiera_l"  # sam2 config name for the large model
 
 # Lazy-loaded predictor singleton
@@ -220,12 +220,18 @@ class SAMPredictor:
         vid: str,
         frame_idx: int,
         obj_id: int,
-        points: list,   # [[x_norm, y_norm], ...]
-        labels: list,   # [1, 0, ...]
+        points: list,         # [[x_norm, y_norm], ...]
+        labels: list,         # [1, 0, ...]
+        text: Optional[str] = None,  # IGNORED - kept for API compatibility
     ) -> dict:
         """
         Add/update point prompts for an object on a frame.
         Returns a unified dict: {frame_idx: {out_obj_ids, out_binary_masks, out_boxes_xywh, out_probs}}
+        
+        Note: SAM3's tracker mode does NOT support text prompts with points.
+        Text descriptions are stored separately and used for:
+        - Text-only segmentation (via add_text_prompt)
+        - Identity tracking during propagation
         """
         session_id = self.get_session_id(pid, vid)
         if session_id is None:
@@ -270,21 +276,87 @@ class SAMPredictor:
             state = predictor._ALL_INFERENCE_STATES[session_id]["state"]
             if sam_frame_idx not in state["cached_frame_outputs"]:
                 state["cached_frame_outputs"][sam_frame_idx] = {}
-            # SAM3 uses the "add_prompt" request type with points in relative coords
+            
+            # SAM3 API constraint: points-based tracker prompts CANNOT include text.
+            # Text prompts are for semantic/detection mode (text + boxes), not tracker mode.
+            # When user provides text description, we store it for use during propagation
+            # (where it helps with new detections), but we do NOT pass it to add_points.
+            # The text description is stored in project config and used for identity tracking.
+            
             points_tensor = torch.tensor(points, dtype=torch.float32)
             labels_tensor = torch.tensor(labels, dtype=torch.int32)
+            base = {
+                "type": "add_prompt",
+                "session_id": session_id,
+                "frame_index": sam_frame_idx,
+                "obj_id": obj_id,
+            }
             with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-                resp = predictor.handle_request({
-                    "type": "add_prompt",
-                    "session_id": session_id,
-                    "frame_index": sam_frame_idx,
-                    "obj_id": obj_id,
-                    "points": points_tensor,
-                    "point_labels": labels_tensor,
-                })
+                # Points-only request (text not allowed with points in SAM3 tracker mode)
+                req = {**base, "points": points_tensor, "point_labels": labels_tensor}
+                resp = predictor.handle_request(req)
             # resp = {"frame_index": sam_frame_idx, "outputs": {out_obj_ids, out_binary_masks, ...}}
             outputs = resp.get("outputs", {})
             return {frame_idx: outputs}  # key by real frame_idx for callers
+
+    def add_text_prompt(
+        self,
+        pid: str,
+        vid: str,
+        frame_idx: int,
+        obj_id: int,
+        text: str,
+    ) -> dict:
+        """
+        Add a text-only prompt for semantic segmentation (SAM3 only).
+        
+        SAM3's text prompts work differently from point prompts:
+        - Text prompts use semantic detection mode (finds all instances matching the text)
+        - They can optionally include a bounding box to narrow the search area
+        - Returns detected masks for the text query
+        
+        Note: Semantic mode calls reset_state internally, so this should be called
+        BEFORE any tracker point prompts if you want to combine them.
+        
+        For SAM2, this is a no-op (SAM2 doesn't support text prompts).
+        """
+        if _model_name == "sam2" or not text:
+            return {frame_idx: {"out_obj_ids": [], "out_binary_masks": []}}
+        
+        session_id = self.get_session_id(pid, vid)
+        if session_id is None:
+            raise ValueError(f"No active session for {pid}/{vid}.")
+        
+        import torch
+        predictor = _get_predictor()
+        sam_frame_idx = self._to_sam_idx(pid, vid, frame_idx)
+        state = predictor._ALL_INFERENCE_STATES[session_id]["state"]
+        if sam_frame_idx not in state["cached_frame_outputs"]:
+            state["cached_frame_outputs"][sam_frame_idx] = {}
+        
+        # SAM3 text prompts use semantic mode
+        # Can use text-only (no box required based on the assertion "at least one of text, boxes")
+        # But a full-frame box can help constrain the search
+        # Box format for handle_request: [x, y, width, height] in normalized coords (0-1)
+        full_frame_box = [[0.0, 0.0, 1.0, 1.0]]  # Use list format for handle_request
+        box_labels = [1]  # positive box
+        
+        req = {
+            "type": "add_prompt",
+            "session_id": session_id,
+            "frame_index": sam_frame_idx,
+            "text": text,
+            "bounding_boxes": full_frame_box,  # Fixed: use correct parameter name
+            "bounding_box_labels": box_labels,
+        }
+        
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+            logger.info(f"add_text_prompt: frame {frame_idx} (sam_idx={sam_frame_idx}) text={text!r}")
+            resp = predictor.handle_request(req)
+        
+        outputs = resp.get("outputs", {})
+        logger.info(f"add_text_prompt result: {list(outputs.keys()) if outputs else 'empty'}")
+        return {frame_idx: outputs}
 
     def add_mask_prompt(
         self,
@@ -293,8 +365,12 @@ class SAMPredictor:
         frame_idx: int,
         obj_id: int,
         mask: object,  # numpy array (H, W)
+        text: Optional[str] = None,  # unused (kept for API compatibility)
     ) -> dict:
-        """Add a mask as a prompt (used for chunk handoff)."""
+        """Add a mask as a prompt (used for chunk handoff).
+        
+        Note: text parameter is ignored - SAM3 tracker mode doesn't support text with points.
+        """
         session_id = self.get_session_id(pid, vid)
         if session_id is None:
             raise ValueError(f"No active session for {pid}/{vid}.")
@@ -357,15 +433,17 @@ class SAMPredictor:
                 state["cached_frame_outputs"][sam_frame_idx] = {}
             points_tensor = torch.tensor(sample_points, dtype=torch.float32)
             labels_tensor = torch.tensor([1] * len(sample_points), dtype=torch.int32)
+            base = {
+                "type": "add_prompt",
+                "session_id": session_id,
+                "frame_index": sam_frame_idx,
+                "obj_id": obj_id,
+            }
+            # SAM3 tracker mode: points-only (text not allowed)
             with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-                resp = predictor.handle_request({
-                    "type": "add_prompt",
-                    "session_id": session_id,
-                    "frame_index": sam_frame_idx,
-                    "obj_id": obj_id,
-                    "points": points_tensor,
-                    "point_labels": labels_tensor,
-                })
+                resp = predictor.handle_request(
+                    {**base, "points": points_tensor, "point_labels": labels_tensor}
+                )
             outputs = resp.get("outputs", {})
             return {frame_idx: outputs}  # key by real frame_idx for callers
 

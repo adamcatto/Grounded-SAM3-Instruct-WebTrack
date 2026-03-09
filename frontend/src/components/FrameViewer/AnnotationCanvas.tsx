@@ -20,9 +20,11 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
     localAnnotations, addLocalPoint,
     currentFrameMasks, currentFrameMasksFrame, setCurrentFrameMasks,
     savedMaskCache, setSavedMask,
-    propagationStatus,
-    config,
+    propagationStatus, propagationStartFrame,
+    config, uncertaintyData,
   } = store
+
+  const confusionScore = uncertaintyData?.per_frame?.[String(currentFrame)]?.confusion_score ?? 0
 
   const [hoverLabel, setHoverLabel] = useState<string | null>(null)
   const [hoverPos, setHoverPos] = useState<{ x: number; y: number } | null>(null)
@@ -35,9 +37,12 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
 
   const masksToShow = useMemo(() => {
     if (currentFrameMasksFrame === currentFrame && Object.keys(currentFrameMasks).length > 0) {
+      console.log(`[MasksToShow] Frame ${currentFrame}: using live masks`, Object.keys(currentFrameMasks))
       return currentFrameMasks
     }
-    return savedMaskCache[currentFrame] ?? {}
+    const saved = savedMaskCache[currentFrame] ?? {}
+    console.log(`[MasksToShow] Frame ${currentFrame}: using saved masks`, Object.keys(saved))
+    return saved
   }, [currentFrame, currentFrameMasks, currentFrameMasksFrame, savedMaskCache])
 
   // ── Cache per-mask ImageData for hover hit-testing ────────────────────────
@@ -58,6 +63,17 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
       })
     }
   }, [masksToShow, width, height])
+
+  // Build object name lookup for mask labels
+  const objectNames = useMemo(() => {
+    const names: Record<string, string> = {}
+    if (video?.objects) {
+      for (const [objId, obj] of Object.entries(video.objects)) {
+        names[objId] = obj.name || objId
+      }
+    }
+    return names
+  }, [video?.objects])
 
   // ── Render loop: draw masks + points onto canvas ──────────────────────────
 
@@ -88,12 +104,12 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
     // The stale flag prevents a superseded async draw from clobbering a newer
     // render that already ran its cleanup.
     let stale = false
-    drawMasks(ctx, masksToDraw, width, height, config.maskOpacity).then(() => {
+    drawMasks(ctx, masksToDraw, width, height, config.maskOpacity, objectNames, config.showMasks).then(() => {
       if (stale) return
       drawPoints(ctx, allPoints, width, height, config.pointSize)
     })
     return () => { stale = true }
-  }, [width, height, masksToShow, localAnnotations, currentFrame, config.showMasks, config.maskOpacity, config.pointSize])
+  }, [width, height, masksToShow, localAnnotations, currentFrame, config.showMasks, config.maskOpacity, config.pointSize, objectNames])
 
   // ── Load saved masks when frame changes ───────────────────────────────────
   // No debounce: start the fetch on the very next event loop tick.
@@ -102,21 +118,29 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
   // the user briefly settles on (not every intermediate frame).
 
   useEffect(() => {
-    if (savedMaskCache[currentFrame]) return  // already in memory
+    console.log(`[MaskLoad] Frame ${currentFrame}: checking cache...`, { inCache: !!savedMaskCache[currentFrame], pid, vid })
+    if (savedMaskCache[currentFrame]) {
+      console.log(`[MaskLoad] Frame ${currentFrame}: already cached`)
+      return  // already in memory
+    }
 
     const frame = currentFrame
     const timer = setTimeout(() => {
+      console.log(`[MaskLoad] Frame ${frame}: fetching from API...`)
       getSavedMask(pid, vid, frame)
         .then(data => {
+          console.log(`[MaskLoad] Frame ${frame}: got response`, { maskCount: Object.keys(data.masks || {}).length })
           if (data.masks && Object.keys(data.masks).length > 0) {
             setSavedMask(frame, data.masks)
           }
         })
-        .catch(() => { /* no mask for this frame yet */ })
+        .catch((err) => { 
+          console.log(`[MaskLoad] Frame ${frame}: no mask or error`, err)
+        })
     }, 0)
 
     return () => clearTimeout(timer)
-  }, [currentFrame, propagationStatus])
+  }, [currentFrame, propagationStatus, pid, vid])
 
   // ── Hover: show mask label tooltip ───────────────────────────────────────
 
@@ -148,19 +172,11 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
     const canvas = canvasRef.current
     if (!canvas) return
 
-    // Compute the true frame number from the video element's actual currentTime
-    // at the moment of click, to avoid drift between store.currentFrame and what
-    // the user sees on screen.
-    const videoEl = videoRef.current
-    const fps = video.fps || 30
-    const trueFrame = videoEl
-      ? Math.floor(videoEl.currentTime * fps)
-      : currentFrame
-
-    // Sync the store so the HUD and mask rendering use the same frame
-    if (trueFrame !== currentFrame) {
-      setCurrentFrame(trueFrame)
-    }
+    // IMPORTANT: When adding point prompts, NEVER change the current frame.
+    // Always use the store's currentFrame - that's what the user selected
+    // and what they expect the point to be placed on.
+    // The frame should never go below propagationStartFrame.
+    const frameToUse = currentFrame
 
     const rect = canvas.getBoundingClientRect()
     const scaleX = width / rect.width
@@ -171,37 +187,57 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
     const ny = py / height
     const label: 0 | 1 = pointMode === 'add' ? 1 : 0
 
-    // Add to local state (use trueFrame so points line up)
-    addLocalPoint(currentObjectId, trueFrame, nx, ny, label)
+    // Add to local state
+    addLocalPoint(currentObjectId, frameToUse, nx, ny, label)
 
     // Get all accumulated points for this object on this frame
-    const framePts = useStore.getState().localAnnotations[currentObjectId]?.[String(trueFrame)]
+    const framePts = useStore.getState().localAnnotations[currentObjectId]?.[String(frameToUse)]
     const allPoints: [number, number][] = framePts ? framePts.points.map(p => [p.x, p.y]) : [[nx, ny]]
     const allLabels = framePts ? framePts.points.map(p => p.label as number) : [label]
 
     try {
       // Extract this single frame on the backend (into annotated_frames/)
       // so the SAM session can be initialized with just this frame.
-      await extractFrame(pid, vid, trueFrame)
+      await extractFrame(pid, vid, frameToUse)
 
-      const result = await addPoints(pid, vid, currentObjectId, trueFrame, allPoints, allLabels)
+      const result = await addPoints(pid, vid, currentObjectId, frameToUse, allPoints, allLabels)
       if (result.masks) {
         // Read latest state after async call — only merge masks from the same frame
         const state = useStore.getState()
-        const prevLive = state.currentFrameMasksFrame === trueFrame ? state.currentFrameMasks : {}
+        const prevLive = state.currentFrameMasksFrame === frameToUse ? state.currentFrameMasks : {}
         const newLive = { ...prevLive, ...result.masks }
-        setCurrentFrameMasks(newLive, trueFrame)
+        setCurrentFrameMasks(newLive, frameToUse)
         // Keep savedMaskCache in sync: merge new masks over the existing saved
         // ones so that scrubbing away and back shows the updated result.
-        const existingSaved = state.savedMaskCache[trueFrame] ?? {}
-        setSavedMask(trueFrame, { ...existingSaved, ...result.masks })
+        const existingSaved = state.savedMaskCache[frameToUse] ?? {}
+        setSavedMask(frameToUse, { ...existingSaved, ...result.masks })
+        
+        // If new instance objects were created (multi-instance detection), merge them into state
+        if (result.new_objects && result.new_objects.length > 0) {
+          const currentObjs = state.project?.videos[vid]?.objects ?? {}
+          const updatedObjs = { ...currentObjs }
+          for (const newObj of result.new_objects) {
+            updatedObjs[newObj.id] = newObj
+          }
+          useStore.getState().updateVideo({ objects: updatedObjs })
+        }
+        
+        // If uncertainty was updated during annotation, merge it into store
+        if (result.uncertainty_update) {
+          useStore.getState().setUncertaintyData(result.uncertainty_update)
+        }
       }
     } catch (err) {
       console.error('Failed to add point:', err)
     }
-  }, [pointMode, currentObjectId, video, currentFrame, width, height, pid, vid, addLocalPoint, setCurrentFrameMasks, setCurrentFrame, videoRef])
+  }, [pointMode, currentObjectId, video, currentFrame, width, height, pid, vid, addLocalPoint, setCurrentFrameMasks, propagationStartFrame])
 
   const cursor = pointMode ? 'crosshair' : 'default'
+
+  const uncertaintyBorderColor =
+    confusionScore >= 0.7 ? 'rgba(239,68,68,0.8)' :
+    confusionScore >= 0.4 ? 'rgba(245,158,11,0.7)' :
+    null
 
   return (
     <>
@@ -220,8 +256,28 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
           height: '100%',
           cursor,
           display: 'block',
+          boxSizing: 'border-box',
+          ...(uncertaintyBorderColor ? { boxShadow: `inset 0 0 0 3px ${uncertaintyBorderColor}` } : {}),
         }}
       />
+      {uncertaintyBorderColor && (
+        <div
+          style={{
+            position: 'absolute',
+            top: 8,
+            right: 8,
+            pointerEvents: 'none',
+            zIndex: 10,
+            color: confusionScore >= 0.7 ? '#ef4444' : '#f59e0b',
+            background: 'rgba(0,0,0,0.7)',
+            borderRadius: '0.375rem',
+            padding: '2px 8px',
+            fontSize: '11px',
+          }}
+        >
+          Identity uncertainty detected
+        </div>
+      )}
       {hoverLabel && hoverPos && (
         <div
           style={{

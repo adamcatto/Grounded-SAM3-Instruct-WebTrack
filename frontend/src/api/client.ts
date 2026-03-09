@@ -1,5 +1,5 @@
 import axios from 'axios'
-import type { Project, VideoMeta, ObjectDef, MaskData } from '../types'
+import type { Project, VideoMeta, ObjectDef, MaskData, UncertaintyData, CorrectionRecord } from '../types'
 
 const api = axios.create({ baseURL: '/api' })
 
@@ -58,14 +58,24 @@ export const getVideoInfo = (pid: string, vid: string) =>
     `/projects/${pid}/videos/${vid}/info`
   ).then(r => r.data)
 
+export const updateVideoMeta = (pid: string, vid: string, updates: { start_frame?: number }) =>
+  api.patch(`/projects/${pid}/videos/${vid}`, updates).then(r => r.data)
+
 export const removeVideo = (pid: string, vid: string) =>
   api.delete(`/projects/${pid}/videos/${vid}`)
 
 export const resetVideo = (pid: string, vid: string) =>
   api.post(`/projects/${pid}/videos/${vid}/reset`).then(r => r.data)
 
+export const clearFramePrompts = (pid: string, vid: string, frameIdx: number) =>
+  api.delete(`/projects/${pid}/videos/${vid}/frames/${frameIdx}/prompts`).then(r => r.data)
+
 export const frameUrl = (pid: string, vid: string, fidx: number) =>
   `/api/projects/${pid}/videos/${vid}/frames/${fidx}`
+
+
+// Alias for timeline thumbnails (same endpoint as frameUrl)
+export const thumbUrl = frameUrl
 
 // Video needs HTTP Range request support for seeking.  Vite's dev proxy
 // re-chunks streaming responses and can break 206 Partial Content replies,
@@ -113,8 +123,30 @@ export const getSessionState = (pid: string, vid: string) =>
 
 // ─── Objects ──────────────────────────────────────────────────────────────────
 
-export const addObject = (pid: string, vid: string, name: string, color?: string) =>
-  api.post<ObjectDef>(`/projects/${pid}/videos/${vid}/objects`, { name, color }).then(r => r.data)
+export const addObject = (
+  pid: string,
+  vid: string,
+  name: string,
+  color?: string,
+  description?: string,
+  minInstances?: number,
+  maxInstances?: number,
+) =>
+  api.post<ObjectDef>(`/projects/${pid}/videos/${vid}/objects`, {
+    name,
+    color,
+    description: description ?? '',
+    min_instances: minInstances ?? 1,
+    max_instances: maxInstances ?? 1,
+  }).then(r => r.data)
+
+export const updateObject = (
+  pid: string,
+  vid: string,
+  oid: string,
+  updates: { name?: string; color?: string; description?: string; min_instances?: number; max_instances?: number }
+) =>
+  api.patch(`/projects/${pid}/videos/${vid}/objects/${oid}`, updates).then(r => r.data)
 
 export const renameObject = (pid: string, vid: string, oid: string, name: string) =>
   api.patch(`/projects/${pid}/videos/${vid}/objects/${oid}`, { name })
@@ -122,7 +154,30 @@ export const renameObject = (pid: string, vid: string, oid: string, name: string
 export const removeObject = (pid: string, vid: string, oid: string) =>
   api.delete(`/projects/${pid}/videos/${vid}/objects/${oid}`)
 
+export const addInstance = (pid: string, vid: string, oid: string) =>
+  api.post<{ sam_obj_id: number; ui_obj_id: string }>(
+    `/projects/${pid}/videos/${vid}/objects/${oid}/instances`
+  ).then(r => r.data)
+
+export const getInstanceGroups = (pid: string, vid: string) =>
+  api.get<Record<string, number[]>>(`/projects/${pid}/videos/${vid}/instance_groups`).then(r => r.data)
+
 // ─── Points / Masks ──────────────────────────────────────────────────────────
+
+export interface AddPointsResponse {
+  frame_idx: number
+  masks: MaskData
+  new_objects?: Array<{
+    id: string
+    name: string
+    color: string
+    description?: string
+    min_instances?: number
+    max_instances?: number
+    _parent_obj?: string
+  }>
+  uncertainty_update?: UncertaintyData  // Updated uncertainty data from annotation
+}
 
 export const addPoints = (
   pid: string,
@@ -130,11 +185,12 @@ export const addPoints = (
   oid: string,
   frameIdx: number,
   points: [number, number][],
-  labels: number[]
+  labels: number[],
+  text?: string,
 ) =>
-  api.post<{ frame_idx: number; masks: MaskData }>(
+  api.post<AddPointsResponse>(
     `/projects/${pid}/videos/${vid}/objects/${oid}/points`,
-    { frame_idx: frameIdx, points, labels }
+    { frame_idx: frameIdx, points, labels, text }
   ).then(r => r.data)
 
 export const clearObjectPoints = (pid: string, vid: string, oid: string) =>
@@ -143,7 +199,9 @@ export const clearObjectPoints = (pid: string, vid: string, oid: string) =>
 // ─── Saved Masks ─────────────────────────────────────────────────────────────
 
 export const getSavedMask = (pid: string, vid: string, fidx: number) =>
-  api.get<{ frame_idx: number; masks: MaskData }>(`/projects/${pid}/videos/${vid}/masks/${fidx}`).then(r => r.data)
+  api.get<{ frame_idx: number; masks: MaskData }>(`/projects/${pid}/videos/${vid}/masks/${fidx}`, {
+    headers: { 'Cache-Control': 'no-cache' }
+  }).then(r => r.data)
 
 // ─── Single-frame prediction ──────────────────────────────────────────────────
 
@@ -169,6 +227,8 @@ export const saveFrameInference = (pid: string, vid: string, frameIdx: number) =
 
 export interface PropagationStatusResponse {
   is_running: boolean
+  is_paused: boolean
+  paused_at_frame: number
   frames_done: number
   total_frames: number
   propagation_complete: boolean
@@ -179,11 +239,130 @@ export interface PropagationStatusResponse {
 export const getPropagationStatus = (pid: string, vid: string) =>
   api.get<PropagationStatusResponse>(`/projects/${pid}/videos/${vid}/propagate/status`).then(r => r.data)
 
+export const pausePropagation = (pid: string, vid: string) =>
+  api.post<{ status: string; paused_at_frame: number }>(
+    `/projects/${pid}/videos/${vid}/propagate/pause`
+  ).then(r => r.data)
+
+// ─── Tracking Params ──────────────────────────────────────────────────────────
+
+export interface TrackingParams {
+  min_iou_threshold: number
+  max_area_ratio: number
+  max_centroid_jump: number
+  consecutive_reject_limit: number
+}
+
+export const getTrackingParams = (pid: string, vid: string) =>
+  api.get<TrackingParams>(`/projects/${pid}/videos/${vid}/tracking_params`).then(r => r.data)
+
+export const updateTrackingParams = (pid: string, vid: string, params: Partial<TrackingParams>) =>
+  api.patch<TrackingParams>(`/projects/${pid}/videos/${vid}/tracking_params`, params).then(r => r.data)
+
+// ─── Resume from Frame ────────────────────────────────────────────────────────
+
+export interface ResumeFromFrameRequest {
+  resume_frame: number
+  clear_from_frame?: boolean
+}
+
+export interface ResumeFromFrameResponse {
+  status: string
+  resume_frame: number
+  deleted_files: number
+  kept_propagated_frames: number
+}
+
+export const resumeFromFrame = (pid: string, vid: string, resumeFrame: number, clearFromFrame = true) =>
+  api.post<ResumeFromFrameResponse>(
+    `/projects/${pid}/videos/${vid}/propagate/resume`,
+    { resume_frame: resumeFrame, clear_from_frame: clearFromFrame }
+  ).then(r => r.data)
+
+export type SwapMode = 'this_frame' | 'all_future'
+
+export interface SwapMasksResponse {
+  frame_idx: number
+  masks: MaskData
+  swapped_frames: number
+  swap_mode: SwapMode
+}
+
+export const swapMasks = (
+  pid: string,
+  vid: string,
+  fidx: number,
+  objIdA: string,
+  objIdB: string,
+  swapMode: SwapMode = 'this_frame'
+) =>
+  api.post<SwapMasksResponse>(
+    `/projects/${pid}/videos/${vid}/masks/${fidx}/swap`,
+    { obj_id_a: objIdA, obj_id_b: objIdB, swap_mode: swapMode }
+  ).then(r => r.data)
+
+// SSE stream for swapping all future frames (bypasses Vite proxy to avoid timeouts)
+export const startSwapAllSSE = (
+  pid: string,
+  vid: string,
+  fidx: number,
+  objIdA: string,
+  objIdB: string
+) => {
+  const params = new URLSearchParams({ obj_id_a: objIdA, obj_id_b: objIdB })
+  return new EventSource(`${BACKEND}/api/projects/${pid}/videos/${vid}/masks/${fidx}/swap_stream?${params}`)
+}
+
 // SSE also benefits from bypassing Vite's proxy to avoid buffering/re-chunking
-export const startPropagationSSE = (pid: string, vid: string, startFrame = 0) =>
-  new EventSource(`${BACKEND}/api/projects/${pid}/videos/${vid}/propagate?start_frame=${startFrame}`)
+export const startPropagationSSE = (pid: string, vid: string, startFrame = 0, resumeFrom = -1) => {
+  const params = new URLSearchParams({ start_frame: String(startFrame) })
+  if (resumeFrom >= 0) params.set('resume_from', String(resumeFrom))
+  return new EventSource(`${BACKEND}/api/projects/${pid}/videos/${vid}/propagate?${params}`)
+}
 
 // ─── Export SSE ───────────────────────────────────────────────────────────────
 
 export const startExportSSE = (pid: string, vid: string) =>
   new EventSource(`${BACKEND}/api/projects/${pid}/videos/${vid}/export`)
+
+// ─── Uncertainty ──────────────────────────────────────────────────────────────
+
+export const getUncertainty = (pid: string, vid: string) =>
+  api.get<UncertaintyData>(`/projects/${pid}/videos/${vid}/uncertainty`).then(r => r.data)
+
+export interface UncertaintyFrameDetail {
+  frame_idx: number
+  frame_image: string | null  // base64 JPEG
+  masks: MaskData
+  confusion_score: number
+  per_object: Record<string, { anomaly_score?: number; overlap_ratio?: number; confidence?: number }>
+}
+
+export const getUncertaintyFrameDetail = (pid: string, vid: string, fidx: number) =>
+  api.get<UncertaintyFrameDetail>(`/projects/${pid}/videos/${vid}/uncertainty/frames/${fidx}`).then(r => r.data)
+
+// ─── Raw masks (pre-correction) ───────────────────────────────────────────────
+
+export const getRawMasks = (pid: string, vid: string, fidx: number) =>
+  api.get<{ frame_idx: number; masks: MaskData }>(`/projects/${pid}/videos/${vid}/masks/${fidx}/raw`).then(r => r.data)
+
+// ─── Identity Corrections ─────────────────────────────────────────────────────
+
+export const getCorrections = (pid: string, vid: string) =>
+  api.get<CorrectionRecord[]>(`/projects/${pid}/videos/${vid}/corrections`).then(r => r.data)
+
+export const applyCorrection = (
+  pid: string,
+  vid: string,
+  correctionId: string,
+  method: 'swap' | 'repropagate' = 'swap'
+) =>
+  api.post<{ status: string; method: string; affected_frames: number }>(
+    `/projects/${pid}/videos/${vid}/corrections/${correctionId}/apply`,
+    { method }
+  ).then(r => r.data)
+
+export const rejectCorrection = (pid: string, vid: string, correctionId: string) =>
+  api.post<{ status: string }>(
+    `/projects/${pid}/videos/${vid}/corrections/${correctionId}/reject`
+  ).then(r => r.data)

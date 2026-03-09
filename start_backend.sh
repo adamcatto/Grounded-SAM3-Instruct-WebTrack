@@ -7,5 +7,6 @@ export LD_LIBRARY_PATH="/home/adam/miniconda3/envs/sam2_app/lib:${LD_LIBRARY_PAT
 # Kill any stale process on port 8000
 fuser -k 8000/tcp >/dev/null 2>&1; sleep 0.3
 
-cd /opt/software/SAM3WebTrack/backend
-uvicorn server:app --host 0.0.0.0 --port 8000
+cd /opt/software/Grounded-SAM3-Instruct-WebTrack/backend
+uvicorn server:app --host 0.0.0.0 --port 8000 --reload
+    

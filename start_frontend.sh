@@ -11,7 +11,7 @@ echo "Using $(node --version)"
 # Kill any stale process on port 5173
 fuser -k 5173/tcp >/dev/null 2>&1; sleep 0.3
 
-cd /opt/software/SAM3WebTrack/frontend
+cd /opt/software/Grounded-SAM3-Instruct-WebTrack/frontend
 npm install
 # Run vite directly with the explicit node binary
 node node_modules/.bin/vite --host 0.0.0.0

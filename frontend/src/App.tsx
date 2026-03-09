@@ -2,7 +2,7 @@ import React, { useEffect, useState, useCallback } from 'react'
 import { useStore, currentVideo as selectCurrentVideo } from './store/useStore'
 import type { ViewerTab } from './store/useStore'
 import { listProjects } from './api/client'
-import { Crosshair, PlayCircle, BrainCircuit, Settings2 } from 'lucide-react'
+import { Crosshair, PlayCircle, BrainCircuit, Settings2, Activity, GitMerge } from 'lucide-react'
 import Header from './components/Header'
 import ProjectDrawer from './components/ProjectDrawer'
 import UploadModal from './components/UploadModal'
@@ -11,17 +11,20 @@ import FrameViewer from './components/FrameViewer/FrameViewer'
 import VideoPlayer from './components/VideoPlayer/VideoPlayer'
 import InferenceStatePanel from './components/InferenceStatePanel'
 import ConfigPanel from './components/ConfigPanel'
+import UncertaintyPanel from './components/UncertaintyPanel'
+import TrackCorrectionPanel from './components/TrackCorrectionPanel'
 import Timeline from './components/Timeline/Timeline'
 import LoadingScreen from './components/LoadingScreen'
 import ResizeHandle from './components/ResizeHandle'
 import ToastContainer from './components/ToastContainer'
 import { useResizable } from './hooks/useResizable'
 
-function TabButton({ active, icon, label, onClick }: {
+function TabButton({ active, icon, label, onClick, badge }: {
   active: boolean
   icon: React.ReactNode
   label: string
   onClick: () => void
+  badge?: number
 }) {
   return (
     <button
@@ -34,6 +37,11 @@ function TabButton({ active, icon, label, onClick }: {
     >
       {icon}
       {label}
+      {badge != null && badge > 0 && (
+        <span className="ml-0.5 bg-amber-500 text-black text-[9px] font-bold rounded-full w-4 h-4 flex items-center justify-center">
+          {badge}
+        </span>
+      )}
     </button>
   )
 }
@@ -44,8 +52,10 @@ export default function App() {
   const {
     project, currentVideoId, viewerTab,
     setProject, setCurrentVideo, setUploadModalOpen, setDrawerOpen, setViewerTab,
-    configDirty, revertConfig,
+    configDirty, revertConfig, corrections,
   } = store
+
+  const pendingCorrections = corrections.filter(c => c.status === 'pending').length
 
   // Guard tab switches away from Settings when there are unsaved changes.
   const handleSetViewerTab = useCallback((tab: ViewerTab) => {
@@ -137,6 +147,19 @@ export default function App() {
                   label="Inference State"
                   onClick={() => handleSetViewerTab('inference')}
                 />
+                <TabButton
+                  active={viewerTab === 'uncertainty'}
+                  icon={<Activity size={14} />}
+                  label="Uncertainty"
+                  onClick={() => handleSetViewerTab('uncertainty')}
+                />
+                <TabButton
+                  active={viewerTab === 'corrections'}
+                  icon={<GitMerge size={14} />}
+                  label="Corrections"
+                  onClick={() => handleSetViewerTab('corrections')}
+                  badge={pendingCorrections}
+                />
               </>
             )}
             <div className="flex-1" />
@@ -152,6 +175,8 @@ export default function App() {
           {viewerTab === 'annotate' && <FrameViewer />}
           {viewerTab === 'player' && <VideoPlayer />}
           {viewerTab === 'inference' && <InferenceStatePanel />}
+          {viewerTab === 'uncertainty' && <UncertaintyPanel />}
+          {viewerTab === 'corrections' && <TrackCorrectionPanel />}
           {viewerTab === 'config' && <ConfigPanel />}
 
           {/* Horizontal resize handle between viewer and timeline */}

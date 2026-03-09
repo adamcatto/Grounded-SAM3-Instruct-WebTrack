@@ -136,7 +136,7 @@ export default function FrameViewer() {
       if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
       e.preventDefault()
-      const delta = e.key === 'ArrowRight' ? 1 : -1
+      const delta = e.key === 'ArrowRight' ? store.frameJump : -store.frameJump
       const minFrame = store.propagationStartFrame
       const maxFrame = (video?.num_frames ?? 1) - 1
       const next = Math.max(minFrame, Math.min(maxFrame, currentFrame + delta))

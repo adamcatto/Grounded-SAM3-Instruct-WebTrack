@@ -11,9 +11,10 @@ interface TrackCanvasProps {
   propagatedFrames: number[]
   total: number
   startFrame: number
+  confusionScores: Record<string, { confusion_score: number }>
 }
 
-function TrackCanvas({ color, propagatedFrames, total, startFrame }: TrackCanvasProps) {
+function TrackCanvas({ color, propagatedFrames, total, startFrame, confusionScores }: TrackCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const rangeLen = total - 1 - startFrame
 
@@ -24,17 +25,19 @@ function TrackCanvas({ color, propagatedFrames, total, startFrame }: TrackCanvas
     if (!ctx) return
     ctx.clearRect(0, 0, CANVAS_W, CANVAS_H)
     if (rangeLen <= 0) return
-    ctx.fillStyle = color
     ctx.globalAlpha = 0.8
     for (const f of propagatedFrames) {
       if (f < startFrame) continue
       const x = Math.round(((f - startFrame) / rangeLen) * CANVAS_W)
+      const score = confusionScores[String(f)]?.confusion_score ?? 0
+      if (score >= 0.7) ctx.fillStyle = '#ef4444'
+      else if (score >= 0.4) ctx.fillStyle = '#f59e0b'
+      else ctx.fillStyle = color
       ctx.fillRect(x, 0, 2, CANVAS_H)
     }
     ctx.globalAlpha = 1
-  // propagatedFrames identity changes only when propagation advances
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [color, propagatedFrames, rangeLen])
+  }, [color, propagatedFrames, rangeLen, confusionScores])
 
   return (
     <canvas
@@ -49,13 +52,15 @@ function TrackCanvas({ color, propagatedFrames, total, startFrame }: TrackCanvas
 export default function ObjectTrackRow() {
   const store = useStore()
   const video = selectCurrentVideo(store)
-  const { currentFrame, setCurrentFrame, propagationStartFrame } = store
+  const { currentFrame, setCurrentFrame, propagationStartFrame, uncertaintyData } = store
 
   const propagatedFrames = useMemo(
     () => video?.propagated_frames ?? [],
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [video?.propagated_frames]
   )
+
+  const confusionScores = uncertaintyData?.per_frame ?? {}
 
   if (!video || Object.keys(video.objects).length === 0) return null
 
@@ -83,6 +88,7 @@ export default function ObjectTrackRow() {
               propagatedFrames={propagatedFrames}
               total={total}
               startFrame={startFrame}
+              confusionScores={confusionScores}
             />
 
             {/* Current frame indicator */}

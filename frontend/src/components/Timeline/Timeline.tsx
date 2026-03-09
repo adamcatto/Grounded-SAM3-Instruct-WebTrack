@@ -46,7 +46,8 @@ export default function Timeline() {
     currentFrame, setCurrentFrame,
     isPlaying, setPlaying,
     propagationStatus, savedMaskCache, setSavedMask,
-    propagationStartFrame,
+    propagationStartFrame, uncertaintyData,
+    frameJump, setFrameJump,
   } = store
 
   const pid = project?.id ?? ''
@@ -118,6 +119,19 @@ export default function Timeline() {
             setCurrentFrame(Math.max(startFrame, Math.min(rangeEnd, Math.round(pct * rangeLen + startFrame))))
           }}
         >
+          {/* Confusion window overlays */}
+          {uncertaintyData?.confusion_windows?.map((win, i) => {
+            const left = rangeLen > 0 ? ((win.start - startFrame) / rangeLen) * 100 : 0
+            const width = rangeLen > 0 ? ((win.end - win.start) / rangeLen) * 100 : 0
+            const color = win.avg_score >= 0.7 ? 'rgba(239,68,68,0.45)' : 'rgba(245,158,11,0.35)'
+            return (
+              <div
+                key={i}
+                className="absolute top-0 h-full rounded pointer-events-none"
+                style={{ left: `${left}%`, width: `${Math.max(0.5, width)}%`, background: color }}
+              />
+            )
+          })}
           <div
             className="absolute top-0 left-0 h-full bg-white/60 rounded-full pointer-events-none"
             style={{ width: `${progress}%` }}
@@ -135,19 +149,34 @@ export default function Timeline() {
 
         {/* Frame skip buttons */}
         <button
-          onClick={() => setCurrentFrame(Math.max(startFrame, currentFrame - 1))}
+          onClick={() => setCurrentFrame(Math.max(startFrame, currentFrame - frameJump))}
           className="btn btn-ghost p-1"
-          title="Previous frame"
+          title={`Previous ${frameJump} frame${frameJump !== 1 ? 's' : ''}`}
         >
           <SkipBack size={13} />
         </button>
         <button
-          onClick={() => setCurrentFrame(Math.min(total - 1, currentFrame + 1))}
+          onClick={() => setCurrentFrame(Math.min(total - 1, currentFrame + frameJump))}
           className="btn btn-ghost p-1"
-          title="Next frame"
+          title={`Next ${frameJump} frame${frameJump !== 1 ? 's' : ''}`}
         >
           <SkipForward size={13} />
         </button>
+
+        {/* Jump amount input */}
+        <div className="flex items-center gap-1" title="Frame jump amount (arrow keys / skip buttons)">
+          <span className="text-[10px] text-[#444]">×</span>
+          <input
+            type="number"
+            min={1}
+            max={9999}
+            value={frameJump}
+            onChange={e => { const n = parseInt(e.target.value, 10); if (!isNaN(n) && n >= 1) setFrameJump(n) }}
+            onFocus={e => e.target.select()}
+            className="w-10 bg-[#1a1a1a] border border-[#2a2a2a] rounded px-1 py-0.5 text-[10px] font-mono text-[#888] text-center focus:outline-none focus:border-[#444]"
+            style={{ MozAppearance: 'textfield' } as React.CSSProperties}
+          />
+        </div>
 
         {/* Jump to frame */}
         <JumpToFrame

@@ -243,7 +243,7 @@ def extract_frame_range(
             break
         cv2.imwrite(str(out_file), frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
         extracted += 1
-        if progress_callback and extracted % 200 == 0:
+        if progress_callback and extracted % 10 == 0:
             progress_callback(extracted, end - start)
 
     cap.release()

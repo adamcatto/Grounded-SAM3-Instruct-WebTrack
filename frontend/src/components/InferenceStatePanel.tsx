@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { RefreshCw, AlertCircle, CheckCircle2, XCircle, ChevronRight } from 'lucide-react'
+import { RefreshCw, AlertCircle, CheckCircle2, XCircle, ChevronRight, Trash2, Loader } from 'lucide-react'
 import { useStore, currentVideo as selectCurrentVideo } from '../store/useStore'
-import { getSessionState, getSavedMask, frameUrl } from '../api/client'
+import { getSessionState, getSavedMask, frameUrl, clearFramePrompts } from '../api/client'
 import type { SessionState } from '../api/client'
 
 // ─── Collapsible section ──────────────────────────────────────────────────────
@@ -302,6 +302,7 @@ function LabeledFrameCard({
   fps,
   pid,
   vid,
+  onRemove,
 }: {
   frameIdx: number
   objPrompts: Record<string, { points: [number, number][]; labels: number[] }>
@@ -311,6 +312,7 @@ function LabeledFrameCard({
   fps: number
   pid: string
   vid: string
+  onRemove: (frameIdx: number) => void
 }) {
   const canvasH = videoWidth > 0 ? Math.round(CANVAS_W * videoHeight / videoWidth) : 360
 
@@ -319,6 +321,18 @@ function LabeledFrameCard({
   const [showPoints, setShowPoints] = useState(true)
   const [tooltip, setTooltip] = useState<TooltipState | null>(null)
   const [renderTick, setRenderTick] = useState(0)
+  const [removing, setRemoving] = useState(false)
+
+  async function handleRemove() {
+    if (!confirm(`Remove frame ${frameIdx} from inference state? This clears its point prompts.`)) return
+    setRemoving(true)
+    try {
+      await clearFramePrompts(pid, vid, frameIdx)
+      onRemove(frameIdx)
+    } catch {
+      setRemoving(false)
+    }
+  }
 
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const frameImgRef = useRef<HTMLImageElement | null>(null)
@@ -523,10 +537,18 @@ function LabeledFrameCard({
           )}
         </span>
         <div className="flex-1" />
-        <div className="flex gap-1">
+        <div className="flex gap-1 items-center">
           <ToggleBtn active={showImage} onClick={() => setShowImage(v => !v)} label="Image" />
           <ToggleBtn active={showMasks} onClick={() => setShowMasks(v => !v)} label="Masks" />
           <ToggleBtn active={showPoints} onClick={() => setShowPoints(v => !v)} label="Points" />
+          <button
+            onClick={handleRemove}
+            disabled={removing}
+            title="Remove from inference state"
+            className="ml-1 p-1 rounded text-[#555] hover:text-red-400 hover:bg-red-400/10 transition-colors disabled:opacity-40"
+          >
+            {removing ? <Loader size={11} className="animate-spin" /> : <Trash2 size={11} />}
+          </button>
         </div>
       </div>
 
@@ -600,13 +622,14 @@ function LabeledFrameCard({
 
 // ─── Labeled frames section ───────────────────────────────────────────────────
 
-function LabeledFramesSection({ state, videoWidth, videoHeight, fps, pid, vid }: {
+function LabeledFramesSection({ state, videoWidth, videoHeight, fps, pid, vid, onRefresh }: {
   state: SessionState
   videoWidth: number
   videoHeight: number
   fps: number
   pid: string
   vid: string
+  onRefresh: () => void
 }) {
   // Collect all frames that have at least one point prompt
   const frameToObjPrompts = useMemo(() => {
@@ -642,6 +665,7 @@ function LabeledFramesSection({ state, videoWidth, videoHeight, fps, pid, vid }:
           fps={fps}
           pid={pid}
           vid={vid}
+          onRemove={onRefresh}
         />
       ))}
     </div>
@@ -770,6 +794,7 @@ export default function InferenceStatePanel() {
               fps={video.fps}
               pid={pid}
               vid={vid}
+              onRefresh={load}
             />
           </Collapsible>
 

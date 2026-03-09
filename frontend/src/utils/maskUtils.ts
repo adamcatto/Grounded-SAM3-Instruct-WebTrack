@@ -49,18 +49,101 @@ export async function drawMasks(
   width: number,
   height: number,
   opacity = 1.0,
+  objectNames?: Record<string, string>,  // objId → object name (for labels)
+  showLabels = true,
 ): Promise<void> {
   const prev = ctx.globalAlpha
   ctx.globalAlpha = Math.max(0, Math.min(1, opacity))
-  for (const [, b64] of Object.entries(masks)) {
+  
+  // Store mask centers for label placement
+  const labelPositions: { objId: string; cx: number; cy: number }[] = []
+  
+  for (const [objId, b64] of Object.entries(masks)) {
     try {
       const bitmap = await loadMaskBitmap(b64)
       ctx.drawImage(bitmap, 0, 0, width, height)
+      
+      // Calculate mask center for label placement
+      if (showLabels && objectNames) {
+        // Create temp canvas to read mask pixels and find centroid
+        const tempCanvas = document.createElement('canvas')
+        tempCanvas.width = width
+        tempCanvas.height = height
+        const tempCtx = tempCanvas.getContext('2d')
+        if (tempCtx) {
+          tempCtx.drawImage(bitmap, 0, 0, width, height)
+          const imageData = tempCtx.getImageData(0, 0, width, height)
+          const data = imageData.data
+          
+          let sumX = 0, sumY = 0, count = 0
+          for (let y = 0; y < height; y++) {
+            for (let x = 0; x < width; x++) {
+              const alpha = data[(y * width + x) * 4 + 3]
+              if (alpha > 30) {
+                sumX += x
+                sumY += y
+                count++
+              }
+            }
+          }
+          
+          if (count > 0) {
+            labelPositions.push({
+              objId,
+              cx: sumX / count,
+              cy: sumY / count,
+            })
+          }
+        }
+      }
     } catch (e) {
       console.warn('Failed to draw mask:', e)
     }
   }
   ctx.globalAlpha = prev
+  
+  // Draw labels after all masks are drawn
+  if (showLabels && objectNames && labelPositions.length > 0) {
+    ctx.font = 'bold 12px Inter, system-ui, sans-serif'
+    ctx.textAlign = 'center'
+    ctx.textBaseline = 'middle'
+    
+    for (const { objId, cx, cy } of labelPositions) {
+      // First check if this exact objId has a name (e.g., "1_1" might have "mouse_1")
+      let label: string
+      if (objectNames[objId]) {
+        label = objectNames[objId]
+      } else if (objId.includes('_')) {
+        // Fallback: for "1_2", use base name + suffix
+        const baseName = objectNames[objId.split('_')[0]] || objId.split('_')[0]
+        label = baseName + '_' + objId.split('_')[1]
+      } else {
+        label = objectNames[objId] || objId
+      }
+      
+      // Measure text for background
+      const metrics = ctx.measureText(label)
+      const textWidth = metrics.width
+      const textHeight = 14
+      const padding = 4
+      
+      // Draw background pill
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.7)'
+      ctx.beginPath()
+      ctx.roundRect(
+        cx - textWidth / 2 - padding,
+        cy - textHeight / 2 - padding / 2,
+        textWidth + padding * 2,
+        textHeight + padding,
+        4
+      )
+      ctx.fill()
+      
+      // Draw text
+      ctx.fillStyle = '#ffffff'
+      ctx.fillText(label, cx, cy)
+    }
+  }
 }
 
 export function drawPoints(

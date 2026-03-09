@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { Project, VideoMeta, ObjectDef, MaskData } from '../types'
+import type { Project, VideoMeta, ObjectDef, MaskData, UncertaintyData, CorrectionRecord } from '../types'
 import { evictMaskImages } from '../utils/maskUtils'
 
 // Max number of frames to keep in the in-memory mask cache.
@@ -12,9 +12,9 @@ const MAX_SAVED_MASK_FRAMES = 200
 let _savedMaskCacheOrder: number[] = []
 
 export type PointMode = 'add' | 'remove' | null
-export type PropagationStatus = 'idle' | 'running' | 'done' | 'error'
+export type PropagationStatus = 'idle' | 'running' | 'paused' | 'done' | 'error'
 export type AppStep = 'upload' | 'annotate' | 'review'
-export type ViewerTab = 'annotate' | 'player' | 'inference' | 'config'
+export type ViewerTab = 'annotate' | 'player' | 'inference' | 'config' | 'uncertainty' | 'corrections'
 
 // ─── App config ───────────────────────────────────────────────────────────────
 
@@ -23,7 +23,7 @@ export interface AppConfig {
   showMasks: boolean
   maskOpacity: number   // 0–1
   pointSize: number     // scale factor relative to default (1.0)
-  startFrame: number    // persisted propagation start frame
+  correctionMethod: 'swap' | 'repropagate'  // default method for applying identity corrections
 }
 
 const CONFIG_KEY = 'sam3wt_config'
@@ -33,7 +33,7 @@ const CONFIG_DEFAULTS: AppConfig = {
   showMasks: true,
   maskOpacity: 0.85,
   pointSize: 1.0,
-  startFrame: 0,
+  correctionMethod: 'swap',
 }
 
 function loadConfig(): AppConfig {
@@ -85,18 +85,27 @@ interface AppState {
   propagationProgress: number
   propagationCurrentFrame: number
   propagationStartFrame: number
+  propagationPausedAtFrame: number
 
   // UI
   viewerTab: ViewerTab
   drawerOpen: boolean
   uploadModalOpen: boolean
   sessionInitialized: boolean
+  frameJump: number
+  setFrameJump: (n: number) => void
+
+  // Identity tracking
+  uncertaintyData: UncertaintyData | null
+  corrections: CorrectionRecord[]
+  setUncertaintyData: (data: UncertaintyData | null) => void
+  setCorrections: (records: CorrectionRecord[]) => void
 
   // Config
   config: AppConfig
   configDirty: boolean         // true when in-memory config differs from last localStorage save
   setConfig: (updates: Partial<AppConfig>) => void
-  persistConfig: () => void    // write current config + propagationStartFrame to localStorage
+  persistConfig: () => void    // write current config to localStorage
   revertConfig: () => void     // restore config + propagationStartFrame from localStorage
 
   // Toasts
@@ -118,6 +127,7 @@ interface AppState {
   setPlaying: (v: boolean) => void
   setPropagationStatus: (s: PropagationStatus) => void
   setPropagationProgress: (p: number, frame: number) => void
+  setPropagationPausedAtFrame: (f: number) => void
   setDrawerOpen: (v: boolean) => void
   setUploadModalOpen: (v: boolean) => void
   setViewerTab: (tab: ViewerTab) => void
@@ -144,15 +154,23 @@ export const useStore = create<AppState>((set, get) => ({
   propagationStatus: 'idle',
   propagationProgress: 0,
   propagationCurrentFrame: 0,
-  // Initialize from persisted config so it survives page refreshes
-  propagationStartFrame: _initialConfig.startFrame,
+  // Starts at 0; overwritten by setCurrentVideo using the per-video start_frame from config.json
+  propagationStartFrame: 0,
+  propagationPausedAtFrame: -1,
   drawerOpen: false,
   uploadModalOpen: false,
   viewerTab: 'annotate' as ViewerTab,
   sessionInitialized: false,
+  frameJump: 1,
+  setFrameJump: (n: number) => set({ frameJump: Math.max(1, Math.round(n)) }),
+  uncertaintyData: null,
+  corrections: [],
   config: _initialConfig,
   configDirty: false,
   toasts: [],
+
+  setUncertaintyData: data => set({ uncertaintyData: data }),
+  setCorrections: records => set({ corrections: records }),
 
   setProject: p => set({ project: p }),
 
@@ -177,9 +195,12 @@ export const useStore = create<AppState>((set, get) => ({
       }
 
       _savedMaskCacheOrder = []
+      // Use the per-video persisted start frame; fall back to 0
+      const startFrame = vidData?.start_frame ?? 0
       set({
         currentVideoId: vid,
-        currentFrame: 0,
+        currentFrame: startFrame,
+        propagationStartFrame: startFrame,
         currentObjectId: null,
         pointMode: null,
         localAnnotations,
@@ -190,11 +211,18 @@ export const useStore = create<AppState>((set, get) => ({
         propagationStatus: alreadyPropagated ? 'done' : 'idle',
         propagationProgress: alreadyPropagated ? 1 : 0,
         sessionInitialized: false,
+        uncertaintyData: null,
+        corrections: [],
       })
     }
   },
 
-  setCurrentFrame: f => set({ currentFrame: f }),
+  // IMPORTANT: Never allow currentFrame to go below propagationStartFrame
+  setCurrentFrame: f => {
+    const { propagationStartFrame } = get()
+    const clamped = Math.max(f, propagationStartFrame)
+    set({ currentFrame: clamped })
+  },
   setCurrentObject: oid => set({ currentObjectId: oid, pointMode: oid ? 'add' : null }),
   setPointMode: m => set({ pointMode: m }),
 
@@ -255,6 +283,8 @@ export const useStore = create<AppState>((set, get) => ({
   setPropagationProgress: (p, frame) =>
     set({ propagationProgress: p, propagationCurrentFrame: frame }),
 
+  setPropagationPausedAtFrame: f => set({ propagationPausedAtFrame: f }),
+
   setDrawerOpen: v => set({ drawerOpen: v }),
   setUploadModalOpen: v => set({ uploadModalOpen: v }),
   setViewerTab: tab => set({ viewerTab: tab }),
@@ -266,20 +296,17 @@ export const useStore = create<AppState>((set, get) => ({
     set({ config: next, configDirty: true })
   },
 
-  // persistConfig: capture current in-memory config + live propagationStartFrame,
-  // write to localStorage, and clear the dirty flag.
+  // persistConfig: write current in-memory config to localStorage, clear dirty flag.
   persistConfig: () => {
-    const { config, propagationStartFrame } = get()
-    const toSave: AppConfig = { ...config, startFrame: propagationStartFrame }
-    writeConfig(toSave)
-    set({ config: toSave, configDirty: false })
+    const { config } = get()
+    writeConfig(config)
+    set({ config, configDirty: false })
   },
 
-  // revertConfig: reload the last saved config from localStorage, restore
-  // propagationStartFrame to the saved startFrame, and clear dirty flag.
+  // revertConfig: reload the last saved config from localStorage, clear dirty flag.
   revertConfig: () => {
     const saved = loadConfig()
-    set({ config: saved, propagationStartFrame: saved.startFrame, configDirty: false })
+    set({ config: saved, configDirty: false })
   },
 
   addToast: (message, type = 'info') => {
@@ -289,8 +316,7 @@ export const useStore = create<AppState>((set, get) => ({
 
   removeToast: id => set(s => ({ toasts: s.toasts.filter(t => t.id !== id) })),
 
-  // Mark dirty so unsaved-changes guard fires if user tries to leave Settings.
-  setPropagationStartFrame: f => set({ propagationStartFrame: f, configDirty: true }),
+  setPropagationStartFrame: f => set({ propagationStartFrame: f }),
 
   updateVideo: updates => {
     const { project, currentVideoId } = get()
@@ -313,6 +339,7 @@ export const useStore = create<AppState>((set, get) => ({
     _savedMaskCacheOrder = []
     set({
       currentFrame: 0,
+      propagationStartFrame: 0,  // Reset start frame to 0 when starting over
       currentObjectId: null,
       pointMode: null,
       localAnnotations: {},
@@ -323,6 +350,7 @@ export const useStore = create<AppState>((set, get) => ({
       isPlaying: false,
       propagationStatus: 'idle',
       propagationProgress: 0,
+      propagationPausedAtFrame: -1,
       sessionInitialized: false,
     })
   },
