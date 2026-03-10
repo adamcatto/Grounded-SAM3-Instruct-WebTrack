@@ -9,12 +9,17 @@ export default defineConfig({
       '/api': {
         target: 'http://localhost:8000',
         changeOrigin: true,
-        // Allow large video file responses and range requests
+        // Required for SSE: disable response buffering so events stream through immediately
+        selfHandleResponse: false,
         configure: (proxy) => {
           proxy.on('proxyRes', (proxyRes) => {
             // Ensure Accept-Ranges header passes through for video seeking
             if (!proxyRes.headers['accept-ranges']) {
               proxyRes.headers['accept-ranges'] = 'bytes'
+            }
+            // Ensure SSE streams are not buffered by the proxy
+            if (proxyRes.headers['content-type']?.includes('text/event-stream')) {
+              proxyRes.headers['x-accel-buffering'] = 'no'
             }
           })
         },

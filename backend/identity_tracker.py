@@ -228,6 +228,13 @@ class IdentityTracker:
         "max_area_ratio": 5.0,
         "max_centroid_jump": 0.25,
         "consecutive_reject_limit": 5,
+        # Entry confirmation window: after an object has been absent for
+        # `entry_absence_threshold` consecutive frames, its next non-empty
+        # prediction is treated as a *candidate* rather than a final mask.
+        # Only after `entry_confirm_window` consecutive detections are all
+        # candidate frames retroactively committed to disk.
+        "entry_absence_threshold": 5,
+        "entry_confirm_window": 5,
     }
 
     def __init__(
@@ -290,6 +297,16 @@ class IdentityTracker:
         self.seed_annotations: dict[int, list[tuple[int, list, list]]] = {
             oid: [] for oid in object_ids
         }
+
+        # ── Entry confirmation window state ───────────────────────────────────
+        # Tracks how many consecutive frames each object has had NO raw SAM
+        # output.  When this count is ≥ entry_absence_threshold and SAM
+        # suddenly produces a mask, that mask becomes a *candidate* instead
+        # of being saved immediately.
+        self._no_mask_run: dict[int, int] = {}
+        # Buffer of (frame_idx, mask) pairs collected during the entry window.
+        # Absent once reset when the window is confirmed or aborted.
+        self._entry_candidates: dict[int, list[tuple[int, np.ndarray]]] = {}
 
         # ── Occlusion / ghost propagation state ──────────────────────────────
         self.occlusion_windows: dict[tuple[int, int], OcclusionWindow] = {}
@@ -803,6 +820,14 @@ class IdentityTracker:
     def consecutive_reject_limit(self) -> int:
         return int(self._tracking_params["consecutive_reject_limit"])
 
+    @property
+    def entry_absence_threshold(self) -> int:
+        return int(self._tracking_params.get("entry_absence_threshold", 5))
+
+    @property
+    def entry_confirm_window(self) -> int:
+        return int(self._tracking_params.get("entry_confirm_window", 5))
+
     # ── Temporal Consistency Validation ──────────────────────────────────────
 
     def validate_temporal_consistency(
@@ -947,7 +972,12 @@ class IdentityTracker:
         sam_masks: dict[int, np.ndarray],
         force_accept: bool = False,
         frame_shape: Optional[tuple[int, int]] = None,
-    ) -> tuple[dict[int, np.ndarray], dict[int, np.ndarray], dict[int, str]]:
+    ) -> tuple[
+        dict[int, np.ndarray],
+        dict[int, np.ndarray],
+        dict[int, str],
+        dict[int, list[tuple[int, np.ndarray]]],
+    ]:
         """
         Validate SAM output masks for temporal consistency and filter/fallback as needed.
 
@@ -957,26 +987,56 @@ class IdentityTracker:
             force_accept: If True, accept all masks regardless of validation
 
         Returns:
-            (display_masks, tracking_masks, rejection_reasons)
+            (display_masks, tracking_masks, rejection_reasons, retroactive_masks)
             - display_masks:  masks to save to disk (SAM output when valid, temporal
                               fallback otherwise)
             - tracking_masks: masks to carry forward as tracking state — uses last
                               clean mask for confused objects so overlap frames don't
                               corrupt future predictions
             - rejection_reasons: obj_id → reason string for any rejection
+            - retroactive_masks: {obj_id: [(frame_idx, mask), ...]} for objects whose
+                              entry window just confirmed — caller must retroactively
+                              save these past-frame masks to disk
         """
         display: dict[int, np.ndarray] = {}
         tracking: dict[int, np.ndarray] = {}
         rejections: dict[int, str] = {}
+        # Retroactive masks for objects whose entry window just confirmed.
+        # Each entry is a list of (frame_idx, mask) that the caller must
+        # save to disk because they were withheld during the window.
+        retroactive: dict[int, list[tuple[int, np.ndarray]]] = {}
 
         # Track consecutive rejections per object
         if not hasattr(self, '_consecutive_rejects'):
             self._consecutive_rejects: dict[int, int] = {}
 
+        # ── Phase 0: update raw-absence counters and abort stale entry windows ─
+        # Count BEFORE temporal validation so we know the pre-frame absence run.
+        prev_no_mask_run = dict(self._no_mask_run)
+        for oid in self.object_ids:
+            raw = sam_masks.get(oid)
+            if raw is None or not raw.astype(bool).any():
+                self._no_mask_run[oid] = self._no_mask_run.get(oid, 0) + 1
+                # An absent frame during an entry window aborts it
+                if oid in self._entry_candidates:
+                    logger.info(
+                        f"Frame {frame_idx}: obj {oid} entry window aborted "
+                        f"(absent after {len(self._entry_candidates[oid])} candidates)"
+                    )
+                    self._entry_candidates.pop(oid)
+            # else: don't reset yet — reset happens when mask is confirmed/committed
+
         # ── Phase 1: temporal consistency validation ──────────────────────────
         for oid in self.object_ids:
             new_mask = sam_masks.get(oid)
             prev_mask = self._prev_masks.get(oid)
+
+            # Objects inside an entry confirmation window must not be compared
+            # against a stale prev_mask (which may be from a wrong historical
+            # detection at a completely different position).  Treat them as if
+            # no previous mask exists so the check always passes.
+            if oid in self._entry_candidates:
+                prev_mask = None
 
             if new_mask is None:
                 if prev_mask is not None:
@@ -1033,6 +1093,70 @@ class IdentityTracker:
                     )
                     display[oid] = new_mask
                     tracking[oid] = new_mask
+
+        # ── Phase 1.3: Entry confirmation window ──────────────────────────────
+        # After a long absence (≥ entry_absence_threshold consecutive frames with
+        # no raw SAM output), the next detection is treated as a *candidate*
+        # rather than committed immediately.  Only after entry_confirm_window
+        # consecutive candidate frames does the entry become final.
+        #
+        # This prevents false positives (SAM briefly predicts a hallucination at
+        # the old annotation location) and also avoids the stale-prev_mask
+        # rejection loop where a real re-entry gets rejected because _prev_masks
+        # still holds a mask from an unrelated earlier detection.
+        if not force_accept:
+            for oid in list(display.keys()):
+                mask = display[oid]
+                if mask is None or not mask.astype(bool).any():
+                    continue  # empty / fallback — no entry logic needed
+
+                # Was this object absent long enough to trigger an entry window?
+                run_before = prev_no_mask_run.get(oid, 0)
+                in_window = oid in self._entry_candidates
+                if run_before >= self.entry_absence_threshold or in_window:
+                    # Add this frame to the candidate buffer
+                    if not in_window:
+                        self._entry_candidates[oid] = []
+                        logger.info(
+                            f"Frame {frame_idx}: obj {oid} entry window started "
+                            f"(absent {run_before} frames, "
+                            f"need {self.entry_confirm_window} to confirm)"
+                        )
+                    self._entry_candidates[oid].append((frame_idx, mask.copy()))
+                    num_candidates = len(self._entry_candidates[oid])
+
+                    if num_candidates >= self.entry_confirm_window:
+                        # Confirmed! Commit current frame and queue past frames.
+                        past = self._entry_candidates.pop(oid)
+                        # Past frames (all but the last, which is the current frame)
+                        # must be written to disk by the caller.
+                        if len(past) > 1:
+                            retroactive[oid] = past[:-1]
+                        self._no_mask_run[oid] = 0
+                        self._consecutive_rejects[oid] = 0
+                        logger.info(
+                            f"Frame {frame_idx}: obj {oid} entry CONFIRMED "
+                            f"({num_candidates} consecutive frames); "
+                            f"retroactive={len(past) - 1} frames"
+                        )
+                        # Keep current frame in display/tracking (already set above)
+                    else:
+                        # Still accumulating — withhold this frame from disk.
+                        # Do NOT update _prev_masks (update_frame won't see it).
+                        del display[oid]
+                        if oid in tracking:
+                            del tracking[oid]
+                        rejections[oid] = (
+                            f"entry_candidate:{num_candidates}/{self.entry_confirm_window}"
+                        )
+                        logger.debug(
+                            f"Frame {frame_idx}: obj {oid} entry candidate "
+                            f"{num_candidates}/{self.entry_confirm_window}"
+                        )
+                else:
+                    # Not coming from a long absence — normal tracking, reset run.
+                    self._no_mask_run[oid] = 0
+                    self._consecutive_rejects[oid] = 0
 
         # ── Phase 1.5: CoM-translation fallback for drastic area changes ─────
         # Runs before Phase 2 so that the corrected masks feed into overlap
@@ -1101,7 +1225,7 @@ class IdentityTracker:
         if rejections:
             self.temporal_rejections[frame_idx] = {oid: r for oid, r in rejections.items()}
 
-        return display, tracking, rejections
+        return display, tracking, rejections, retroactive
 
     def update_frame(
         self,

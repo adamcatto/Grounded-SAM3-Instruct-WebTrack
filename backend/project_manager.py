@@ -455,6 +455,16 @@ class ProjectManager:
     def masks_dir(self, pid: str, vid: str) -> Path:
         return self.video_dir(pid, vid) / "masks"
 
+    def seed_masks_dir(self, pid: str, vid: str) -> Path:
+        """
+        Persistent mask storage for user-annotated keyframes.
+        Files here survive "clear all masks" operations and serve as
+        display fallbacks and propagation anchors.
+        """
+        d = self.video_dir(pid, vid) / "seed_masks"
+        d.mkdir(exist_ok=True)
+        return d
+
     def masks_raw_dir(self, pid: str, vid: str) -> Path:
         d = self.video_dir(pid, vid) / "masks_raw"
         d.mkdir(exist_ok=True)

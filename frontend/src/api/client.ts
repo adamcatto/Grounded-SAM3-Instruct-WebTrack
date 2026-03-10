@@ -198,6 +198,21 @@ export const clearObjectPoints = (pid: string, vid: string, oid: string) =>
 
 // ─── Saved Masks ─────────────────────────────────────────────────────────────
 
+export const clearFrameMasks = (pid: string, vid: string, fidx: number) =>
+  api.delete<{ status: string; frame_idx: number; deleted: string[] }>(`/projects/${pid}/videos/${vid}/masks/${fidx}`).then(r => r.data)
+
+export type ClearMasksMode = 'all' | 'from_frame' | 'to_frame' | 'range'
+export const clearMasksBulk = (
+  pid: string, vid: string,
+  mode: ClearMasksMode,
+  from_frame?: number,
+  to_frame?: number,
+) =>
+  api.delete<{ status: string; mode: string; deleted_frames: number }>(
+    `/projects/${pid}/videos/${vid}/masks`,
+    { params: { mode, ...(from_frame != null ? { from_frame } : {}), ...(to_frame != null ? { to_frame } : {}) } },
+  ).then(r => r.data)
+
 export const getSavedMask = (pid: string, vid: string, fidx: number) =>
   api.get<{ frame_idx: number; masks: MaskData }>(`/projects/${pid}/videos/${vid}/masks/${fidx}`, {
     headers: { 'Cache-Control': 'no-cache' }
@@ -302,6 +317,13 @@ export const swapMasks = (
   ).then(r => r.data)
 
 // SSE stream for swapping all future frames (bypasses Vite proxy to avoid timeouts)
+// ─── SSE helpers (use proxy-compatible relative URLs) ────────────────────────
+// All SSE connections go through the Vite proxy (/api → localhost:8000) so
+// they work regardless of whether port 8000 is directly reachable from the
+// browser (e.g. VS Code port forwarding only exposes the dev-server port).
+// Only videoSourceUrl uses BACKEND directly because video streaming requires
+// HTTP Range requests which Vite's proxy may buffer incorrectly.
+
 export const startSwapAllSSE = (
   pid: string,
   vid: string,
@@ -310,20 +332,19 @@ export const startSwapAllSSE = (
   objIdB: string
 ) => {
   const params = new URLSearchParams({ obj_id_a: objIdA, obj_id_b: objIdB })
-  return new EventSource(`${BACKEND}/api/projects/${pid}/videos/${vid}/masks/${fidx}/swap_stream?${params}`)
+  return new EventSource(`/api/projects/${pid}/videos/${vid}/masks/${fidx}/swap_stream?${params}`)
 }
 
-// SSE also benefits from bypassing Vite's proxy to avoid buffering/re-chunking
 export const startPropagationSSE = (pid: string, vid: string, startFrame = 0, resumeFrom = -1) => {
   const params = new URLSearchParams({ start_frame: String(startFrame) })
   if (resumeFrom >= 0) params.set('resume_from', String(resumeFrom))
-  return new EventSource(`${BACKEND}/api/projects/${pid}/videos/${vid}/propagate?${params}`)
+  return new EventSource(`/api/projects/${pid}/videos/${vid}/propagate?${params}`)
 }
 
 // ─── Export SSE ───────────────────────────────────────────────────────────────
 
 export const startExportSSE = (pid: string, vid: string) =>
-  new EventSource(`${BACKEND}/api/projects/${pid}/videos/${vid}/export`)
+  new EventSource(`/api/projects/${pid}/videos/${vid}/export`)
 
 // ─── Uncertainty ──────────────────────────────────────────────────────────────
 

@@ -45,6 +45,7 @@ CONFUSION_THRESHOLD = 0.4         # confusion score to open a confusion window
 CONFUSION_RESET_THRESHOLD = 0.7   # confusion score → use full annotation fallback
 TEXT_SIMILARITY_THRESHOLD = 0.3   # min text similarity for "similar pair" protection
 N_POST_WINDOW_FRAMES = 10         # frames after window end for swap detection
+ABSENT_FRAMES_THRESHOLD = 8      # consecutive empty SAM frames → treat object as absent at batch boundary
 MAX_INST_SLOTS = 10               # max SAM obj_id slots reserved per UI object
 
 logging.basicConfig(level=logging.INFO)
@@ -1466,6 +1467,9 @@ def get_saved_mask(pid: str, vid: str, fidx: int):
 
     masks_path = pm.masks_dir(pid, vid) / f"{fidx:06d}.npz"
     if not masks_path.exists():
+        # Fall back to seed_masks (survives "clear all masks")
+        masks_path = pm.seed_masks_dir(pid, vid) / f"{fidx:06d}.npz"
+    if not masks_path.exists():
         return JSONResponse({"masks": {}}, headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
 
     mask_b64 = _get_encoded_masks(masks_path, video["objects"])
@@ -1473,6 +1477,105 @@ def get_saved_mask(pid: str, vid: str, fidx: int):
         {"frame_idx": fidx, "masks": mask_b64},
         headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
     )
+
+
+def _delete_masks_in_range(
+    pid: str, vid: str,
+    from_frame: Optional[int] = None,
+    to_frame: Optional[int] = None,
+) -> int:
+    """
+    Delete mask/bbox files in [from_frame, to_frame] (both inclusive, None = unbounded).
+    Skips frames that have a corresponding seed_masks entry so annotated
+    keyframe masks are preserved.
+    Returns number of frame files deleted.
+    """
+    masks_dir = pm.masks_dir(pid, vid)
+    bboxes_dir = pm.bboxes_dir(pid, vid)
+    seed_dir = pm.seed_masks_dir(pid, vid)
+    deleted = 0
+    for npz in sorted(masks_dir.glob("*.npz")):
+        fidx = int(npz.stem)
+        if from_frame is not None and fidx < from_frame:
+            continue
+        if to_frame is not None and fidx > to_frame:
+            continue
+        if (seed_dir / npz.name).exists():
+            continue  # protected seed frame
+        npz.unlink()
+        bbox = bboxes_dir / f"{fidx:06d}.json"
+        if bbox.exists():
+            bbox.unlink()
+        deleted += 1
+    return deleted
+
+
+@app.delete("/api/projects/{pid}/videos/{vid}/masks/{fidx}")
+def delete_frame_masks(pid: str, vid: str, fidx: int):
+    """Delete saved masks for a single frame (.npz and .json bbox files).
+    Skips the frame if it is protected by a seed_masks entry."""
+    video = pm.get_video(pid, vid)
+    if video is None:
+        raise HTTPException(404, "Video not found")
+
+    seed_path = pm.seed_masks_dir(pid, vid) / f"{fidx:06d}.npz"
+    if seed_path.exists():
+        return JSONResponse({"status": "protected", "frame_idx": fidx, "deleted": []})
+
+    masks_path = pm.masks_dir(pid, vid) / f"{fidx:06d}.npz"
+    bboxes_path = pm.bboxes_dir(pid, vid) / f"{fidx:06d}.json"
+
+    deleted = []
+    if masks_path.exists():
+        masks_path.unlink()
+        deleted.append("masks")
+    if bboxes_path.exists():
+        bboxes_path.unlink()
+        deleted.append("bboxes")
+
+    _invalidate_mask_cache(pid, vid)
+    return JSONResponse({"status": "ok", "frame_idx": fidx, "deleted": deleted})
+
+
+@app.delete("/api/projects/{pid}/videos/{vid}/masks")
+def bulk_delete_masks(
+    pid: str, vid: str,
+    mode: str = "all",
+    from_frame: Optional[int] = None,
+    to_frame: Optional[int] = None,
+):
+    """
+    Bulk-delete propagation mask files while preserving seed_masks keyframes.
+
+    mode:
+      all        – delete every non-seed frame
+      from_frame – delete from from_frame to end
+      to_frame   – delete from start to to_frame
+      range      – delete from from_frame to to_frame (inclusive)
+    """
+    video = pm.get_video(pid, vid)
+    if video is None:
+        raise HTTPException(404, "Video not found")
+
+    if mode == "all":
+        deleted = _delete_masks_in_range(pid, vid)
+    elif mode == "from_frame":
+        if from_frame is None:
+            raise HTTPException(422, "from_frame required for mode=from_frame")
+        deleted = _delete_masks_in_range(pid, vid, from_frame=from_frame)
+    elif mode == "to_frame":
+        if to_frame is None:
+            raise HTTPException(422, "to_frame required for mode=to_frame")
+        deleted = _delete_masks_in_range(pid, vid, to_frame=to_frame)
+    elif mode == "range":
+        if from_frame is None or to_frame is None:
+            raise HTTPException(422, "from_frame and to_frame required for mode=range")
+        deleted = _delete_masks_in_range(pid, vid, from_frame=from_frame, to_frame=to_frame)
+    else:
+        raise HTTPException(422, f"Unknown mode: {mode}")
+
+    _invalidate_mask_cache(pid, vid)
+    return JSONResponse({"status": "ok", "mode": mode, "deleted_frames": deleted})
 
 
 @app.get("/api/projects/{pid}/videos/{vid}/masks/{fidx}/composite")
@@ -1908,6 +2011,10 @@ def save_frame_to_inference(pid: str, vid: str, frame_idx: int):
         pm.save_point_prompts(pid, vid, obj_id_str, frame_idx, [[cx, cy]], [1])
         saved_count += 1
 
+    # Mirror the mask file into seed_masks/ so it survives "clear all masks".
+    seed_path = pm.seed_masks_dir(pid, vid) / f"{frame_idx:06d}.npz"
+    shutil.copy2(str(masks_path), str(seed_path))
+
     return {"status": "saved", "frame_idx": frame_idx, "objects_saved": saved_count}
 
 
@@ -2088,6 +2195,18 @@ async def _run_propagation_bg(
         # If resuming from a paused frame, pre-load that frame's masks as the
         # initial seed so the first batch behaves like a continuation batch.
         prev_batch_last_masks: dict | None = None
+        # Tracks how many consecutive frames each object produced empty raw SAM
+        # output (before any fallback). Used to detect genuine absence at batch
+        # boundaries so we don't seed a stale mask into the next batch.
+        obj_sam_empty_consec: dict[int, int] = {}
+        # Objects considered absent at the end of the previous batch.
+        prev_batch_absent: set[int] = set()
+        # Objects that have produced at least one confirmed (non-suppressed)
+        # non-empty mask at any point during propagation.  Only these are
+        # eligible for trial re-entry seeding — objects that have *never* been
+        # seen should not be searched for with stale annotation coordinates in
+        # a batch where they don't yet appear.
+        ever_detected: set[int] = set()
         if seed_frame >= 0:
             seed_npz = masks_dir / f"{seed_frame:06d}.npz"
             if seed_npz.exists():
@@ -2182,6 +2301,7 @@ async def _run_propagation_bg(
                     return
 
                 # ── 5. Add prompts ────────────────────────────────────────
+                trial_objects: set[int] = set()  # populated in subsequent batches for absent objects
                 try:
                     if prev_batch_last_masks is None:
                         # First batch that has frame data: replay point prompts
@@ -2267,9 +2387,12 @@ async def _run_propagation_bg(
                         seed_masks: dict = {}
                         last_prev_frame = batch_start - 1
                         prev_npz = masks_dir / f"{last_prev_frame:06d}.npz"
-                        if prev_npz.exists():
+                        # Also check seed_masks/ (persists across "clear all masks")
+                        seed_npz_fallback = pm.seed_masks_dir(pid, vid) / f"{last_prev_frame:06d}.npz"
+                        npz_to_load = prev_npz if prev_npz.exists() else (seed_npz_fallback if seed_npz_fallback.exists() else None)
+                        if npz_to_load is not None:
                             try:
-                                saved = load_masks_npz(str(prev_npz))
+                                saved = load_masks_npz(str(npz_to_load))
                                 seed_masks = {int(k): v.astype(np.uint8) for k, v in saved.items()}
                             except Exception as _e:
                                 logger.warning(
@@ -2294,8 +2417,55 @@ async def _run_propagation_bg(
                             f"{[v[0] for v in adaptive_strategy.values()]}"
                         )
 
+                        # Only objects that have been seen before are eligible
+                        # for trial re-entry seeding.  Objects that have *never*
+                        # produced a confirmed mask are simply not present yet —
+                        # trial-seeding them with stale annotation coords causes
+                        # SAM to hallucinate large masks at those pixel positions
+                        # in frames where the object doesn't exist.
+                        trial_objects = prev_batch_absent & ever_detected
+
                         seeded_count = 0
                         for obj_id_int, strategy in adaptive_strategy.items():
+                            # For absent (but previously seen) objects use original
+                            # annotation prompts instead of a stale positional mask.
+                            # This lets SAM re-detect the object based on appearance
+                            # when it re-enters the scene.
+                            if obj_id_int in prev_batch_absent:
+                                if obj_id_int not in ever_detected:
+                                    # Never seen before — don't seed.  In-window
+                                    # annotation replay (below) will handle it if
+                                    # its annotated frame falls in this batch.
+                                    logger.info(
+                                        f"Batch {batch_idx}: obj {obj_id_int} absent but "
+                                        f"never detected — skipping trial seed"
+                                    )
+                                    continue
+                                seed_pts = tracker.seed_annotations.get(obj_id_int, [])
+                                if seed_pts:
+                                    obj_text = pm.get_object_description(pid, vid, str(obj_id_int)) or None
+                                    for (_fidx, pts, lbls) in seed_pts[-1:]:  # most recent annotation
+                                        await loop.run_in_executor(None, functools.partial(
+                                            sam.add_points, pid, vid,
+                                            frame_idx=batch_start,
+                                            obj_id=obj_id_int,
+                                            points=pts,
+                                            labels=lbls,
+                                            text=obj_text,
+                                        ))
+                                    seeded_count += 1
+                                    logger.info(
+                                        f"Batch {batch_idx}: trial-seeding obj {obj_id_int} "
+                                        f"with annotation prompts (absent "
+                                        f"{obj_sam_empty_consec.get(obj_id_int, 0)} frames)"
+                                    )
+                                else:
+                                    logger.info(
+                                        f"Batch {batch_idx}: no annotations for absent obj "
+                                        f"{obj_id_int}, staying absent"
+                                    )
+                                continue
+
                             obj_text = pm.get_object_description(pid, vid, str(obj_id_int)) or None
                             mode = strategy[0]
 
@@ -2344,8 +2514,11 @@ async def _run_propagation_bg(
                                 seeded_count += 1
 
                         # Fallback: for objects not covered by adaptive strategy,
-                        # use their last available mask from seed_masks
+                        # use their last available mask from seed_masks.
+                        # Absent objects are already handled above; skip them here.
                         for obj_id_int, mask_np in seed_masks.items():
+                            if obj_id_int in prev_batch_absent:
+                                continue
                             if obj_id_int not in adaptive_strategy:
                                 obj_text = pm.get_object_description(pid, vid, str(obj_id_int)) or None
                                 await loop.run_in_executor(None, functools.partial(
@@ -2357,9 +2530,46 @@ async def _run_propagation_bg(
                                 ))
                                 seeded_count += 1
 
+                        # ── In-window annotation replay for never-seen objects ──
+                        # If an object has never been detected, its first appearance
+                        # might be within this batch.  Replay its annotation at the
+                        # exact frame it was made (not batch_start) so SAM sees the
+                        # prompt in the right visual context — same logic as the
+                        # first-batch replay, but applied to late-entry objects.
+                        inwindow_count = 0
+                        for obj_id_str, frame_map in all_prompts.items():
+                            oid = int(obj_id_str)
+                            # Skip objects that have already been detected — they
+                            # are handled by normal carry-forward seeding or trial
+                            # re-entry seeding above.  Objects that have NEVER been
+                            # detected (not in ever_detected) always get in-window
+                            # replay regardless of prev_batch_absent: being absent
+                            # last batch doesn't mean their first appearance isn't
+                            # in this batch.
+                            if oid in ever_detected:
+                                continue  # handled above
+                            obj_text = pm.get_object_description(pid, vid, obj_id_str) or None
+                            for fidx_str, prompt in frame_map.items():
+                                real_fidx = int(fidx_str)
+                                if batch_start <= real_fidx < batch_end:
+                                    await loop.run_in_executor(None, functools.partial(
+                                        sam.add_points, pid, vid,
+                                        frame_idx=real_fidx,
+                                        obj_id=oid,
+                                        points=prompt["points"],
+                                        labels=prompt["labels"],
+                                        text=None,  # SAM3 tracker mode doesn't support text
+                                    ))
+                                    inwindow_count += 1
+                                    logger.info(
+                                        f"Batch {batch_idx}: in-window replay for never-seen "
+                                        f"obj {oid} at frame {real_fidx}"
+                                    )
+
                         logger.info(
                             f"Batch {batch_idx}: seeded {seeded_count} object(s) "
-                            f"on frame {batch_start} "
+                            f"on frame {batch_start}, "
+                            f"{inwindow_count} in-window annotation(s) "
                             f"(confusion={batch_confusion:.3f}, "
                             f"in-memory: {len(prev_batch_last_masks)}, "
                             f"disk-backed: {prev_npz.exists()})"
@@ -2462,6 +2672,62 @@ async def _run_propagation_bg(
                                 score = float(probs_raw[i]) if i < len(probs_raw) else 1.0
                                 bboxes_to_save[str(oid)] = list(box) + [score]
 
+                        # ── Trial-object plausibility filter ───────────────
+                        # For objects seeded with annotation prompts this batch
+                        # (because they were absent), validate that SAM's output
+                        # looks like a real re-detection before accepting it.
+                        # "Plausible" means the mask area is within a reasonable
+                        # multiple of the object's historical average area.
+                        # False positives (SAM picking up background at the old
+                        # annotation coordinates) are suppressed here.
+                        for _oid in list(trial_objects):
+                            raw_m = sam_output_masks.get(_oid)
+                            if raw_m is None or not raw_m.astype(bool).any():
+                                continue  # still empty — nothing to validate
+                            traj = tracker.trajectories.get(_oid)
+                            if traj and len(traj._history) >= 3:
+                                mean_area = float(np.mean([s.area for _, s in traj._history]))
+                                frame_px = raw_m.size
+                                pred_area = float(raw_m.astype(bool).sum()) / frame_px
+                                if mean_area > 0:
+                                    ratio = pred_area / mean_area
+                                    plausible = 0.15 <= ratio <= 8.0
+                                else:
+                                    plausible = pred_area > 5e-4  # any non-trivial mask
+                            else:
+                                # No history: accept anything non-trivial
+                                frame_px = raw_m.size
+                                plausible = float(raw_m.astype(bool).sum()) / frame_px > 5e-4
+
+                            if plausible:
+                                # Object successfully re-detected — graduate from trial mode
+                                trial_objects.discard(_oid)
+                                obj_sam_empty_consec[_oid] = 0  # reset absence counter
+                                logger.info(
+                                    f"Frame {real_frame_idx}: obj {_oid} re-detected "
+                                    f"(area={float(raw_m.astype(bool).sum())/raw_m.size:.4f})"
+                                )
+                            else:
+                                # Implausible — suppress this prediction so it
+                                # doesn't corrupt the tracking state.
+                                sam_output_masks[_oid] = np.zeros_like(raw_m)
+                                logger.debug(
+                                    f"Frame {real_frame_idx}: obj {_oid} trial prediction "
+                                    f"suppressed (implausible area)"
+                                )
+
+                        # ── Track per-object SAM absence ───────────────────
+                        # Count consecutive frames with empty raw SAM output so we
+                        # can detect objects that have genuinely left the frame by
+                        # the end of a batch (and avoid seeding them next batch).
+                        for _oid in obj_ids_int:
+                            raw_m = sam_output_masks.get(_oid)
+                            if raw_m is None or not raw_m.astype(bool).any():
+                                obj_sam_empty_consec[_oid] = obj_sam_empty_consec.get(_oid, 0) + 1
+                            else:
+                                obj_sam_empty_consec[_oid] = 0
+                                ever_detected.add(_oid)
+
                         # ── Temporal Consistency Validation ────────────────
                         # Filter masks that are temporally inconsistent (big jumps
                         # in position/size/IoU) and fall back to previous frame
@@ -2477,7 +2743,7 @@ async def _run_propagation_bg(
                             (fresh_video["height"], fresh_video["width"])
                             if fresh_video else None
                         )
-                        display_masks, tracking_masks, rejections = tracker.validate_and_filter_masks(
+                        display_masks, tracking_masks, rejections, retroactive_masks = tracker.validate_and_filter_masks(
                             real_frame_idx,
                             sam_output_masks,
                             force_accept=is_first_frame,  # Accept first frame of batch
@@ -2485,6 +2751,29 @@ async def _run_propagation_bg(
                         )
                         if rejections:
                             logger.debug(f"Frame {real_frame_idx} rejections: {rejections}")
+
+                        # Retroactively save masks for objects whose entry window
+                        # just confirmed.  These frames were withheld from disk
+                        # until enough consecutive detections validated them.
+                        for _r_oid, _r_frames in retroactive_masks.items():
+                            for _r_fidx, _r_mask in _r_frames:
+                                _r_path = masks_dir / f"{_r_fidx:06d}.npz"
+                                try:
+                                    # Merge with existing masks (other objects may
+                                    # already have data saved at this frame).
+                                    if _r_path.exists():
+                                        existing = load_masks_npz(str(_r_path))
+                                        existing[str(_r_oid)] = _r_mask
+                                        save_masks_npz(str(_r_path), existing)
+                                    else:
+                                        save_masks_npz(str(_r_path), {str(_r_oid): _r_mask})
+                                    logger.info(
+                                        f"Retroactive save: obj {_r_oid} @ frame {_r_fidx}"
+                                    )
+                                except Exception as _re:
+                                    logger.warning(
+                                        f"Retroactive save failed obj {_r_oid} @ {_r_fidx}: {_re}"
+                                    )
 
                         # display_masks → saved to disk (SAM output; shows what the model saw)
                         # tracking_masks → carry-forward state (clean masks during confusion)
@@ -2562,6 +2851,21 @@ async def _run_propagation_bg(
                 # Invalidate encode cache so scrubbing after propagation gets fresh masks
                 _invalidate_mask_cache(pid, vid)
                 prev_batch_last_masks = last_frame_masks if last_frame_masks else prev_batch_last_masks
+
+                # Determine which objects were absent at the end of this batch.
+                # An object is "absent" if its raw SAM output was empty for the
+                # last ABSENT_FRAMES_THRESHOLD consecutive frames — this means it
+                # has genuinely left the scene and should NOT be seeded next batch.
+                prev_batch_absent = {
+                    oid for oid, count in obj_sam_empty_consec.items()
+                    if count >= ABSENT_FRAMES_THRESHOLD
+                }
+                if prev_batch_absent:
+                    logger.info(
+                        f"Batch {batch_idx}: objects absent at end of batch "
+                        f"(will skip seeding): {prev_batch_absent}"
+                    )
+
                 logger.info(
                     f"Batch {batch_idx} done: {batch_frame_count} frames, "
                     f"{len(last_frame_masks)} object mask(s) carried forward"

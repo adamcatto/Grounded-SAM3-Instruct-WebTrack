@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react'
-import { Plus, RotateCcw, ChevronRight, Loader, Download, X, Zap, Save, Pause, Play, SkipBack, ArrowRightLeft } from 'lucide-react'
+import { Plus, RotateCcw, ChevronRight, Loader, Download, X, Zap, Save, Pause, Play, SkipBack, SkipForward, ArrowRightLeft, Trash2 } from 'lucide-react'
 import { useStore, currentVideo as selectCurrentVideo } from '../../store/useStore'
-import { addObject, initSession, startPropagationSSE, startExportSSE, getProject, resetVideo, predictFrame, saveFrameInference, getPropagationStatus, pausePropagation, updateVideoMeta, swapMasks, startSwapAllSSE, getUncertainty, getCorrections, resumeFromFrame, type SwapMode } from '../../api/client'
+import { addObject, initSession, startPropagationSSE, startExportSSE, getProject, resetVideo, predictFrame, saveFrameInference, clearFrameMasks, clearMasksBulk, getPropagationStatus, pausePropagation, updateVideoMeta, swapMasks, startSwapAllSSE, getUncertainty, getCorrections, resumeFromFrame, type SwapMode, type ClearMasksMode } from '../../api/client'
 import { getObjectColor } from '../../utils/colors'
 import { clearMaskCache } from '../../utils/maskUtils'
 import ObjectCard from './ObjectCard'
@@ -38,6 +38,10 @@ export default function LeftPanel() {
   const [trackFrame, setTrackFrame] = useState(0)
   const activeEsRef = useRef<EventSource | null>(null)
   const [predictingFrame, setPredictingFrame] = useState(false)
+  // Clear masks modal state
+  const [showClearMasksModal, setShowClearMasksModal] = useState(false)
+  const [clearRangeFrom, setClearRangeFrom] = useState('')
+  const [clearRangeTo, setClearRangeTo] = useState('')
   // Swap masks state
   const [swapObjA, setSwapObjA] = useState<string>('')
   const [swapObjB, setSwapObjB] = useState<string>('')
@@ -145,7 +149,14 @@ export default function LeftPanel() {
     // Close any existing connection
     activeEsRef.current?.close()
 
-    console.log(`[SSE] Connecting to propagation SSE (attempt ${retryCount + 1})...`, { pid, vid, propagationStartFrame })
+    if (!pid || !vid) {
+      console.error('[SSE] Cannot connect: pid or vid is empty', { pid, vid })
+      setTrackingError('Internal error: project/video ID missing')
+      setPropagationStatus('error')
+      return
+    }
+    const sseUrl = `/api/projects/${pid}/videos/${vid}/propagate?start_frame=${propagationStartFrame}`
+    console.log(`[SSE] Connecting to propagation SSE (attempt ${retryCount + 1})...`, { pid, vid, propagationStartFrame, sseUrl })
     const es = startPropagationSSE(pid, vid, propagationStartFrame)
     activeEsRef.current = es
 
@@ -232,7 +243,7 @@ export default function LeftPanel() {
     })
     es.onerror = (event) => {
       const status = useStore.getState().propagationStatus
-      console.error('[SSE] Connection error:', { readyState: es.readyState, status, event })
+      console.error('[SSE] Connection error:', { readyState: es.readyState, status, event, url: sseUrl })
       if (status === 'done') return
       es.close()
       activeEsRef.current = null
@@ -323,6 +334,7 @@ export default function LeftPanel() {
       setTotalFramesToProcess(0)
       setActualStartFrame(propagationStartFrame)
       totalBatchesRef.current = 1
+      console.log('[Track] About to call _connectSSE(0)', { pid, vid, propagationStartFrame, sessionInitialized })
       _connectSSE(0)
     }
   }
@@ -517,7 +529,9 @@ export default function LeftPanel() {
       const result = await predictFrame(pid, vid, frame, usePrev)
       if (Object.keys(result.masks).length > 0) {
         setSavedMask(result.frame_idx, result.masks)
-        setPendingInferenceFrame(result.frame_idx)
+        // Auto-save to inference state so it anchors future tracking
+        await saveFrameInference(pid, vid, result.frame_idx)
+        addToast(`Frame ${result.frame_idx} predicted and saved.`, 'success')
         // Refresh project to pick up any newly registered instance objects
         const fresh = await getProject(pid)
         setProject(fresh)
@@ -529,6 +543,55 @@ export default function LeftPanel() {
       addToast(msg, 'error')
     } finally {
       setPredictingFrame(false)
+    }
+  }
+
+  function handleClearFrameMasks() {
+    setClearRangeFrom(String(currentFrame))
+    setClearRangeTo(String(video ? video.num_frames - 1 : currentFrame))
+    setShowClearMasksModal(true)
+  }
+
+  async function handleConfirmClearMasks(mode: ClearMasksMode | 'this_frame') {
+    if (!pid || !vid) return
+    setShowClearMasksModal(false)
+    try {
+      if (mode === 'this_frame') {
+        const result = await clearFrameMasks(pid, vid, currentFrame)
+        if (result.status === 'protected') {
+          addToast(`Frame ${currentFrame} is a seed keyframe and cannot be cleared.`, 'error')
+          return
+        }
+        setSavedMask(currentFrame, {})
+        store.setCurrentFrameMasks({})
+        clearMaskCache()
+        addToast(`Masks cleared for frame ${currentFrame}.`, 'success')
+      } else if (mode === 'from_frame') {
+        const result = await clearMasksBulk(pid, vid, 'from_frame', currentFrame)
+        clearMaskCache()
+        store.resetVideoState()
+        addToast(`Cleared ${result.deleted_frames} frame(s) from frame ${currentFrame} onwards (seed frames preserved).`, 'success')
+      } else if (mode === 'range') {
+        const from = parseInt(clearRangeFrom)
+        const to = parseInt(clearRangeTo)
+        if (isNaN(from) || isNaN(to) || from > to) {
+          addToast('Invalid range.', 'error')
+          return
+        }
+        const result = await clearMasksBulk(pid, vid, 'range', from, to)
+        clearMaskCache()
+        store.resetVideoState()
+        addToast(`Cleared ${result.deleted_frames} frame(s) in range ${from}–${to} (seed frames preserved).`, 'success')
+      } else {
+        // all
+        const result = await clearMasksBulk(pid, vid, 'all')
+        clearMaskCache()
+        store.resetVideoState()
+        addToast(`Cleared ${result.deleted_frames} frame(s) (seed frames preserved).`, 'success')
+      }
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : 'Clear failed'
+      addToast(msg, 'error')
     }
   }
 
@@ -840,36 +903,6 @@ export default function LeftPanel() {
         />
       </div>
 
-      {/* Save-to-inference-state prompt */}
-      {pendingInferenceFrame !== null && (
-        <div className="mx-2 mb-2 p-2.5 rounded-lg border border-blue-800/50 bg-[#0d1a2a] flex-shrink-0">
-          <div className="flex items-start justify-between gap-2 mb-2">
-            <p className="text-xs text-[#aaa] leading-snug">
-              <span className="text-blue-400 font-medium">Frame {pendingInferenceFrame} predicted.</span>
-              {' '}Save as a keyframe so it anchors future tracking?
-            </p>
-            <button onClick={() => setPendingInferenceFrame(null)} className="text-[#555] hover:text-[#aaa] flex-shrink-0 mt-0.5">
-              <X size={11} />
-            </button>
-          </div>
-          <div className="flex gap-1.5">
-            <button
-              onClick={handleSaveInference}
-              className="btn btn-primary flex items-center gap-1 text-xs py-1"
-            >
-              <Save size={10} />
-              Save to inference state
-            </button>
-            <button
-              onClick={() => setPendingInferenceFrame(null)}
-              className="btn btn-ghost text-xs py-1"
-            >
-              Dismiss
-            </button>
-          </div>
-        </div>
-      )}
-
       {/* Swap all-future progress bar */}
       {swapping && swapProgressTotal > 0 && (
         <div className="mx-3 mb-2 space-y-1 flex-shrink-0">
@@ -942,6 +975,15 @@ export default function LeftPanel() {
               Resume
             </button>
             <button
+              onClick={handleTrack}
+              disabled={!hasObjects}
+              className="btn btn-ghost flex-1 flex items-center justify-center gap-1 text-xs py-1.5 disabled:opacity-40"
+              title="Choose a frame to start tracking from"
+            >
+              <SkipForward size={10} />
+              From frame
+            </button>
+            <button
               onClick={handleRestartFromStart}
               disabled={!hasObjects}
               className="btn btn-ghost flex-1 flex items-center justify-center gap-1 text-xs py-1.5 disabled:opacity-40"
@@ -984,12 +1026,25 @@ export default function LeftPanel() {
             <span>Export</span>
           </button>
         )}
+        {savedMaskCache[currentFrame] && Object.keys(savedMaskCache[currentFrame]).length > 0 && (
+          <button
+            onClick={handleClearFrameMasks}
+            disabled={isTracking}
+            className="btn btn-ghost flex-1 min-w-0 flex flex-col items-center justify-center gap-0.5 px-0.5 py-2 disabled:opacity-40 text-red-400 hover:text-red-300"
+            style={{ fontSize: 'clamp(7px, 4cqi, 11px)', lineHeight: 1.2 }}
+            title={`Clear saved masks for frame ${currentFrame}`}
+          >
+            <Trash2 size={10} />
+            <span>Clear</span>
+            <span>masks</span>
+          </button>
+        )}
         <button
           onClick={handlePredictFrame}
           disabled={predictingFrame || isTracking || !hasObjects}
           className="btn btn-ghost flex-1 min-w-0 flex flex-col items-center justify-center gap-0.5 px-0.5 py-2 disabled:opacity-40"
           style={{ fontSize: 'clamp(7px, 4cqi, 11px)', lineHeight: 1.2 }}
-          title={`Predict mask for frame ${store.currentFrame}`}
+          title={`Predict mask for frame ${currentFrame}`}
         >
           {predictingFrame
             ? <Loader size={10} className="animate-spin" />
@@ -1059,6 +1114,74 @@ export default function LeftPanel() {
                 Start tracking
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Clear Masks Modal */}
+      {showClearMasksModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+          <div className="bg-[#1a1a1a] rounded-xl border border-[#333] p-5 w-84 shadow-xl">
+            <h3 className="text-sm font-semibold text-[#eee] mb-1">Clear masks</h3>
+            <p className="text-xs text-[#666] mb-4 leading-relaxed">
+              Seed keyframe masks (from "Predict") are always preserved.
+            </p>
+            <div className="flex flex-col gap-2">
+              <button
+                onClick={() => handleConfirmClearMasks('this_frame')}
+                className="btn btn-ghost w-full py-2 text-xs text-left px-3"
+              >
+                This frame only <span className="text-[#555]">(frame {currentFrame})</span>
+              </button>
+              <button
+                onClick={() => handleConfirmClearMasks('from_frame')}
+                className="btn btn-ghost w-full py-2 text-xs text-left px-3"
+              >
+                This frame and all future frames <span className="text-[#555]">(frame {currentFrame} →)</span>
+              </button>
+              <div className="rounded border border-[#2a2a2a] p-2.5 flex flex-col gap-2">
+                <p className="text-xs text-[#888]">Range of frames</p>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="number"
+                    min={0}
+                    max={video ? video.num_frames - 1 : 0}
+                    value={clearRangeFrom}
+                    onChange={e => setClearRangeFrom(e.target.value)}
+                    className="flex-1 text-xs py-1 px-2 rounded bg-[#111] border border-[#333] text-[#ccc]"
+                    placeholder="From"
+                  />
+                  <span className="text-xs text-[#555]">–</span>
+                  <input
+                    type="number"
+                    min={0}
+                    max={video ? video.num_frames - 1 : 0}
+                    value={clearRangeTo}
+                    onChange={e => setClearRangeTo(e.target.value)}
+                    className="flex-1 text-xs py-1 px-2 rounded bg-[#111] border border-[#333] text-[#ccc]"
+                    placeholder="To"
+                  />
+                  <button
+                    onClick={() => handleConfirmClearMasks('range')}
+                    className="btn btn-ghost text-xs py-1 px-2 flex-shrink-0"
+                  >
+                    Clear
+                  </button>
+                </div>
+              </div>
+              <button
+                onClick={() => handleConfirmClearMasks('all')}
+                className="btn btn-ghost w-full py-2 text-xs text-red-400 hover:text-red-300 text-left px-3"
+              >
+                All frames
+              </button>
+            </div>
+            <button
+              onClick={() => setShowClearMasksModal(false)}
+              className="mt-3 btn btn-ghost w-full py-2 text-xs text-[#555] hover:text-[#aaa]"
+            >
+              Cancel
+            </button>
           </div>
         </div>
       )}
