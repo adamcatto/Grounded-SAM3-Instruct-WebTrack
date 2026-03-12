@@ -333,6 +333,33 @@ export default function ConfigPanel() {
         {/* Tracking Parameters */}
         {trackingParams && (
           <Section title="Tracking parameters">
+            <div className="py-3 border-b border-[#1e1e1e]">
+              <p className="text-sm text-[#ddd] font-medium mb-0.5">Propagation mode</p>
+              <p className="text-xs text-[#666] mb-3 leading-relaxed">
+                <b className="text-[#999]">Temporal tracking</b> carries each frame's prediction
+                forward as the seed for the next, and applies temporal consistency filtering to reject
+                implausible jumps. <b className="text-[#999]">Per-frame prediction</b> re-seeds SAM
+                from the original annotation prompts each batch without filtering.{' '}
+                <b className="text-[#999]">Dual candidate</b> runs both a seed-only and a temporal
+                pass per batch, then selects whichever mask has better IoU with the previous frame —
+                slower but more robust to drift. Best for long videos with similar-looking objects.
+              </p>
+              <div className="flex gap-2 flex-wrap">
+                {(['temporal_tracking', 'per_frame', 'dual_candidate'] as const).map(m => (
+                  <button
+                    key={m}
+                    onClick={() => handleTrackingParamChange('propagation_mode', m)}
+                    className={`flex-1 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
+                      (trackingParams.propagation_mode ?? 'temporal_tracking') === m
+                        ? 'bg-blue-600/20 border-blue-500/60 text-blue-400'
+                        : 'border-[#333] text-[#666] hover:border-[#555] hover:text-[#aaa]'
+                    }`}
+                  >
+                    {m === 'temporal_tracking' ? 'Temporal tracking' : m === 'per_frame' ? 'Per-frame' : 'Dual candidate'}
+                  </button>
+                ))}
+              </div>
+            </div>
             <SliderRow
               label="Min IoU threshold"
               description="Minimum overlap (IoU) required between consecutive frames. Lower values allow more mask drift."

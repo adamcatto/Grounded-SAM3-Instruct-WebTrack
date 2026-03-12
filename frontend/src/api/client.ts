@@ -266,6 +266,7 @@ export interface TrackingParams {
   max_area_ratio: number
   max_centroid_jump: number
   consecutive_reject_limit: number
+  propagation_mode: 'temporal_tracking' | 'per_frame'
 }
 
 export const getTrackingParams = (pid: string, vid: string) =>

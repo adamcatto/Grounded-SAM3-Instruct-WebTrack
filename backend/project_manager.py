@@ -151,6 +151,7 @@ class ProjectManager:
             "anomaly_threshold": 2.5,         # Z-score for anomaly detection
             "confusion_threshold": 0.4,       # Score to open confusion window
             "text_similarity_threshold": 0.3, # Min text similarity for pair protection
+            "propagation_mode": "temporal_tracking",  # "temporal_tracking" or "per_frame"
         }
 
     def get_tracking_params(self, pid: str, vid: str) -> dict:
