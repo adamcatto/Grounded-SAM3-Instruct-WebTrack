@@ -1,5 +1,8 @@
 import axios from 'axios'
-import type { Project, VideoMeta, ObjectDef, MaskData, UncertaintyData, CorrectionRecord } from '../types'
+import type { Project, VideoMeta, ObjectDef, MaskData, UncertaintyData, CorrectionRecord, ClassifierFramesResponse, ClassifierResults } from '../types'
+
+// Direct backend URL for SSE/streaming (bypasses Vite dev proxy)
+const BACKEND_URL = (import.meta.env.VITE_BACKEND_URL as string | undefined) ?? 'http://localhost:8000'
 
 const api = axios.create({ baseURL: '/api' })
 
@@ -266,7 +269,7 @@ export interface TrackingParams {
   max_area_ratio: number
   max_centroid_jump: number
   consecutive_reject_limit: number
-  propagation_mode: 'temporal_tracking' | 'per_frame'
+  propagation_mode: 'temporal_tracking' | 'per_frame' | 'dual_candidate'
 }
 
 export const getTrackingParams = (pid: string, vid: string) =>
@@ -363,6 +366,25 @@ export interface UncertaintyFrameDetail {
 export const getUncertaintyFrameDetail = (pid: string, vid: string, fidx: number) =>
   api.get<UncertaintyFrameDetail>(`/projects/${pid}/videos/${vid}/uncertainty/frames/${fidx}`).then(r => r.data)
 
+// ─── Overlaps ──────────────────────────────────────────────────────────────────
+
+export interface OcclusionWindow {
+  pair: [number, number]
+  onset_frame: number
+  end_frame: number           // -1 if still active at propagation end
+  frames: number[]
+  swap_detected: boolean
+  identity_map: Record<string, string> | null
+  corrected: boolean
+}
+
+export interface OverlapsData {
+  windows: OcclusionWindow[]
+}
+
+export const getOverlaps = (pid: string, vid: string) =>
+  api.get<OverlapsData>(`/projects/${pid}/videos/${vid}/overlaps`).then(r => r.data)
+
 // ─── Raw masks (pre-correction) ───────────────────────────────────────────────
 
 export const getRawMasks = (pid: string, vid: string, fidx: number) =>
@@ -388,3 +410,85 @@ export const rejectCorrection = (pid: string, vid: string, correctionId: string)
   api.post<{ status: string }>(
     `/projects/${pid}/videos/${vid}/corrections/${correctionId}/reject`
   ).then(r => r.data)
+
+// ─── Classifier ───────────────────────────────────────────────────────────────
+
+// Legacy frame-fetch endpoint (kept for potential debugging use)
+export const getClassifierFrames = (
+  pid: string, vid: string,
+  start: number, end: number,
+  step: number, maxSize = 96,
+) =>
+  api.get<ClassifierFramesResponse>(
+    `/projects/${pid}/videos/${vid}/classifier-frames`,
+    { params: { start, end, step, max_size: maxSize } }
+  ).then(r => r.data)
+
+export interface ClassifierTrainParams {
+  startFrame: number
+  endFrame:   number
+  step:       number
+  epochs:     number
+  lr:         number
+  trainRatio: number
+  evalRatio:  number
+}
+
+export type ClassifierSSEEvent =
+  | { type: 'split';               train_frames: number[]; eval_frames: number[] }
+  | { type: 'status';              message: string }
+  | { type: 'epoch';               epoch: number; epochs: number; loss: number; train_acc: number }
+  | { type: 'inference_progress';  done: number; total: number }
+  | { type: 'done';                object_ids: string[]; frame_assignments: Record<string, Record<string, { predictedClass: string; confidence: number; scores: Record<string, number> }>>; train_frames: number[]; eval_frames: number[]; train_accuracy: number; eval_agreement: number }
+  | { type: 'cancelled' }
+  | { type: 'error';               message: string }
+
+/**
+ * Open an SSE connection to the backend classifier training endpoint.
+ * Returns a cleanup function that closes the connection.
+ */
+export function openClassifierStream(
+  pid: string,
+  vid: string,
+  params: ClassifierTrainParams,
+  onEvent: (ev: ClassifierSSEEvent) => void,
+): () => void {
+  const qs = new URLSearchParams({
+    start_frame:  String(params.startFrame),
+    end_frame:    String(params.endFrame),
+    step:         String(params.step),
+    epochs:       String(params.epochs),
+    lr:           String(params.lr),
+    train_ratio:  String(params.trainRatio),
+    eval_ratio:   String(params.evalRatio),
+  })
+  const url = `${BACKEND_URL}/api/projects/${pid}/videos/${vid}/classifier/train?${qs}`
+  const es  = new EventSource(url)
+
+  const handle = (type: string, raw: string) => {
+    try {
+      onEvent({ type, ...JSON.parse(raw) } as ClassifierSSEEvent)
+    } catch {
+      onEvent({ type: 'error', message: `Parse error for event "${type}"` })
+    }
+  }
+
+  for (const t of ['split', 'status', 'epoch', 'inference_progress', 'done', 'cancelled', 'error']) {
+    es.addEventListener(t, (e: MessageEvent) => {
+      handle(t, e.data)
+      if (t === 'done' || t === 'cancelled' || t === 'error') es.close()
+    })
+  }
+  es.onerror = () => {
+    onEvent({ type: 'error', message: 'SSE connection error' })
+    es.close()
+  }
+
+  return () => es.close()
+}
+
+export const cancelClassifier = (pid: string, vid: string) =>
+  api.post(`/projects/${pid}/videos/${vid}/classifier/cancel`)
+
+export const getClassifierResults = (pid: string, vid: string) =>
+  api.get<ClassifierResults>(`/projects/${pid}/videos/${vid}/classifier/results`).then(r => r.data)

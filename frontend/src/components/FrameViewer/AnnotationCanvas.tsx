@@ -22,6 +22,7 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
     savedMaskCache, setSavedMask,
     propagationStatus, propagationStartFrame,
     config, uncertaintyData,
+    classifierResults, showClassifierOverlay,
   } = store
 
   const confusionScore = uncertaintyData?.per_frame?.[String(currentFrame)]?.confusion_score ?? 0
@@ -64,16 +65,36 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
     }
   }, [masksToShow, width, height])
 
-  // Build object name lookup for mask labels
+  // Build object name lookup for mask labels.
+  // When the classifier overlay is active, replace each label with the predicted
+  // class name (+ confidence).  A "→" arrow and amber colour in the table make
+  // discrepancies obvious; here we just append the predicted name so it is
+  // readable directly on the canvas without extra canvas drawing code.
   const objectNames = useMemo(() => {
-    const names: Record<string, string> = {}
+    const baseNames: Record<string, string> = {}
     if (video?.objects) {
       for (const [objId, obj] of Object.entries(video.objects)) {
-        names[objId] = obj.name || objId
+        baseNames[objId] = obj.name || objId
+      }
+    }
+
+    if (!showClassifierOverlay || !classifierResults) return baseNames
+
+    const frameAsgn = classifierResults.frameAssignments[currentFrame]
+    if (!frameAsgn) return baseNames
+
+    const names: Record<string, string> = { ...baseNames }
+    for (const [samObjId, asgn] of Object.entries(frameAsgn)) {
+      const predName = video?.objects[asgn.predictedClass]?.name ?? asgn.predictedClass
+      const pct = Math.round(asgn.confidence * 100)
+      if (asgn.predictedClass !== samObjId) {
+        names[samObjId] = `${predName} (${pct}%) ⚠`
+      } else {
+        names[samObjId] = `${predName} ✓${pct}%`
       }
     }
     return names
-  }, [video?.objects])
+  }, [video?.objects, showClassifierOverlay, classifierResults, currentFrame])
 
   // ── Render loop: draw masks + points onto canvas ──────────────────────────
 

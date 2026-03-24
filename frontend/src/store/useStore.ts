@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { Project, VideoMeta, ObjectDef, MaskData, UncertaintyData, CorrectionRecord } from '../types'
+import type { Project, VideoMeta, ObjectDef, MaskData, UncertaintyData, CorrectionRecord, ClassifierResults } from '../types'
 import { evictMaskImages } from '../utils/maskUtils'
 
 // Max number of frames to keep in the in-memory mask cache.
@@ -14,7 +14,7 @@ let _savedMaskCacheOrder: number[] = []
 export type PointMode = 'add' | 'remove' | null
 export type PropagationStatus = 'idle' | 'running' | 'paused' | 'done' | 'error'
 export type AppStep = 'upload' | 'annotate' | 'review'
-export type ViewerTab = 'annotate' | 'player' | 'inference' | 'config' | 'uncertainty' | 'corrections'
+export type ViewerTab = 'annotate' | 'player' | 'inference' | 'config' | 'uncertainty' | 'corrections' | 'overlaps' | 'classifier'
 
 // ─── App config ───────────────────────────────────────────────────────────────
 
@@ -101,6 +101,12 @@ interface AppState {
   setUncertaintyData: (data: UncertaintyData | null) => void
   setCorrections: (records: CorrectionRecord[]) => void
 
+  // Classifier
+  classifierResults: ClassifierResults | null
+  showClassifierOverlay: boolean
+  setClassifierResults: (r: ClassifierResults | null) => void
+  setShowClassifierOverlay: (v: boolean) => void
+
   // Config
   config: AppConfig
   configDirty: boolean         // true when in-memory config differs from last localStorage save
@@ -171,6 +177,11 @@ export const useStore = create<AppState>((set, get) => ({
 
   setUncertaintyData: data => set({ uncertaintyData: data }),
   setCorrections: records => set({ corrections: records }),
+
+  classifierResults: null,
+  showClassifierOverlay: false,
+  setClassifierResults: r => set({ classifierResults: r }),
+  setShowClassifierOverlay: v => set({ showClassifierOverlay: v }),
 
   setProject: p => set({ project: p }),
 

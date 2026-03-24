@@ -412,15 +412,36 @@ class SAMPredictor:
             cx = float(xs.mean()) / w
             cy = float(ys.mean()) / h
             sample_points = [[cx, cy]]
-            # Add up to 4 more points evenly spaced along the mask's main diagonal
-            # (sorted by x+y), giving SAM coverage of the object's spatial extent.
-            N_EXTRA = 4
+            # Sample up to 24 more points evenly distributed across the mask using
+            # multiple sort orderings (main diagonal, anti-diagonal, horizontal,
+            # vertical) so all spatial quadrants of the object are represented.
+            # 25 total gives SAM strong appearance anchors for large or complex
+            # masks (e.g. a mouse partially occluded by another).
+            N_TOTAL = 25
             n = len(xs)
-            if n >= N_EXTRA + 1:
-                diag_order = np.argsort(xs + ys)
-                for i in range(1, N_EXTRA + 1):
-                    idx = diag_order[int(i * n / (N_EXTRA + 1))]
-                    sample_points.append([float(xs[idx]) / w, float(ys[idx]) / h])
+            if n >= 2:
+                orderings = [
+                    np.argsort(xs + ys),      # main diagonal  (bottom-left → top-right)
+                    np.argsort(xs - ys),      # anti-diagonal  (top-left  → bottom-right)
+                    np.argsort(xs),           # left → right
+                    np.argsort(ys),           # top  → bottom
+                    np.argsort(xs * xs + ys * ys),  # inner → outer
+                    np.argsort(-(xs * xs + ys * ys)),  # outer → inner
+                ]
+                seen: set[tuple[int, int]] = set()
+                per_ord = max(1, (N_TOTAL - 1) // len(orderings))
+                for order in orderings:
+                    steps = min(per_ord, n)
+                    for i in range(steps):
+                        idx = order[int(i * n / steps)]
+                        key = (int(xs[idx]), int(ys[idx]))
+                        if key not in seen:
+                            seen.add(key)
+                            sample_points.append([float(xs[idx]) / w, float(ys[idx]) / h])
+                        if len(sample_points) >= N_TOTAL:
+                            break
+                    if len(sample_points) >= N_TOTAL:
+                        break
             logger.debug(
                 f"add_mask_prompt: obj {obj_id} frame {frame_idx} → "
                 f"{len(sample_points)} seed point(s)"

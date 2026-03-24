@@ -228,6 +228,14 @@ class IdentityTracker:
         "max_area_ratio": 5.0,
         "max_centroid_jump": 0.25,
         "consecutive_reject_limit": 5,
+        # After consecutive_reject_limit consecutive rejections, force-accept the
+        # next prediction so the tracker can re-anchor when an object reappears
+        # after occlusion or a large legitimate motion.
+        "enable_reject_escape": True,
+        # Minimum acceptable mask size in pixels.  SAM occasionally outputs a
+        # mask with 0–99 pixels even when min_objects=1; treat these as absent
+        # and fall back to the previous frame's mask.
+        "min_mask_px": 100,
         # Entry confirmation window: after an object has been absent for
         # `entry_absence_threshold` consecutive frames, its next non-empty
         # prediction is treated as a *candidate* rather than a final mask.
@@ -308,18 +316,23 @@ class IdentityTracker:
         # Absent once reset when the window is confirmed or aborted.
         self._entry_candidates: dict[int, list[tuple[int, np.ndarray]]] = {}
 
+        # ── Per-object flag: force-accept SAM output on next frame ───────────
+        # Set when an occlusion window closes so the first post-divergence
+        # frame bypasses temporal rejection and lets SAM re-anchor.
+        self._force_accept_next: set[int] = set()
+
         # ── Occlusion / ghost propagation state ──────────────────────────────
         self.occlusion_windows: dict[tuple[int, int], OcclusionWindow] = {}
-        # Onset triggers (any one is sufficient)
-        self.ONSET_PROXIMITY = 0.12      # normalized centroid distance
-        self.ONSET_AREA_RATIO = 0.85     # union_area / sum_of_individual_areas
-        self.ONSET_TOUCH_MARGIN = 0.02   # fraction of min(H,W) for dilation touch-check
+        # Proximity check: dilation margin as fraction of min(H,W).
+        # Onset  = dilated masks touch  (closest points ≤ margin pixels apart).
+        # Diverge = dilated masks no longer touch.
+        self.ONSET_TOUCH_MARGIN = 0.01   # fraction of min(H,W) for dilation check
         # Velocity estimation
         self.VELOCITY_WINDOW = 8         # history frames for velocity estimate
         self.MAX_GHOST_FRAMES = 90       # clamp linear extrapolation after this many frames
         # Post-divergence identity resolution
         self.POST_DIVERGE_WAIT = 4       # stable SAM frames before resolving identity
-        self.DIVERGE_WIDTH_FRAC = 0.10   # min centroid separation as fraction of avg mask width
+        # (DIVERGE_WIDTH_FRAC removed — divergence now uses dilation-based touch check)
 
     def set_seed_annotations(self, obj_id: int, annotations: list[tuple[int, list, list]]):
         """Register original hand-labeled point prompts for fallback seeding."""
@@ -442,12 +455,18 @@ class IdentityTracker:
         frame_shape: tuple[int, int],
     ) -> set[tuple[int, int]]:
         """
-        Detect pairs of similar objects that are entering an occlusion event.
+        Detect pairs of similar objects whose masks are touching or overlapping.
+
+        "Touching" is defined as: the closest points on the two masks are within
+        ONSET_TOUCH_MARGIN * min(H, W) pixels of each other.  This is implemented
+        by dilating each mask by that margin and checking for intersection — no
+        intersection means the masks are farther apart than the threshold.
+
         Returns set of (a, b) pairs with a < b.
         """
         H, W = frame_shape
-        margin_px = max(3, int(min(H, W) * self.ONSET_TOUCH_MARGIN))
-        kernel = np.ones((margin_px, margin_px), np.uint8)
+        margin_px = max(1, int(min(H, W) * self.ONSET_TOUCH_MARGIN))
+        kernel = np.ones((margin_px * 2 + 1, margin_px * 2 + 1), np.uint8)
         triggered: set[tuple[int, int]] = set()
 
         for (a, b), sim in self.text_similarity.items():
@@ -464,36 +483,18 @@ class IdentityTracker:
             mask_b = sam_masks.get(b)
             if mask_a is None or mask_b is None:
                 continue
-            stats_a = compute_mask_stats(mask_a)
-            stats_b = compute_mask_stats(mask_b)
-            if stats_a is None or stats_b is None:
+            if not mask_a.astype(bool).any() or not mask_b.astype(bool).any():
                 continue
 
-            # Condition 1: centroids within ONSET_PROXIMITY
-            dx = stats_a.centroid[0] - stats_b.centroid[0]
-            dy = stats_a.centroid[1] - stats_b.centroid[1]
-            dist = float(np.sqrt(dx * dx + dy * dy))
-            proximity_triggered = dist < self.ONSET_PROXIMITY
-
-            # Condition 2: masks overlapping (union < sum of individual areas)
-            ma = mask_a.astype(bool)
-            mb = mask_b.astype(bool)
-            union_px = float((ma | mb).sum())
-            sum_px = float(ma.sum()) + float(mb.sum())
-            area_ratio = union_px / sum_px if sum_px > 0 else 1.0
-            area_triggered = area_ratio < self.ONSET_AREA_RATIO
-
-            # Condition 3: masks nearly touching (dilated masks intersect)
-            dilated_a = cv2.dilate(mask_a, kernel)
-            dilated_b = cv2.dilate(mask_b, kernel)
+            # Dilate both masks and check for intersection.
+            # Intersection ⟺ closest points on original masks ≤ margin_px pixels apart.
+            dilated_a = cv2.dilate(mask_a.astype(np.uint8), kernel)
+            dilated_b = cv2.dilate(mask_b.astype(np.uint8), kernel)
             touch_triggered = bool((dilated_a.astype(bool) & dilated_b.astype(bool)).any())
 
-            if proximity_triggered or area_triggered or touch_triggered:
+            if touch_triggered:
                 triggered.add(key)
-                logger.debug(
-                    f"Frame {frame_idx}: pair {key} onset "
-                    f"(prox={proximity_triggered}, area={area_triggered}, touch={touch_triggered})"
-                )
+                logger.debug(f"Frame {frame_idx}: pair {key} onset (dilation-touch, margin={margin_px}px)")
 
         return triggered
 
@@ -537,8 +538,18 @@ class IdentityTracker:
     ) -> set[tuple[int, int]]:
         """
         Detect pairs whose SAM masks have cleanly separated after an occlusion window.
+
+        Divergence is the inverse of onset: the pair is considered diverged when
+        the dilated masks (same margin as onset) no longer intersect, i.e. the
+        closest points on the two masks are more than ONSET_TOUCH_MARGIN * min(H,W)
+        pixels apart.
+
         Returns pairs to close.
         """
+        H, W = frame_shape
+        margin_px = max(1, int(min(H, W) * self.ONSET_TOUCH_MARGIN))
+        kernel = np.ones((margin_px * 2 + 1, margin_px * 2 + 1), np.uint8)
+
         diverged: set[tuple[int, int]] = set()
         for pair, window in self.occlusion_windows.items():
             if window.end_frame != -1:
@@ -548,21 +559,18 @@ class IdentityTracker:
             mask_b = sam_masks.get(b)
             if mask_a is None or mask_b is None:
                 continue
-            stats_a = compute_mask_stats(mask_a)
-            stats_b = compute_mask_stats(mask_b)
-            if stats_a is None or stats_b is None:
+            if not mask_a.astype(bool).any() or not mask_b.astype(bool).any():
                 continue
-            avg_width = (stats_a.bbox[2] + stats_b.bbox[2]) / 2.0
-            threshold = max(0.05, avg_width * self.DIVERGE_WIDTH_FRAC)
-            dx = stats_a.centroid[0] - stats_b.centroid[0]
-            dy = stats_a.centroid[1] - stats_b.centroid[1]
-            dist = float(np.sqrt(dx * dx + dy * dy))
-            iou = compute_iou(mask_a, mask_b)
-            if dist > threshold and iou < 0.05:
+
+            dilated_a = cv2.dilate(mask_a.astype(np.uint8), kernel)
+            dilated_b = cv2.dilate(mask_b.astype(np.uint8), kernel)
+            still_touching = bool((dilated_a.astype(bool) & dilated_b.astype(bool)).any())
+
+            if not still_touching:
                 diverged.add(pair)
                 logger.info(
                     f"Frame {frame_idx}: pair {pair} diverged "
-                    f"(dist={dist:.3f} > {threshold:.3f}, iou={iou:.3f})"
+                    f"(dilated masks no longer touch, margin={margin_px}px)"
                 )
         return diverged
 
@@ -828,6 +836,57 @@ class IdentityTracker:
     def entry_confirm_window(self) -> int:
         return int(self._tracking_params.get("entry_confirm_window", 5))
 
+    @property
+    def enable_reject_escape(self) -> bool:
+        return bool(self._tracking_params.get("enable_reject_escape", True))
+
+    @property
+    def min_mask_px(self) -> int:
+        return int(self._tracking_params.get("min_mask_px", 100))
+
+    # ── Ghost quality guard ───────────────────────────────────────────────────
+
+    def _sam_good_during_overlap(
+        self,
+        obj_id: int,
+        sam_mask: np.ndarray,
+        prev_mask: Optional[np.ndarray],
+        onset_frame: int,
+    ) -> bool:
+        """
+        Return True if the raw SAM output for obj_id is reliable enough during
+        an occlusion window that we should prefer it over the ghost mask.
+
+        Criteria:
+        1. SAM mask is non-empty.
+        2. Area has not collapsed: current area ≥ 0.3 × prev area.
+        3. Frame-to-frame IoU is at least 0.7 × the mean IoU seen in the last
+           N frames *before* the onset (using trajectory history).  This catches
+           cases where SAM suddenly jumps or merges without the IoU dropping to
+           zero, relative to the object's own baseline stability.
+        """
+        if int(sam_mask.astype(bool).sum()) < self.min_mask_px:
+            return False
+
+        if prev_mask is not None and prev_mask.astype(bool).any():
+            prev_area = float(prev_mask.astype(bool).sum())
+            curr_area = float(sam_mask.astype(bool).sum())
+            if prev_area > 0 and curr_area < 0.3 * prev_area:
+                return False  # collapsed
+
+            iou = compute_iou(sam_mask.astype(bool), prev_mask.astype(bool))
+
+            # Compare IoU against pre-onset trajectory baseline
+            traj = self.trajectories.get(obj_id)
+            if traj is not None and len(traj._history) >= 3:
+                pre_onset = [s.iou_with_prev for f, s in traj._history if f < onset_frame]
+                if pre_onset:
+                    mean_hist_iou = float(np.mean(pre_onset))
+                    if iou < 0.7 * mean_hist_iou and iou < self.min_iou_threshold:
+                        return False
+
+        return True
+
     # ── Temporal Consistency Validation ──────────────────────────────────────
 
     def validate_temporal_consistency(
@@ -1012,10 +1071,15 @@ class IdentityTracker:
 
         # ── Phase 0: update raw-absence counters and abort stale entry windows ─
         # Count BEFORE temporal validation so we know the pre-frame absence run.
+        # A mask below min_mask_px is treated as absent for entry-window purposes.
         prev_no_mask_run = dict(self._no_mask_run)
         for oid in self.object_ids:
             raw = sam_masks.get(oid)
-            if raw is None or not raw.astype(bool).any():
+            raw_absent = (
+                raw is None
+                or int(raw.astype(bool).sum()) < self.min_mask_px
+            )
+            if raw_absent:
                 self._no_mask_run[oid] = self._no_mask_run.get(oid, 0) + 1
                 # An absent frame during an entry window aborts it
                 if oid in self._entry_candidates:
@@ -1027,6 +1091,10 @@ class IdentityTracker:
             # else: don't reset yet — reset happens when mask is confirmed/committed
 
         # ── Phase 1: temporal consistency validation ──────────────────────────
+        # Consume and clear the post-divergence force-accept set before we loop.
+        force_accept_this_frame = set(self._force_accept_next)
+        self._force_accept_next.clear()
+
         for oid in self.object_ids:
             new_mask = sam_masks.get(oid)
             prev_mask = self._prev_masks.get(oid)
@@ -1045,21 +1113,31 @@ class IdentityTracker:
                     rejections[oid] = "no_sam_output"
                 continue
 
-            if force_accept:
+            # Per-object force-accept: set when an occlusion window just closed
+            # for this object (post-divergence re-anchor frame).
+            per_obj_force = oid in force_accept_this_frame
+
+            if force_accept or per_obj_force:
                 display[oid] = new_mask
                 tracking[oid] = new_mask
                 self._consecutive_rejects[oid] = 0
+                if per_obj_force and not force_accept:
+                    logger.info(f"Frame {frame_idx}, obj {oid}: post-divergence force-accept")
                 continue
 
-            # Empty mask: always fall back — never force-accept a zero-area mask.
-            # These don't count toward consecutive_rejects so they don't
-            # eventually trigger the force-accept escape hatch.
-            if not new_mask.astype(bool).any():
+            # Reject masks that are empty or below the minimum pixel count.
+            # These don't count toward consecutive_rejects (the escape hatch
+            # is for genuine position/IoU jumps, not SAM dropping an object).
+            mask_px = int(new_mask.astype(bool).sum())
+            if mask_px < self.min_mask_px:
                 if prev_mask is not None:
                     display[oid] = prev_mask.copy()
                     tracking[oid] = prev_mask.copy()
-                    rejections[oid] = "empty_mask"
-                    logger.debug(f"Frame {frame_idx}, obj {oid}: empty mask, using prev")
+                    rejections[oid] = f"small_mask:{mask_px}px"
+                    logger.debug(
+                        f"Frame {frame_idx}, obj {oid}: mask too small "
+                        f"({mask_px} < {self.min_mask_px}px), using prev"
+                    )
                 continue
 
             is_valid, reason, _ = self.validate_temporal_consistency(oid, new_mask, prev_mask)
@@ -1072,7 +1150,9 @@ class IdentityTracker:
                 consec = self._consecutive_rejects.get(oid, 0) + 1
                 self._consecutive_rejects[oid] = consec
 
-                if consec >= self.consecutive_reject_limit:
+                # Escape hatch: after N consecutive rejects, force-accept so
+                # the tracker can re-anchor after occlusion or large motion.
+                if self.enable_reject_escape and consec >= self.consecutive_reject_limit:
                     logger.warning(
                         f"Frame {frame_idx}, obj {oid}: accepting after {consec} consecutive rejects "
                         f"(reason: {reason})"
@@ -1198,13 +1278,44 @@ class IdentityTracker:
                     self._open_occlusion_window(frame_idx, key, sam_masks, frame_shape)
 
         # ── Phase 4: Ghost mask substitution during active occlusion windows ──
+        # Ghost masks are used only when the SAM output is unreliable (collapsed
+        # or large IoU drop vs trajectory baseline).  When SAM looks good we
+        # trust it and skip the ghost entirely.
+        #
+        # IMPORTANT: ghost masks are NEVER written into tracking_masks.  They are
+        # display-only fallbacks.  tracking_masks always stays on real SAM output
+        # or last_clean_mask so that the ghost never poisons future SAM state.
         if not force_accept and frame_shape is not None:
             ghost_masks = self._get_ghost_masks_for_frame(frame_idx, frame_shape)
             for oid, ghost in ghost_masks.items():
-                display[oid] = ghost
-                tracking[oid] = ghost
-                existing = rejections.get(oid, "")
-                rejections[oid] = (existing + "|ghost").lstrip("|")
+                # Determine which occlusion window this object is in (any active one)
+                onset_frame = -1
+                for pair, window in self.occlusion_windows.items():
+                    if window.end_frame == -1 and oid in pair:
+                        onset_frame = window.onset_frame
+                        break
+
+                sam_raw = sam_masks.get(oid)
+                prev_m = self._prev_masks.get(oid)
+                sam_ok = (
+                    sam_raw is not None
+                    and self._sam_good_during_overlap(oid, sam_raw, prev_m, onset_frame)
+                )
+
+                if sam_ok:
+                    # SAM is tracking well through the overlap — keep its output.
+                    # display and tracking are already set from Phase 1/2 above.
+                    logger.debug(
+                        f"Frame {frame_idx}, obj {oid}: SAM good during overlap, skipping ghost"
+                    )
+                else:
+                    # SAM has degraded — show ghost in display, but carry forward
+                    # last_clean_mask into tracking so SAM state stays uncontaminated.
+                    display[oid] = ghost
+                    clean = self.trajectories[oid].last_clean_mask if oid in self.trajectories else None
+                    tracking[oid] = clean.copy() if clean is not None else ghost
+                    existing = rejections.get(oid, "")
+                    rejections[oid] = (existing + "|ghost").lstrip("|")
 
         # ── Phase 5: Divergence check + post-diverge frame collection ─────────
         if not force_accept and frame_shape is not None:
@@ -1213,6 +1324,15 @@ class IdentityTracker:
                 key = (min(pair), max(pair))
                 if key in self.occlusion_windows:
                     self.occlusion_windows[key].end_frame = frame_idx
+                    # Flag both objects for force-accept on the next frame so SAM
+                    # can re-anchor cleanly after the overlap without temporal
+                    # validation rejecting its first post-divergence prediction.
+                    for _oid in key:
+                        self._force_accept_next.add(_oid)
+                    logger.info(
+                        f"Frame {frame_idx}: pair {key} diverged — "
+                        f"force-accept next frame for objs {key}"
+                    )
             # Collect stable SAM frames for closed-but-unresolved windows
             for key, window in self.occlusion_windows.items():
                 if window.end_frame != -1 and window.identity_map is None:
@@ -1601,6 +1721,52 @@ class IdentityTracker:
             "similarity_matrix": sim_matrix,
             "temporal_rejection_count": total_rejections,
         }
+
+    def build_overlaps_json(self) -> dict:
+        """
+        Serialize all occlusion windows to a JSON-safe dict for storage.
+        Returned structure:
+        {
+          "windows": [
+            {
+              "pair": [a, b],
+              "onset_frame": int,
+              "end_frame": int,          # -1 if still active
+              "frames": [onset..end],    # list of frame indices in window
+              "swap_detected": bool,
+              "identity_map": {str: str} | null,
+              "corrected": bool,
+            },
+            ...
+          ]
+        }
+        """
+        windows = []
+        for pair, window in self.occlusion_windows.items():
+            a, b = pair
+            end = window.end_frame
+            if end == -1:
+                frame_list = sorted(window.ghost_masks_by_frame.keys())
+            else:
+                frame_list = list(range(window.onset_frame, end + 1))
+
+            identity_map_json: Optional[dict] = None
+            if window.identity_map is not None:
+                identity_map_json = {str(k): str(v) for k, v in window.identity_map.items()}
+
+            windows.append({
+                "pair": [a, b],
+                "onset_frame": window.onset_frame,
+                "end_frame": end,
+                "frames": frame_list,
+                "swap_detected": bool(window.identity_map),
+                "identity_map": identity_map_json,
+                "corrected": window.corrected,
+            })
+
+        # Sort by onset frame
+        windows.sort(key=lambda w: w["onset_frame"])
+        return {"windows": windows}
 
     def build_correction_records(
         self,

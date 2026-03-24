@@ -5,15 +5,22 @@ Supports SAM3 (primary) with SAM2 fallback.
 
 import asyncio
 import functools
+import os
+import itertools
 import json
 import logging
 import shutil
 import tempfile
+import threading
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, BackgroundTasks
+import base64
+import cv2
+import io
+
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
@@ -38,6 +45,7 @@ from video_processor import (
 )
 
 STREAM_BATCH_SIZE = 1000  # frames extracted per streaming mini-batch
+ANCHOR_EVERY = 20         # re-seed SAM from carry-forward masks every N frames within a batch (0 = disabled)
 
 # Identity / confusion detection constants
 ANOMALY_THRESHOLD = 2.5           # z-score to flag a mask as anomalous
@@ -203,6 +211,64 @@ def _get_encoded_masks(masks_path: Path, objects: dict) -> dict:
 
     _mask_encode_cache[key] = mask_b64
     return mask_b64
+
+
+def _centroid_swap_correct(
+    sam_masks: dict[int, np.ndarray],
+    prev_masks: dict[int, np.ndarray],
+    min_distance_margin: float = 5.0,
+) -> dict[int, np.ndarray]:
+    """
+    At batch boundaries, SAM3 can mis-assign object IDs when objects have moved.
+    Compare centroids of the new SAM masks against the previous batch's last-frame
+    centroids and apply the lowest-cost permutation (Hungarian-style brute force for
+    small N).  Returns a remapped copy of sam_masks if a better assignment is found,
+    otherwise returns sam_masks unchanged.
+    """
+    common = [o for o in sam_masks if o in prev_masks]
+    if len(common) < 2:
+        return sam_masks
+
+    def _centroid(m: np.ndarray):
+        pts = np.argwhere(m.astype(bool))
+        return pts.mean(axis=0) if len(pts) > 0 else None
+
+    prev_c = {o: _centroid(prev_masks[o]) for o in common}
+    new_c  = {o: _centroid(sam_masks[o])  for o in common}
+    valid  = [o for o in common if prev_c[o] is not None and new_c[o] is not None]
+    if len(valid) < 2:
+        return sam_masks
+
+    # Identity cost: each new observation gets the same obj_id as before
+    identity_cost = sum(
+        float(np.linalg.norm(new_c[o] - prev_c[o])) for o in valid
+    )
+
+    best_cost = identity_cost
+    best_perm: list[int] = list(range(len(valid)))
+
+    for perm in itertools.permutations(range(len(valid))):
+        cost = sum(
+            float(np.linalg.norm(new_c[valid[i]] - prev_c[valid[perm[i]]]))
+            for i in range(len(valid))
+        )
+        if cost < best_cost - min_distance_margin:
+            best_cost = cost
+            best_perm = list(perm)
+
+    if best_perm == list(range(len(valid))):
+        return sam_masks  # identity is already optimal
+
+    # Build remapped dict: the mask currently labelled valid[i] should be valid[best_perm[i]]
+    remapped = dict(sam_masks)
+    temp = {valid[best_perm[i]]: sam_masks[valid[i]] for i in range(len(valid))}
+    remapped.update(temp)
+    logger.info(
+        f"Centroid swap correction applied: "
+        f"{[(valid[i], valid[best_perm[i]]) for i in range(len(valid)) if best_perm[i] != i]} "
+        f"(cost {identity_cost:.1f} → {best_cost:.1f})"
+    )
+    return remapped
 
 
 def _invalidate_mask_cache(pid: str, vid: str) -> None:
@@ -661,6 +727,7 @@ def update_tracking_params(pid: str, vid: str, params: dict):
     # stays in sync automatically, and include identity_tracker-specific keys.
     allowed_keys = set(pm.default_tracking_params().keys()) | {
         "entry_absence_threshold", "entry_confirm_window",
+        "enable_reject_escape", "min_mask_px",
     }
     invalid_keys = set(params.keys()) - allowed_keys
     if invalid_keys:
@@ -2723,12 +2790,18 @@ async def _run_propagation_bg(
                     yield {"event": "error", "data": json.dumps({"error": f"Prompt setup failed: {e}"})}
                     return
 
-                # ── 6. Run propagation ────────────────────────────────────
-                queue: asyncio.Queue = asyncio.Queue(maxsize=50)
+                # ── 6. Run propagation (with periodic re-anchoring) ───────
                 # Initialise from previous batch so objects that SAM temporarily
                 # loses near the end of a batch still have a carry-forward mask.
                 last_frame_masks: dict = dict(prev_batch_last_masks) if prev_batch_last_masks else {}
                 batch_frame_count = 0
+
+                # Track the sub-tmp directory used for re-anchor sub-batches so we can clean it up.
+                _current_sub_tmp: "Path | None" = None
+                # Flag so the break/re-anchor logic can distinguish the first sub-batch
+                # (which uses the full tmp_dir session with existing seeding) from
+                # re-anchor sub-batches (which use a limited sub-tmp seeded from per-frame prediction).
+                _is_first_sub: bool = True
 
                 # Always propagate forward.  For the first batch, start from
                 # the annotated frame (not frame 0) — SAM needs the prompt
@@ -2737,318 +2810,583 @@ async def _run_propagation_bg(
                 # nothing was annotated there.
                 # Subsequent batches start from batch_start (seeded via masks).
                 if batch_idx == 0 and sam3_annotated_frame is not None:
-                    _start = sam3_annotated_frame
+                    _sub_start = sam3_annotated_frame
                 else:
-                    _start = batch_start
+                    _sub_start = batch_start
                 _direction = "forward"
+                # real_frame_idx must be defined before the sub-batch loop so
+                # re-anchoring can reference the last processed frame.
+                real_frame_idx: int = _sub_start
 
-                def _run_propagation(
-                    b_start=batch_start, b_len=batch_len,
-                    s3_start=_start, direction=_direction,
-                ):
-                    try:
-                        prop_iter = sam.propagate_stream(
-                            pid, vid,
-                            start_frame_idx=s3_start,
-                            max_frame_num_to_track=b_len if not is_sam3 else None,
-                            propagation_direction=direction,
-                        )
-                        for item in prop_iter:
+                # Sub-batch loop: the first sub-batch uses the full tmp_dir session
+                # (seeded by section 5 above) and is stopped via stop_event after
+                # ANCHOR_EVERY frames.  Subsequent re-anchor sub-batches each get a
+                # fresh sub-tmp directory containing only ANCHOR_EVERY frames with
+                # symlinks to the original tmp_dir files, so SAM's frame-0 is always
+                # the anchor start frame — this ensures seeding at SAM index 0 (the
+                # only index that works reliably for SAM3).
+                # At each anchor point the anchor frame is predicted via per-frame
+                # SAM inference using only the original user annotations (no temporal
+                # drift from propagation), then used to seed the next sub-batch.
+                import concurrent.futures
+                while True:
+                    queue: asyncio.Queue = asyncio.Queue(maxsize=50)
+                    stop_event = threading.Event()
+
+                    def _run_propagation(
+                        b_len=batch_len,
+                        s3_start=_sub_start,
+                        direction=_direction,
+                        _stop=stop_event,
+                        _queue=queue,
+                    ):
+                        try:
+                            prop_iter = sam.propagate_stream(
+                                pid, vid,
+                                start_frame_idx=s3_start,
+                                max_frame_num_to_track=b_len if not is_sam3 else None,
+                                propagation_direction=direction,
+                            )
+                            _stopped = False
+                            for item in prop_iter:
+                                asyncio.run_coroutine_threadsafe(
+                                    _queue.put(("frame", item)), loop
+                                ).result()
+                                if _stop.is_set():
+                                    _stopped = True
+                                    break
                             asyncio.run_coroutine_threadsafe(
-                                queue.put(("frame", item)), loop
+                                _queue.put(("stopped" if _stopped else "done", None)), loop
                             ).result()
-                    except Exception as exc:
-                        asyncio.run_coroutine_threadsafe(
-                            queue.put(("error", exc)), loop
-                        ).result()
-                    finally:
-                        asyncio.run_coroutine_threadsafe(
-                            queue.put(("done", None)), loop
-                        ).result()
+                        except Exception as exc:
+                            asyncio.run_coroutine_threadsafe(
+                                _queue.put(("error", exc)), loop
+                            ).result()
+                            asyncio.run_coroutine_threadsafe(
+                                _queue.put(("done", None)), loop
+                            ).result()
 
-                executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-                loop.run_in_executor(executor, _run_propagation)
+                    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                    loop.run_in_executor(executor, _run_propagation)
 
-                try:
-                    while True:
-                        msg_type, payload = await queue.get()
-                        if msg_type == "error":
-                            raise payload
-                        if msg_type == "done":
-                            break
+                    _sub_frames = 0   # frames consumed in this sub-batch
+                    _sub_done = True  # True = natural end of batch, False = anchor stop
 
-                        # ── Translate SAM's internal sequential index → real frame index
-                        item = payload
-                        sam_idx = item.get("frame_index", batch_frame_count)
-                        real_frame_idx = sam.to_real_idx(pid, vid, sam_idx)
+                    try:
+                        while True:
+                            msg_type, payload = await queue.get()
+                            if msg_type == "error":
+                                raise payload
+                            if msg_type in ("done", "stopped"):
+                                _sub_done = (msg_type == "done")
+                                break
 
-                        frame_outputs = item.get("outputs", {})
-                        if isinstance(frame_outputs, dict):
-                            # SAM3 keys outputs by its internal index; try both forms
-                            fo = (frame_outputs.get(sam_idx)
-                                  or frame_outputs.get(str(sam_idx))
-                                  or frame_outputs.get(real_frame_idx)
-                                  or frame_outputs.get(str(real_frame_idx))
-                                  or frame_outputs)
-                        else:
-                            fo = {}
+                            # ── Translate SAM's internal sequential index → real frame index
+                            item = payload
+                            sam_idx = item.get("frame_index", batch_frame_count)
+                            real_frame_idx = sam.to_real_idx(pid, vid, sam_idx)
+                            _sub_frames += 1
 
-                        obj_ids = fo.get("out_obj_ids", [])
-                        masks_raw = fo.get("out_binary_masks", [])
-                        boxes_raw = fo.get("out_boxes_xywh", [])
-                        probs_raw = fo.get("out_probs", [])
-
-                        # Build raw masks dict from SAM output
-                        sam_output_masks: dict[int, np.ndarray] = {}
-                        bboxes_to_save: dict = {}
-
-                        for i, oid in enumerate(obj_ids):
-                            if i < len(masks_raw):
-                                mask = masks_raw[i]
-                                if hasattr(mask, "numpy"):
-                                    mask = mask.numpy()
-                                mask = np.squeeze(mask).astype(np.uint8)
-                                sam_output_masks[int(oid)] = mask
-                            if i < len(boxes_raw):
-                                box = boxes_raw[i]
-                                if hasattr(box, "tolist"):
-                                    box = box.tolist()
-                                score = float(probs_raw[i]) if i < len(probs_raw) else 1.0
-                                bboxes_to_save[str(oid)] = list(box) + [score]
-
-                        # ── Dual-candidate selection ────────────────────────
-                        # When dual_candidate mode is active, compare the
-                        # temporal SAM output mask against the corresponding
-                        # seed-pass mask.  For each object, keep whichever
-                        # candidate has higher IoU with the last accepted mask.
-                        # This lets a fresh annotation-grounded prediction win
-                        # over a temporally-drifted one.
-                        if seed_pass_masks:
-                            _dc_seed_frame = seed_pass_masks.get(real_frame_idx, {})
-                            for _dc_oid in list(sam_output_masks.keys()):
-                                _dc_t_mask = sam_output_masks.get(_dc_oid)
-                                _dc_s_mask = _dc_seed_frame.get(_dc_oid)
-                                if _dc_s_mask is None or not _dc_s_mask.astype(bool).any():
-                                    continue
-                                _dc_prev = last_frame_masks.get(_dc_oid)
-                                if _dc_prev is None or not _dc_prev.astype(bool).any():
-                                    continue
-                                _dc_iou_t = (
-                                    compute_iou(_dc_t_mask.astype(bool), _dc_prev.astype(bool))
-                                    if _dc_t_mask is not None and _dc_t_mask.astype(bool).any()
-                                    else 0.0
-                                )
-                                _dc_iou_s = compute_iou(_dc_s_mask.astype(bool), _dc_prev.astype(bool))
-                                if _dc_iou_s > _dc_iou_t + DUAL_CANDIDATE_IOU_MARGIN:
-                                    sam_output_masks[_dc_oid] = _dc_s_mask
-                                    logger.debug(
-                                        f"Frame {real_frame_idx}: obj {_dc_oid} → seed candidate "
-                                        f"(IoU temporal={_dc_iou_t:.3f}, seed={_dc_iou_s:.3f})"
+                            frame_outputs = item.get("outputs", {})
+                            if isinstance(frame_outputs, dict):
+                                # SAM3 keys outputs by its internal index; try both forms
+                                fo = (frame_outputs.get(sam_idx)
+                                      or frame_outputs.get(str(sam_idx))
+                                      or frame_outputs.get(real_frame_idx)
+                                      or frame_outputs.get(str(real_frame_idx))
+                                      or frame_outputs)
+                            else:
+                                fo = {}
+    
+                            obj_ids = fo.get("out_obj_ids", [])
+                            masks_raw = fo.get("out_binary_masks", [])
+                            boxes_raw = fo.get("out_boxes_xywh", [])
+                            probs_raw = fo.get("out_probs", [])
+    
+                            # Build raw masks dict from SAM output
+                            sam_output_masks: dict[int, np.ndarray] = {}
+                            bboxes_to_save: dict = {}
+    
+                            for i, oid in enumerate(obj_ids):
+                                if i < len(masks_raw):
+                                    mask = masks_raw[i]
+                                    if hasattr(mask, "numpy"):
+                                        mask = mask.numpy()
+                                    mask = np.squeeze(mask).astype(np.uint8)
+                                    sam_output_masks[int(oid)] = mask
+                                if i < len(boxes_raw):
+                                    box = boxes_raw[i]
+                                    if hasattr(box, "tolist"):
+                                        box = box.tolist()
+                                    score = float(probs_raw[i]) if i < len(probs_raw) else 1.0
+                                    bboxes_to_save[str(oid)] = list(box) + [score]
+    
+                            # ── Dual-candidate selection ────────────────────────
+                            # When dual_candidate mode is active, compare the
+                            # temporal SAM output mask against the corresponding
+                            # seed-pass mask.  For each object, keep whichever
+                            # candidate has higher IoU with the last accepted mask.
+                            # This lets a fresh annotation-grounded prediction win
+                            # over a temporally-drifted one.
+                            if seed_pass_masks:
+                                _dc_seed_frame = seed_pass_masks.get(real_frame_idx, {})
+                                for _dc_oid in list(sam_output_masks.keys()):
+                                    _dc_t_mask = sam_output_masks.get(_dc_oid)
+                                    _dc_s_mask = _dc_seed_frame.get(_dc_oid)
+                                    if _dc_s_mask is None or not _dc_s_mask.astype(bool).any():
+                                        continue
+                                    _dc_prev = last_frame_masks.get(_dc_oid)
+                                    if _dc_prev is None or not _dc_prev.astype(bool).any():
+                                        continue
+                                    _dc_iou_t = (
+                                        compute_iou(_dc_t_mask.astype(bool), _dc_prev.astype(bool))
+                                        if _dc_t_mask is not None and _dc_t_mask.astype(bool).any()
+                                        else 0.0
                                     )
-                            # Also recover objects that temporal missed but seed found
-                            for _dc_oid, _dc_s_mask in _dc_seed_frame.items():
-                                if _dc_oid in sam_output_masks:
-                                    continue  # already have temporal result
-                                if not _dc_s_mask.astype(bool).any():
-                                    continue
-                                _dc_prev = last_frame_masks.get(_dc_oid)
-                                if _dc_prev is None or not _dc_prev.astype(bool).any():
-                                    continue
-                                _dc_iou_s = compute_iou(_dc_s_mask.astype(bool), _dc_prev.astype(bool))
-                                if _dc_iou_s > DUAL_CANDIDATE_IOU_MARGIN:
-                                    sam_output_masks[_dc_oid] = _dc_s_mask
-                                    logger.debug(
-                                        f"Frame {real_frame_idx}: obj {_dc_oid} → seed-only recovery "
-                                        f"(IoU={_dc_iou_s:.3f})"
-                                    )
-
-                        # ── Trial-object plausibility filter ───────────────
-                        # For objects seeded with annotation prompts this batch
-                        # (because they were absent), validate that SAM's output
-                        # looks like a real re-detection before accepting it.
-                        # "Plausible" means the mask area is within a reasonable
-                        # multiple of the object's historical average area.
-                        # False positives (SAM picking up background at the old
-                        # annotation coordinates) are suppressed here.
-                        for _oid in list(trial_objects):
-                            raw_m = sam_output_masks.get(_oid)
-                            if raw_m is None or not raw_m.astype(bool).any():
-                                continue  # still empty — nothing to validate
-                            traj = tracker.trajectories.get(_oid)
-                            if traj and len(traj._history) >= 3:
-                                mean_area = float(np.mean([s.area for _, s in traj._history]))
-                                frame_px = raw_m.size
-                                pred_area = float(raw_m.astype(bool).sum()) / frame_px
-                                if mean_area > 0:
-                                    ratio = pred_area / mean_area
-                                    plausible = 0.15 <= ratio <= 8.0
+                                    _dc_iou_s = compute_iou(_dc_s_mask.astype(bool), _dc_prev.astype(bool))
+                                    if _dc_iou_s > _dc_iou_t + DUAL_CANDIDATE_IOU_MARGIN:
+                                        sam_output_masks[_dc_oid] = _dc_s_mask
+                                        logger.debug(
+                                            f"Frame {real_frame_idx}: obj {_dc_oid} → seed candidate "
+                                            f"(IoU temporal={_dc_iou_t:.3f}, seed={_dc_iou_s:.3f})"
+                                        )
+                                # Also recover objects that temporal missed but seed found
+                                for _dc_oid, _dc_s_mask in _dc_seed_frame.items():
+                                    if _dc_oid in sam_output_masks:
+                                        continue  # already have temporal result
+                                    if not _dc_s_mask.astype(bool).any():
+                                        continue
+                                    _dc_prev = last_frame_masks.get(_dc_oid)
+                                    if _dc_prev is None or not _dc_prev.astype(bool).any():
+                                        continue
+                                    _dc_iou_s = compute_iou(_dc_s_mask.astype(bool), _dc_prev.astype(bool))
+                                    if _dc_iou_s > DUAL_CANDIDATE_IOU_MARGIN:
+                                        sam_output_masks[_dc_oid] = _dc_s_mask
+                                        logger.debug(
+                                            f"Frame {real_frame_idx}: obj {_dc_oid} → seed-only recovery "
+                                            f"(IoU={_dc_iou_s:.3f})"
+                                        )
+    
+                            # ── Trial-object plausibility filter ───────────────
+                            # For objects seeded with annotation prompts this batch
+                            # (because they were absent), validate that SAM's output
+                            # looks like a real re-detection before accepting it.
+                            # "Plausible" means the mask area is within a reasonable
+                            # multiple of the object's historical average area.
+                            # False positives (SAM picking up background at the old
+                            # annotation coordinates) are suppressed here.
+                            for _oid in list(trial_objects):
+                                raw_m = sam_output_masks.get(_oid)
+                                if raw_m is None or not raw_m.astype(bool).any():
+                                    continue  # still empty — nothing to validate
+                                traj = tracker.trajectories.get(_oid)
+                                if traj and len(traj._history) >= 3:
+                                    mean_area = float(np.mean([s.area for _, s in traj._history]))
+                                    frame_px = raw_m.size
+                                    pred_area = float(raw_m.astype(bool).sum()) / frame_px
+                                    if mean_area > 0:
+                                        ratio = pred_area / mean_area
+                                        plausible = 0.15 <= ratio <= 8.0
+                                    else:
+                                        plausible = pred_area > 5e-4  # any non-trivial mask
                                 else:
-                                    plausible = pred_area > 5e-4  # any non-trivial mask
+                                    # No history: accept anything non-trivial
+                                    frame_px = raw_m.size
+                                    plausible = float(raw_m.astype(bool).sum()) / frame_px > 5e-4
+    
+                                if plausible:
+                                    # Object successfully re-detected — graduate from trial mode
+                                    trial_objects.discard(_oid)
+                                    obj_sam_empty_consec[_oid] = 0  # reset absence counter
+                                    logger.info(
+                                        f"Frame {real_frame_idx}: obj {_oid} re-detected "
+                                        f"(area={float(raw_m.astype(bool).sum())/raw_m.size:.4f})"
+                                    )
+                                else:
+                                    # Implausible — suppress this prediction so it
+                                    # doesn't corrupt the tracking state.
+                                    sam_output_masks[_oid] = np.zeros_like(raw_m)
+                                    logger.debug(
+                                        f"Frame {real_frame_idx}: obj {_oid} trial prediction "
+                                        f"suppressed (implausible area)"
+                                    )
+    
+                            # ── Track per-object SAM absence ───────────────────
+                            # Count consecutive frames with empty raw SAM output so we
+                            # can detect objects that have genuinely left the frame by
+                            # the end of a batch (and avoid seeding them next batch).
+                            for _oid in obj_ids_int:
+                                raw_m = sam_output_masks.get(_oid)
+                                if raw_m is None or not raw_m.astype(bool).any():
+                                    obj_sam_empty_consec[_oid] = obj_sam_empty_consec.get(_oid, 0) + 1
+                                else:
+                                    obj_sam_empty_consec[_oid] = 0
+                                    ever_detected.add(_oid)
+    
+                            # ── Temporal Consistency Validation ────────────────
+                            fresh_video = pm.get_video(pid, vid)
+    
+                            if propagation_mode == "per_frame":
+                                # Per-frame mode: skip all temporal filtering.
+                                # Save raw SAM output directly (non-empty masks only).
+                                display_masks = {
+                                    oid: mask for oid, mask in sam_output_masks.items()
+                                    if mask is not None and mask.astype(bool).any()
+                                }
+                                tracking_masks = display_masks
+                                rejections: dict = {}
+                                retroactive_masks: dict = {}
                             else:
-                                # No history: accept anything non-trivial
-                                frame_px = raw_m.size
-                                plausible = float(raw_m.astype(bool).sum()) / frame_px > 5e-4
-
-                            if plausible:
-                                # Object successfully re-detected — graduate from trial mode
-                                trial_objects.discard(_oid)
-                                obj_sam_empty_consec[_oid] = 0  # reset absence counter
-                                logger.info(
-                                    f"Frame {real_frame_idx}: obj {_oid} re-detected "
-                                    f"(area={float(raw_m.astype(bool).sum())/raw_m.size:.4f})"
+                                # Temporal tracking mode: filter masks that are
+                                # inconsistent (big jumps in position/size/IoU) and
+                                # fall back to the previous frame.
+    
+                                # Refresh tracking params from video config (allows real-time updates)
+                                if fresh_video:
+                                    fresh_params = fresh_video.get("tracking_params", {})
+                                    tracker.update_tracking_params(fresh_params)
+    
+                                is_first_frame = (real_frame_idx == batch_start)
+    
+                                # ── Centroid swap correction at batch boundaries ──────────────
+                                # SAM3 can mis-assign object IDs at the first frame of a new
+                                # batch because add_mask_prompt uses center-of-mass points that
+                                # may have shifted between batches.  Check whether any permutation
+                                # of the new SAM mask labels achieves a lower total centroid
+                                # distance to the previous batch's last masks; if so, remap.
+                                if is_first_frame and prev_batch_last_masks and len(sam_output_masks) >= 2:
+                                    sam_output_masks = _centroid_swap_correct(
+                                        sam_output_masks, prev_batch_last_masks
+                                    )
+    
+                                _fshape = (
+                                    (fresh_video["height"], fresh_video["width"])
+                                    if fresh_video else None
                                 )
-                            else:
-                                # Implausible — suppress this prediction so it
-                                # doesn't corrupt the tracking state.
-                                sam_output_masks[_oid] = np.zeros_like(raw_m)
-                                logger.debug(
-                                    f"Frame {real_frame_idx}: obj {_oid} trial prediction "
-                                    f"suppressed (implausible area)"
+                                display_masks, tracking_masks, rejections, retroactive_masks = tracker.validate_and_filter_masks(
+                                    real_frame_idx,
+                                    sam_output_masks,
+                                    force_accept=is_first_frame,
+                                    frame_shape=_fshape,
                                 )
+                                if rejections:
+                                    logger.debug(f"Frame {real_frame_idx} rejections: {rejections}")
+    
+                                # Retroactively save masks for objects whose entry window
+                                # just confirmed.  These frames were withheld from disk
+                                # until enough consecutive detections validated them.
+                                for _r_oid, _r_frames in retroactive_masks.items():
+                                    for _r_fidx, _r_mask in _r_frames:
+                                        _r_path = masks_dir / f"{_r_fidx:06d}.npz"
+                                        try:
+                                            # Merge with existing masks (other objects may
+                                            # already have data saved at this frame).
+                                            if _r_path.exists():
+                                                existing = load_masks_npz(str(_r_path))
+                                                existing[str(_r_oid)] = _r_mask
+                                                save_masks_npz(str(_r_path), existing)
+                                            else:
+                                                save_masks_npz(str(_r_path), {str(_r_oid): _r_mask})
+                                            logger.info(
+                                                f"Retroactive save: obj {_r_oid} @ frame {_r_fidx}"
+                                            )
+                                        except Exception as _re:
+                                            logger.warning(
+                                                f"Retroactive save failed obj {_r_oid} @ {_r_fidx}: {_re}"
+                                            )
+    
+                            # display_masks → saved to disk (SAM output; shows what the model saw)
+                            # tracking_masks → carry-forward state (clean masks during confusion)
+                            masks_to_save = {str(k): v for k, v in display_masks.items()}
+    
+                            # Use tracking_masks (not display_masks) for next-frame seeding so
+                            # overlap-confused predictions don't poison future tracking state.
+                            for _oid, _m in tracking_masks.items():
+                                if _m.any():
+                                    last_frame_masks[_oid] = _m
 
-                        # ── Track per-object SAM absence ───────────────────
-                        # Count consecutive frames with empty raw SAM output so we
-                        # can detect objects that have genuinely left the frame by
-                        # the end of a batch (and avoid seeding them next batch).
-                        for _oid in obj_ids_int:
-                            raw_m = sam_output_masks.get(_oid)
-                            if raw_m is None or not raw_m.astype(bool).any():
-                                obj_sam_empty_consec[_oid] = obj_sam_empty_consec.get(_oid, 0) + 1
-                            else:
-                                obj_sam_empty_consec[_oid] = 0
-                                ever_detected.add(_oid)
-
-                        # ── Temporal Consistency Validation ────────────────
-                        fresh_video = pm.get_video(pid, vid)
-
-                        if propagation_mode == "per_frame":
-                            # Per-frame mode: skip all temporal filtering.
-                            # Save raw SAM output directly (non-empty masks only).
-                            display_masks = {
-                                oid: mask for oid, mask in sam_output_masks.items()
-                                if mask is not None and mask.astype(bool).any()
-                            }
-                            tracking_masks = display_masks
-                            rejections: dict = {}
-                            retroactive_masks: dict = {}
-                        else:
-                            # Temporal tracking mode: filter masks that are
-                            # inconsistent (big jumps in position/size/IoU) and
-                            # fall back to the previous frame.
-
-                            # Refresh tracking params from video config (allows real-time updates)
-                            if fresh_video:
-                                fresh_params = fresh_video.get("tracking_params", {})
-                                tracker.update_tracking_params(fresh_params)
-
-                            is_first_frame = (real_frame_idx == batch_start)
-                            _fshape = (
-                                (fresh_video["height"], fresh_video["width"])
-                                if fresh_video else None
-                            )
-                            display_masks, tracking_masks, rejections, retroactive_masks = tracker.validate_and_filter_masks(
+                            # Identity tracker sees display masks (what SAM produced)
+                            current_frame_masks = display_masks
+    
+                            if masks_to_save:
+                                masks_path = masks_dir / f"{real_frame_idx:06d}.npz"
+                                save_masks_npz(str(masks_path), masks_to_save)
+                                # Save to masks_raw/ only if it doesn't exist yet
+                                # (preserve the very first propagation pass)
+                                raw_path = masks_raw_dir / f"{real_frame_idx:06d}.npz"
+                                if not raw_path.exists():
+                                    save_masks_npz(str(raw_path), masks_to_save)
+                            if bboxes_to_save:
+                                save_bboxes_json(str(bboxes_dir / f"{real_frame_idx:06d}.json"), bboxes_to_save)
+    
+                            # ── Update IdentityTracker ────────────────────────
+                            tracker.update_frame(
                                 real_frame_idx,
-                                sam_output_masks,
-                                force_accept=is_first_frame,
-                                frame_shape=_fshape,
+                                current_frame_masks,
+                                {int(k): v for k, v in bboxes_to_save.items()},
                             )
-                            if rejections:
-                                logger.debug(f"Frame {real_frame_idx} rejections: {rejections}")
+                            confusion_score = tracker.confusion_scores.get(real_frame_idx, 0.0)
+    
+                            # Collect seed-frame masks (earliest annotated frames)
+                            if sam3_annotated_frame is not None and real_frame_idx == sam3_annotated_frame:
+                                seed_frame_masks = {int(k): v for k, v in current_frame_masks.items()}
+    
+                            # Collect post-window masks for swap detection
+                            confusion_windows_so_far = tracker.get_confusion_windows()
+                            for w_idx, window in enumerate(confusion_windows_so_far):
+                                w_end = window["end"]
+                                # Capture masks from frames just after window ends
+                                if w_end < real_frame_idx <= w_end + N_POST_WINDOW_FRAMES:
+                                    if w_idx not in post_window_masks_by_window:
+                                        post_window_masks_by_window[w_idx] = {}
+                                    for oid_int, m in current_frame_masks.items():
+                                        if oid_int not in post_window_masks_by_window[w_idx]:
+                                            post_window_masks_by_window[w_idx][oid_int] = m
+    
+                            pm.mark_frame_propagated(pid, vid, real_frame_idx)
+                            batch_frame_count += 1
+                            total_propagated += 1
+                            progress = total_propagated / num_frames if num_frames > 0 else 1.0
+    
+                            yield {
+                                "event": "progress",
+                                "data": json.dumps({
+                                    "frame": real_frame_idx,
+                                    "progress": round(progress, 4),
+                                    "done": False,
+                                    "batch": batch_idx,
+                                    "batch_start": batch_start,
+                                    "batch_end": batch_end,
+                                    "obj_ids": [str(o) for o in obj_ids],
+                                    "uncertainty_score": round(confusion_score, 4),
+                                }),
+                            }
+    
+                            # For the first sub-batch (full tmp_dir session): stop the
+                            # propagation thread after ANCHOR_EVERY frames so we can
+                            # re-anchor.  For re-anchor sub-batches the sub-tmp dir has
+                            # exactly ANCHOR_EVERY frames and SAM stops naturally, but
+                            # setting the event is harmless (the thread already exited).
+                            if ANCHOR_EVERY > 0 and _sub_frames >= ANCHOR_EVERY:
+                                stop_event.set()
 
-                            # Retroactively save masks for objects whose entry window
-                            # just confirmed.  These frames were withheld from disk
-                            # until enough consecutive detections validated them.
-                            for _r_oid, _r_frames in retroactive_masks.items():
-                                for _r_fidx, _r_mask in _r_frames:
-                                    _r_path = masks_dir / f"{_r_fidx:06d}.npz"
-                                    try:
-                                        # Merge with existing masks (other objects may
-                                        # already have data saved at this frame).
-                                        if _r_path.exists():
-                                            existing = load_masks_npz(str(_r_path))
-                                            existing[str(_r_oid)] = _r_mask
-                                            save_masks_npz(str(_r_path), existing)
-                                        else:
-                                            save_masks_npz(str(_r_path), {str(_r_oid): _r_mask})
-                                        logger.info(
-                                            f"Retroactive save: obj {_r_oid} @ frame {_r_fidx}"
-                                        )
-                                    except Exception as _re:
-                                        logger.warning(
-                                            f"Retroactive save failed obj {_r_oid} @ {_r_fidx}: {_re}"
-                                        )
+                    except Exception as e:
+                        logger.error(f"Propagation error in batch {batch_idx}: {e}", exc_info=True)
+                        yield {"event": "error", "data": json.dumps({"error": str(e)})}
+                        return
 
-                        # display_masks → saved to disk (SAM output; shows what the model saw)
-                        # tracking_masks → carry-forward state (clean masks during confusion)
-                        masks_to_save = {str(k): v for k, v in display_masks.items()}
+                    # ── Re-anchor or end sub-batch loop ────────────────────
+                    _was_first_sub = _is_first_sub
+                    _is_first_sub = False
 
-                        # Use tracking_masks (not display_masks) for next-frame seeding so
-                        # overlap-confused predictions don't poison future tracking state.
-                        for _oid, _m in tracking_masks.items():
-                            if _m.any():
-                                last_frame_masks[_oid] = _m
-
-                        # Identity tracker sees display masks (what SAM produced)
-                        current_frame_masks = display_masks
-
-                        if masks_to_save:
-                            masks_path = masks_dir / f"{real_frame_idx:06d}.npz"
-                            save_masks_npz(str(masks_path), masks_to_save)
-                            # Save to masks_raw/ only if it doesn't exist yet
-                            # (preserve the very first propagation pass)
-                            raw_path = masks_raw_dir / f"{real_frame_idx:06d}.npz"
-                            if not raw_path.exists():
-                                save_masks_npz(str(raw_path), masks_to_save)
-                        if bboxes_to_save:
-                            save_bboxes_json(str(bboxes_dir / f"{real_frame_idx:06d}.json"), bboxes_to_save)
-
-                        # ── Update IdentityTracker ────────────────────────
-                        tracker.update_frame(
-                            real_frame_idx,
-                            current_frame_masks,
-                            {int(k): v for k, v in bboxes_to_save.items()},
+                    if real_frame_idx + 1 >= batch_end:
+                        # All frames in this extraction batch have been processed.
+                        break
+                    if _was_first_sub and _sub_done:
+                        # First sub-batch ended naturally (short batch / video).
+                        break
+                    if _sub_frames == 0:
+                        # No frames were produced — propagation failed silently.
+                        logger.warning(
+                            f"Batch {batch_idx}: sub-batch from {_sub_start} produced 0 frames; ending batch."
                         )
-                        confusion_score = tracker.confusion_scores.get(real_frame_idx, 0.0)
+                        break
 
-                        # Collect seed-frame masks (earliest annotated frames)
-                        if sam3_annotated_frame is not None and real_frame_idx == sam3_annotated_frame:
-                            seed_frame_masks = {int(k): v for k, v in current_frame_masks.items()}
+                    # ── Periodic re-anchor: per-frame prediction from original seed ──
+                    # The anchor frame (first frame of the next sub-batch) is predicted
+                    # using only the original user annotations — no temporal context from
+                    # propagation.  A mini SAM session containing just the annotated
+                    # frames + the anchor frame image is used, point prompts are replayed,
+                    # and the result is saved to disk.  The next propagation sub-batch is
+                    # then seeded from this clean per-frame output.
+                    _anchor_real    = real_frame_idx
+                    _anchor_frame   = _anchor_real + 1   # frame to predict via per-frame inference
+                    _next_sub_start = _anchor_frame + 1  # first frame of next propagation sub-batch
 
-                        # Collect post-window masks for swap detection
-                        confusion_windows_so_far = tracker.get_confusion_windows()
-                        for w_idx, window in enumerate(confusion_windows_so_far):
-                            w_end = window["end"]
-                            # Capture masks from frames just after window ends
-                            if w_end < real_frame_idx <= w_end + N_POST_WINDOW_FRAMES:
-                                if w_idx not in post_window_masks_by_window:
-                                    post_window_masks_by_window[w_idx] = {}
-                                for oid_int, m in current_frame_masks.items():
-                                    if oid_int not in post_window_masks_by_window[w_idx]:
-                                        post_window_masks_by_window[w_idx][oid_int] = m
+                    if _anchor_frame >= batch_end:
+                        break  # nothing left to process in this extraction batch
 
-                        pm.mark_frame_propagated(pid, vid, real_frame_idx)
-                        batch_frame_count += 1
+                    # Close the finished sub-batch session before opening mini-session.
+                    sam.close_session(pid, vid)
+
+                    # ── Per-frame prediction for anchor frame ──────────────────
+                    _ann_dir_pf = pm.annotated_frames_dir(pid, vid)
+                    _anchor_img  = Path(tmp_dir) / f"{_anchor_frame:06d}.jpg"
+                    _anchor_masks: dict[int, np.ndarray] = {}
+
+                    if _ann_dir_pf.exists() and _anchor_img.exists():
+                        _mini_tmp = Path(tempfile.mkdtemp(prefix="sam3wt_pfanc_"))
+                        try:
+                            # Symlink annotated frames (original user-labeled frames)
+                            for _jpg in sorted(_ann_dir_pf.glob("*.jpg")):
+                                _dst = _mini_tmp / _jpg.name
+                                if not _dst.exists():
+                                    os.symlink(str(_jpg.resolve()), str(_dst))
+                            # Symlink the anchor frame image from the batch tmp dir
+                            _anc_dst = _mini_tmp / f"{_anchor_frame:06d}.jpg"
+                            if not _anc_dst.exists():
+                                os.symlink(str(_anchor_img.resolve()), str(_anc_dst))
+
+                            # Init fresh SAM session on mini-dir
+                            _mini_sid = await loop.run_in_executor(
+                                None, sam.init_session, pid, vid, str(_mini_tmp)
+                            )
+                            pm.update_video(pid, vid, {"sam3_session_id": _mini_sid})
+                            _mini_fmap = sam._frame_maps.get((pid, vid), [])
+
+                            # Replay original point prompts (only frames present in mini-dir)
+                            _all_prompts_pf = pm.get_all_point_prompts(pid, vid)
+                            def _replay_pf(_fmap=_mini_fmap, _prompts=_all_prompts_pf):
+                                for _oid_str, _pfmap in _prompts.items():
+                                    _oid_int = int(_oid_str.split("_")[0])
+                                    for _fidx_str, _prompt in _pfmap.items():
+                                        _rf = int(_fidx_str)
+                                        if _rf in _fmap:
+                                            try:
+                                                sam.add_points(
+                                                    pid, vid, frame_idx=_rf,
+                                                    obj_id=_oid_int,
+                                                    points=_prompt["points"],
+                                                    labels=_prompt["labels"],
+                                                    text=None,
+                                                )
+                                            except Exception as _pe:
+                                                logger.warning(
+                                                    f"Anchor prompt replay obj {_oid_str} frame {_rf}: {_pe}"
+                                                )
+                            await loop.run_in_executor(None, _replay_pf)
+
+                            # Propagate through mini-session; capture output at anchor frame
+                            if _mini_fmap:
+                                def _prop_pf(_fmap=_mini_fmap, _tgt=_anchor_frame):
+                                    _out: dict[int, np.ndarray] = {}
+                                    for _item in sam.propagate_stream(
+                                        pid, vid, _fmap[0], direction="forward"
+                                    ):
+                                        _ri = sam.to_real_idx(pid, vid, _item.get("frame_index", -1))
+                                        if _ri == _tgt:
+                                            _outputs = _item.get("outputs", {})
+                                            for _oid, _m in zip(
+                                                _outputs.get("out_obj_ids", []),
+                                                _outputs.get("out_binary_masks", []),
+                                            ):
+                                                if _m is not None:
+                                                    _out[_oid] = _m.squeeze().astype(np.uint8)
+                                    return _out
+                                _anchor_masks = await loop.run_in_executor(None, _prop_pf)
+
+                        except Exception as _anc_exc:
+                            logger.error(
+                                f"Per-frame anchor prediction failed at frame {_anchor_frame}: {_anc_exc}",
+                                exc_info=True,
+                            )
+                        finally:
+                            sam.close_session(pid, vid)
+                            shutil.rmtree(str(_mini_tmp), ignore_errors=True)
+                    else:
+                        logger.warning(
+                            f"Per-frame anchor: missing ann_dir or frame image for frame {_anchor_frame}"
+                        )
+
+                    # Save anchor frame masks to disk and emit a progress event
+                    if _anchor_masks:
+                        _anc_save = {str(k): v for k, v in _anchor_masks.items()}
+                        save_masks_npz(str(masks_dir / f"{_anchor_frame:06d}.npz"), _anc_save)
+                        _anc_raw = masks_raw_dir / f"{_anchor_frame:06d}.npz"
+                        if not _anc_raw.exists():
+                            save_masks_npz(str(_anc_raw), _anc_save)
+                        pm.mark_frame_propagated(pid, vid, _anchor_frame)
+                        last_frame_masks.update(_anchor_masks)
                         total_propagated += 1
+                        batch_frame_count += 1
                         progress = total_propagated / num_frames if num_frames > 0 else 1.0
-
                         yield {
                             "event": "progress",
                             "data": json.dumps({
-                                "frame": real_frame_idx,
+                                "frame": _anchor_frame,
                                 "progress": round(progress, 4),
                                 "done": False,
                                 "batch": batch_idx,
                                 "batch_start": batch_start,
                                 "batch_end": batch_end,
                                 "obj_ids": [str(o) for o in obj_ids],
-                                "uncertainty_score": round(confusion_score, 4),
+                                "uncertainty_score": 0.0,
                             }),
                         }
+                        logger.info(
+                            f"Batch {batch_idx}: anchor frame {_anchor_frame} predicted "
+                            f"via per-frame inference ({len(_anchor_masks)} objects)"
+                        )
+                    else:
+                        # Fallback: seed from last propagated masks (better than nothing)
+                        logger.warning(
+                            f"Batch {batch_idx}: per-frame anchor at {_anchor_frame} "
+                            f"produced no masks — falling back to last_frame_masks"
+                        )
+                        _anchor_masks = dict(last_frame_masks)
 
-                except Exception as e:
-                    logger.error(f"Propagation error in batch {batch_idx}: {e}", exc_info=True)
-                    yield {"event": "error", "data": json.dumps({"error": str(e)})}
-                    return
+                    if _next_sub_start >= batch_end:
+                        break  # anchor was the last frame in this extraction batch
+
+                    # ── Build sub-tmp for next propagation sub-batch ───────────
+                    _sub_batch_size = min(ANCHOR_EVERY, batch_end - _next_sub_start)
+                    if _sub_batch_size <= 0:
+                        break
+
+                    _sub_tmp = Path(tmp_dir) / f"sub_{_next_sub_start}"
+                    _sub_tmp.mkdir(exist_ok=True)
+                    for _rf in range(_next_sub_start, _next_sub_start + _sub_batch_size):
+                        _src = Path(tmp_dir) / f"{_rf:06d}.jpg"
+                        _dst = _sub_tmp / f"{_rf:06d}.jpg"
+                        if _src.exists() and not _dst.exists():
+                            _dst.symlink_to(_src.resolve())
+
+                    # Remove the previous sub-tmp (if any)
+                    if _current_sub_tmp is not None and _current_sub_tmp.exists():
+                        shutil.rmtree(str(_current_sub_tmp), ignore_errors=True)
+                    _current_sub_tmp = _sub_tmp
+
+                    try:
+                        new_sid = await loop.run_in_executor(
+                            None, sam.init_session, pid, vid, str(_sub_tmp)
+                        )
+                        pm.update_video(pid, vid, {"sam3_session_id": new_sid})
+                    except Exception as _re_exc:
+                        logger.error(
+                            f"Re-anchor session init failed at frame {_next_sub_start}: {_re_exc}",
+                            exc_info=True,
+                        )
+                        yield {"event": "error", "data": json.dumps({"error": f"Re-anchor failed: {_re_exc}"})}
+                        return
+
+                    # Seed at _next_sub_start (SAM index 0 of _sub_tmp) with the
+                    # anchor frame's per-frame prediction masks
+                    _anchor_seeded = 0
+                    for _r_oid, _r_mask in _anchor_masks.items():
+                        if not _r_mask.astype(bool).any():
+                            continue
+                        try:
+                            await loop.run_in_executor(None, functools.partial(
+                                sam.add_mask_prompt, pid, vid,
+                                frame_idx=_next_sub_start,
+                                obj_id=_r_oid,
+                                mask=_r_mask,
+                                text=None,
+                            ))
+                            _anchor_seeded += 1
+                        except Exception as _seed_exc:
+                            logger.warning(f"Re-anchor seed failed for obj {_r_oid}: {_seed_exc}")
+                    logger.info(
+                        f"Batch {batch_idx}: anchor {_anchor_frame} → propagation from {_next_sub_start} "
+                        f"({_sub_batch_size} frames, {_anchor_seeded} objects seeded from per-frame prediction)"
+                    )
+                    _sub_start = _next_sub_start
+                    # (loop continues — new queue/stop_event created at top of while)
+
+                # Clean up any sub-tmp directory left over from the last re-anchor.
+                if _current_sub_tmp is not None and _current_sub_tmp.exists():
+                    shutil.rmtree(str(_current_sub_tmp), ignore_errors=True)
+                    _current_sub_tmp = None
 
                 # ── 7. Carry masks forward for the next batch ─────────────
                 # Invalidate encode cache so scrubbing after propagation gets fresh masks
@@ -3082,6 +3420,7 @@ async def _run_propagation_bg(
         pm.mark_propagation_complete(pid, vid)
 
         # Save uncertainty data
+        confusion_windows = []
         try:
             confusion_windows = tracker.get_confusion_windows()
             uncertainty_data = tracker.build_uncertainty_json(confusion_windows)
@@ -3092,7 +3431,16 @@ async def _run_propagation_bg(
             )
         except Exception as ue:
             logger.warning(f"Failed to save uncertainty data: {ue}")
-            confusion_windows = []
+
+        # Save overlap window data
+        try:
+            overlaps_data = tracker.build_overlaps_json()
+            pm.save_overlaps(pid, vid, overlaps_data)
+            logger.info(
+                f"Overlaps saved: {len(overlaps_data.get('windows', []))} occlusion window(s)"
+            )
+        except Exception as oe:
+            logger.warning(f"Failed to save overlaps data: {oe}")
 
         # Build and save correction records (identity swap detection)
         try:
@@ -3610,6 +3958,233 @@ def get_uncertainty(pid: str, vid: str):
     if video is None:
         raise HTTPException(404, "Video not found")
     return pm.load_uncertainty(pid, vid)
+
+
+@app.get("/api/projects/{pid}/videos/{vid}/overlaps")
+def get_overlaps(pid: str, vid: str):
+    """Return detected occlusion/overlap windows from the last propagation run."""
+    video = pm.get_video(pid, vid)
+    if video is None:
+        raise HTTPException(404, "Video not found")
+    return pm.load_overlaps(pid, vid)
+
+
+@app.get("/api/projects/{pid}/videos/{vid}/classifier-frames")
+def get_classifier_frames(
+    pid: str,
+    vid: str,
+    start: int = Query(0),
+    end: int = Query(0),
+    step: int = Query(1),
+    max_size: int = Query(96),
+):
+    """
+    Return downsampled frame images + raw binary masks for in-browser classifier training.
+    Images: base64 JPEG at max_size on the longer dimension.
+    Masks: base64 grayscale PNG (0 or 255) per object at the same dimensions.
+    Only frames that have propagated masks are returned.
+    """
+    video = pm.get_video(pid, vid)
+    if video is None:
+        raise HTTPException(404, "Video not found")
+
+    step = max(1, step)
+    max_size = max(32, min(256, max_size))
+    video_dir = pm.video_dir(pid, vid)
+    masks_dir = video_dir / "masks"
+    frames_dir = video_dir / "frames"
+    source_video = next(video_dir.glob("source.*"), None)
+
+    num_frames = video.get("num_frames", 1)
+    frame_indices = list(range(max(0, start), min(end + 1, num_frames), step))
+
+    results = []
+    cap = None
+    try:
+        if source_video and source_video.exists():
+            cap = cv2.VideoCapture(str(source_video))
+
+        h_ref: Optional[int] = None
+        w_ref: Optional[int] = None
+
+        for fidx in frame_indices:
+            mask_path = masks_dir / f"{fidx:06d}.npz"
+            if not mask_path.exists():
+                continue  # skip frames without propagated masks
+
+            # Load frame image — prefer pre-extracted, fall back to VideoCapture
+            frame_np = None
+            frame_path = frames_dir / f"{fidx:06d}.jpg"
+            if frame_path.exists():
+                frame_np = cv2.imread(str(frame_path))
+            elif cap is not None:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
+                ok, frame_np = cap.read()
+                if not ok:
+                    frame_np = None
+
+            image_b64 = None
+            new_h, new_w = None, None
+            if frame_np is not None:
+                h_orig, w_orig = frame_np.shape[:2]
+                h_ref, w_ref = h_orig, w_orig
+                scale = max_size / max(h_orig, w_orig)
+                new_h = max(1, int(h_orig * scale))
+                new_w = max(1, int(w_orig * scale))
+                frame_small = cv2.resize(frame_np, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                ok_enc, enc = cv2.imencode('.jpg', frame_small, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                if ok_enc:
+                    image_b64 = base64.b64encode(enc.tobytes()).decode()
+
+            if image_b64 is None:
+                continue  # skip frames we can't read
+
+            # Load and resize masks
+            masks_b64: dict = {}
+            try:
+                npz = np.load(str(mask_path))
+                for key in npz.files:
+                    obj_id = key.replace("obj_", "")
+                    mask = npz[key].astype(np.uint8)
+                    # Resize mask to the same dims as the image
+                    if h_ref is not None and mask.shape[:2] != (h_ref, w_ref):
+                        mask = cv2.resize(mask, (w_ref, h_ref), interpolation=cv2.INTER_NEAREST)
+                    assert new_h is not None and new_w is not None
+                    mask_small = cv2.resize(mask, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+                    ok_m, enc_m = cv2.imencode('.png', mask_small * 255)
+                    if ok_m:
+                        masks_b64[obj_id] = base64.b64encode(enc_m.tobytes()).decode()
+            except Exception as e:
+                logger.warning(f"classifier-frames: failed masks for frame {fidx}: {e}")
+
+            if not masks_b64:
+                continue  # skip frames with no valid masks
+
+            results.append({
+                "frame_idx": fidx,
+                "image": image_b64,
+                "masks": masks_b64,
+                "height": new_h,
+                "width": new_w,
+            })
+
+    finally:
+        if cap is not None:
+            cap.release()
+
+    return {"frames": results}
+
+
+# ─── Classifier (DINOv2 per-pixel identity classifier) ────────────────────────
+
+@app.get("/api/projects/{pid}/videos/{vid}/classifier/train")
+async def stream_classifier_train(
+    request: Request,
+    pid: str,
+    vid: str,
+    start_frame: int = Query(0),
+    end_frame:   int = Query(-1),
+    step:        int = Query(5),
+    epochs:      int = Query(20),
+    lr:          float = Query(5e-4),
+    train_ratio: float = Query(0.75),
+    eval_ratio:  float = Query(0.20),
+):
+    """
+    SSE stream that trains a DINOv2-backed per-pixel object identity
+    classifier and yields progress events.
+
+    Event types: split | status | epoch | inference_progress | done | cancelled | error
+    """
+    video = pm.get_video(pid, vid)
+    if video is None:
+        raise HTTPException(404, "Video not found")
+
+    objects = video.get("objects", {})
+    obj_ids = sorted(objects.keys(), key=lambda k: int(k))
+    if len(obj_ids) < 2:
+        raise HTTPException(400, "Need at least 2 tracked objects to train the classifier")
+
+    num_frames   = video.get("num_frames", 0)
+    frames_dir   = pm.frames_dir(pid, vid)
+    masks_dir    = pm.masks_dir(pid, vid)
+    video_source = video.get("source_path", "")
+
+    real_end  = end_frame if end_frame >= 0 else max(0, num_frames - 1)
+    frame_rng = range(start_frame, real_end + 1, max(1, step))
+
+    import concurrent.futures as _cf
+    import classifier as _clf
+
+    queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+    loop  = asyncio.get_event_loop()
+
+    def _bg():
+        try:
+            for ev in _clf.train_and_infer(
+                pid, vid, frames_dir, masks_dir, video_source,
+                frame_rng, obj_ids, epochs, lr, train_ratio, eval_ratio,
+            ):
+                asyncio.run_coroutine_threadsafe(queue.put(("ev", ev)), loop).result()
+        except Exception as exc:
+            asyncio.run_coroutine_threadsafe(
+                queue.put(("ev", {"type": "error", "message": str(exc)})), loop
+            ).result()
+        finally:
+            asyncio.run_coroutine_threadsafe(queue.put(("done", None)), loop).result()
+
+    executor = _cf.ThreadPoolExecutor(max_workers=1)
+    loop.run_in_executor(executor, _bg)
+
+    results_path = pm.video_dir(pid, vid) / "classifier_results.json"
+
+    async def _generate():
+        while True:
+            if await request.is_disconnected():
+                _clf.cancel(pid, vid)
+                return
+            try:
+                msg_type, payload = await asyncio.wait_for(queue.get(), timeout=30)
+            except asyncio.TimeoutError:
+                if await request.is_disconnected():
+                    _clf.cancel(pid, vid)
+                    return
+                continue
+            if msg_type == "done":
+                return
+            ev = payload
+            etype = ev.get("type", "unknown")
+            yield {"event": etype, "data": json.dumps(ev)}
+            if etype == "done":
+                try:
+                    results_path.write_text(json.dumps(ev))
+                except Exception as save_exc:
+                    logger.warning(f"Could not save classifier results: {save_exc}")
+                return
+            if etype in ("error", "cancelled"):
+                return
+
+    return EventSourceResponse(_generate())
+
+
+@app.post("/api/projects/{pid}/videos/{vid}/classifier/cancel")
+async def cancel_classifier(pid: str, vid: str):
+    """Cancel a running classifier training job."""
+    try:
+        import classifier as _clf
+        _clf.cancel(pid, vid)
+    except ImportError:
+        pass
+    return {"status": "cancelled"}
+
+
+@app.get("/api/projects/{pid}/videos/{vid}/classifier/results")
+async def get_classifier_results(pid: str, vid: str):
+    """Return the most recently saved classifier results for this video."""
+    results_path = pm.video_dir(pid, vid) / "classifier_results.json"
+    if not results_path.exists():
+        raise HTTPException(404, "No classifier results — train the classifier first")
+    return json.loads(results_path.read_text())
 
 
 @app.get("/api/projects/{pid}/videos/{vid}/uncertainty/frames/{fidx}")

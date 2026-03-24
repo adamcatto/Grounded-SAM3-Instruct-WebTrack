@@ -42,7 +42,9 @@
       "Bash(/opt/conda/envs/sam3/bin/python -c \"import sys; sys.path.insert\\(0, ''backend''\\); import identity_tracker; print\\(''OK''\\)\")",
       "Bash(conda run -n sam3 python -c \"import ast; ast.parse\\(open\\(''backend/server.py''\\).read\\(\\)\\); print\\(''server.py: OK''\\); ast.parse\\(open\\(''backend/project_manager.py''\\).read\\(\\)\\); print\\(''project_manager.py: OK''\\)\")",
       "Bash(/opt/conda/envs/sam3/bin/python -c \"import ast; ast.parse\\(open\\(''backend/server.py''\\).read\\(\\)\\); print\\(''server.py: OK''\\); ast.parse\\(open\\(''backend/project_manager.py''\\).read\\(\\)\\); print\\(''project_manager.py: OK''\\)\")",
-      "Bash(/home/adam/miniconda3/envs/sam3/bin/python3 -c \"import ast; ast.parse\\(open\\(''backend/server.py''\\).read\\(\\)\\); print\\(''server.py OK''\\); ast.parse\\(open\\(''backend/project_manager.py''\\).read\\(\\)\\); print\\(''project_manager.py OK''\\)\")"
+      "Bash(/home/adam/miniconda3/envs/sam3/bin/python3 -c \"import ast; ast.parse\\(open\\(''backend/server.py''\\).read\\(\\)\\); print\\(''server.py OK''\\); ast.parse\\(open\\(''backend/project_manager.py''\\).read\\(\\)\\); print\\(''project_manager.py OK''\\)\")",
+      "Bash(npm install:*)",
+      "Bash(node -e \"require\\(''''@tensorflow/tfjs''''\\)\")"
     ]
   }
 }

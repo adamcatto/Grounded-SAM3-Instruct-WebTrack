@@ -482,6 +482,9 @@ class ProjectManager:
     def uncertainty_path(self, pid: str, vid: str) -> Path:
         return self.video_dir(pid, vid) / "uncertainty.json"
 
+    def overlaps_path(self, pid: str, vid: str) -> Path:
+        return self.video_dir(pid, vid) / "overlaps.json"
+
     # ─── Uncertainty & Corrections ───────────────────────────────────────────
 
     def save_uncertainty(self, pid: str, vid: str, data: dict):
@@ -495,6 +498,18 @@ class ProjectManager:
             return json.loads(p.read_text())
         except Exception:
             return {}
+
+    def save_overlaps(self, pid: str, vid: str, data: dict):
+        self.overlaps_path(pid, vid).write_text(json.dumps(data, indent=2))
+
+    def load_overlaps(self, pid: str, vid: str) -> dict:
+        p = self.overlaps_path(pid, vid)
+        if not p.exists():
+            return {"windows": []}
+        try:
+            return json.loads(p.read_text())
+        except Exception:
+            return {"windows": []}
 
     def save_correction(self, pid: str, vid: str, record: dict):
         path = self.corrections_dir(pid, vid) / f"{record['id']}.json"

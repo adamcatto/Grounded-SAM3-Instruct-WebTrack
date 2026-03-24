@@ -96,6 +96,35 @@ export interface UncertaintyData {
   similarity_matrix: Record<string, number>  // "objA_objB" → similarity score
 }
 
+// ─── Classifier types ─────────────────────────────────────────────────────────
+
+export interface ClassifierFrameData {
+  frame_idx: number
+  image: string | null  // base64 JPEG
+  masks: Record<string, string>  // obj_id → base64 grayscale PNG (0/255)
+  height: number | null
+  width: number | null
+}
+
+export interface ClassifierFramesResponse {
+  frames: ClassifierFrameData[]
+}
+
+export interface ClassifierAssignment {
+  predictedClass: string  // obj_id predicted by classifier
+  confidence: number
+  scores: Record<string, number>  // obj_id → probability
+}
+
+export interface ClassifierResults {
+  objectIds: string[]
+  frameAssignments: Record<number, Record<string, ClassifierAssignment>>  // frameIdx → samObjId → assignment
+  trainFrames: number[]
+  evalFrames: number[]
+  trainAccuracy: number  // how well model fits training data
+  evalAgreement: number  // fraction of eval frames that agree with SAM3
+}
+
 export interface CorrectionRecord {
   id: string
   status: 'pending' | 'applied' | 'rejected'
