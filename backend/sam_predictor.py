@@ -299,65 +299,6 @@ class SAMPredictor:
             outputs = resp.get("outputs", {})
             return {frame_idx: outputs}  # key by real frame_idx for callers
 
-    def add_text_prompt(
-        self,
-        pid: str,
-        vid: str,
-        frame_idx: int,
-        obj_id: int,
-        text: str,
-    ) -> dict:
-        """
-        Add a text-only prompt for semantic segmentation (SAM3 only).
-        
-        SAM3's text prompts work differently from point prompts:
-        - Text prompts use semantic detection mode (finds all instances matching the text)
-        - They can optionally include a bounding box to narrow the search area
-        - Returns detected masks for the text query
-        
-        Note: Semantic mode calls reset_state internally, so this should be called
-        BEFORE any tracker point prompts if you want to combine them.
-        
-        For SAM2, this is a no-op (SAM2 doesn't support text prompts).
-        """
-        if _model_name == "sam2" or not text:
-            return {frame_idx: {"out_obj_ids": [], "out_binary_masks": []}}
-        
-        session_id = self.get_session_id(pid, vid)
-        if session_id is None:
-            raise ValueError(f"No active session for {pid}/{vid}.")
-        
-        import torch
-        predictor = _get_predictor()
-        sam_frame_idx = self._to_sam_idx(pid, vid, frame_idx)
-        state = predictor._ALL_INFERENCE_STATES[session_id]["state"]
-        if sam_frame_idx not in state["cached_frame_outputs"]:
-            state["cached_frame_outputs"][sam_frame_idx] = {}
-        
-        # SAM3 text prompts use semantic mode
-        # Can use text-only (no box required based on the assertion "at least one of text, boxes")
-        # But a full-frame box can help constrain the search
-        # Box format for handle_request: [x, y, width, height] in normalized coords (0-1)
-        full_frame_box = [[0.0, 0.0, 1.0, 1.0]]  # Use list format for handle_request
-        box_labels = [1]  # positive box
-        
-        req = {
-            "type": "add_prompt",
-            "session_id": session_id,
-            "frame_index": sam_frame_idx,
-            "text": text,
-            "bounding_boxes": full_frame_box,  # Fixed: use correct parameter name
-            "bounding_box_labels": box_labels,
-        }
-        
-        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-            logger.info(f"add_text_prompt: frame {frame_idx} (sam_idx={sam_frame_idx}) text={text!r}")
-            resp = predictor.handle_request(req)
-        
-        outputs = resp.get("outputs", {})
-        logger.info(f"add_text_prompt result: {list(outputs.keys()) if outputs else 'empty'}")
-        return {frame_idx: outputs}
-
     def add_mask_prompt(
         self,
         pid: str,

@@ -44,7 +44,16 @@
       "Bash(/opt/conda/envs/sam3/bin/python -c \"import ast; ast.parse\\(open\\(''backend/server.py''\\).read\\(\\)\\); print\\(''server.py: OK''\\); ast.parse\\(open\\(''backend/project_manager.py''\\).read\\(\\)\\); print\\(''project_manager.py: OK''\\)\")",
       "Bash(/home/adam/miniconda3/envs/sam3/bin/python3 -c \"import ast; ast.parse\\(open\\(''backend/server.py''\\).read\\(\\)\\); print\\(''server.py OK''\\); ast.parse\\(open\\(''backend/project_manager.py''\\).read\\(\\)\\); print\\(''project_manager.py OK''\\)\")",
       "Bash(npm install:*)",
-      "Bash(node -e \"require\\(''''@tensorflow/tfjs''''\\)\")"
+      "Bash(node -e \"require\\(''''@tensorflow/tfjs''''\\)\")",
+      "Bash(find /opt/software -name *.py -path *sam3* -type f)",
+      "Bash(find /opt/software/Grounded-SAM3-Instruct-WebTrack/.sam3_src -name *.py -exec grep -l \"propagate_in_video\\\\|handle_stream_request\" {})",
+      "Bash(2)",
+      "Bash(find /home/adam -path */sam3* -name *.py)",
+      "Read(//opt/**)",
+      "Bash(grep -n \"def build_sam3_video_model\\\\|return.*Sam3Video\\\\|Sam3VideoInference\\\\|Sam3VideoBase\" /opt/software/Grounded-SAM3-Instruct-WebTrack/.sam3_src/sam3/model/*.py)",
+      "Bash(conda run:*)",
+      "Bash(/opt/conda/envs/sam3/bin/python -m py_compile /opt/software/Grounded-SAM3-Instruct-WebTrack/backend/server.py)",
+      "Bash(/home/lauren/.pyenv/versions/3.14.0/bin/python -m py_compile /opt/software/Grounded-SAM3-Instruct-WebTrack/backend/server.py)"
     ]
   }
 }

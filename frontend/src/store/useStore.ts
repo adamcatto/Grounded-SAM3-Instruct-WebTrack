@@ -1,20 +1,17 @@
 import { create } from 'zustand'
-import type { Project, VideoMeta, ObjectDef, MaskData, UncertaintyData, CorrectionRecord, ClassifierResults } from '../types'
+import type { Project, VideoMeta, MaskData } from '../types'
 import { evictMaskImages } from '../utils/maskUtils'
 
 // Max number of frames to keep in the in-memory mask cache.
-// Each frame holds N base64-encoded PNGs (~50 KB each compressed).
-// The corresponding decoded ImageBitmaps are bounded separately in maskUtils.
 const MAX_SAVED_MASK_FRAMES = 200
 
 // Insertion-order tracking for FIFO eviction of savedMaskCache.
-// Module-level (not in Zustand state) since it's purely an implementation detail.
 let _savedMaskCacheOrder: number[] = []
 
 export type PointMode = 'add' | 'remove' | null
 export type PropagationStatus = 'idle' | 'running' | 'paused' | 'done' | 'error'
 export type AppStep = 'upload' | 'annotate' | 'review'
-export type ViewerTab = 'annotate' | 'player' | 'inference' | 'config' | 'uncertainty' | 'corrections' | 'overlaps' | 'classifier'
+export type ViewerTab = 'annotate' | 'player' | 'inference' | 'config'
 
 // ─── App config ───────────────────────────────────────────────────────────────
 
@@ -23,7 +20,6 @@ export interface AppConfig {
   showMasks: boolean
   maskOpacity: number   // 0–1
   pointSize: number     // scale factor relative to default (1.0)
-  correctionMethod: 'swap' | 'repropagate'  // default method for applying identity corrections
 }
 
 const CONFIG_KEY = 'sam3wt_config'
@@ -33,7 +29,6 @@ const CONFIG_DEFAULTS: AppConfig = {
   showMasks: true,
   maskOpacity: 0.85,
   pointSize: 1.0,
-  correctionMethod: 'swap',
 }
 
 function loadConfig(): AppConfig {
@@ -75,7 +70,7 @@ interface AppState {
   currentFrameMasks: MaskData
   currentFrameMasksFrame: number | null   // which frame currentFrameMasks belongs to
   savedMaskCache: Record<number, MaskData>
-  pendingInferenceFrame: number | null    // frame awaiting "save to inference state" confirmation
+  pendingInferenceFrame: number | null
 
   // Playback
   isPlaying: boolean
@@ -87,6 +82,12 @@ interface AppState {
   propagationStartFrame: number
   propagationPausedAtFrame: number
 
+  // Anchor annotation phase
+  anchorPhase: boolean                                   // true during anchor annotation
+  anchorFrames: number[]                                 // [start, start+1000, ..., last]
+  currentAnchorIndex: number                             // which anchor user is on (0-based)
+  annotatedAnchorIndices: number[]                       // which anchor indices have been committed
+
   // UI
   viewerTab: ViewerTab
   drawerOpen: boolean
@@ -95,24 +96,12 @@ interface AppState {
   frameJump: number
   setFrameJump: (n: number) => void
 
-  // Identity tracking
-  uncertaintyData: UncertaintyData | null
-  corrections: CorrectionRecord[]
-  setUncertaintyData: (data: UncertaintyData | null) => void
-  setCorrections: (records: CorrectionRecord[]) => void
-
-  // Classifier
-  classifierResults: ClassifierResults | null
-  showClassifierOverlay: boolean
-  setClassifierResults: (r: ClassifierResults | null) => void
-  setShowClassifierOverlay: (v: boolean) => void
-
   // Config
   config: AppConfig
-  configDirty: boolean         // true when in-memory config differs from last localStorage save
+  configDirty: boolean
   setConfig: (updates: Partial<AppConfig>) => void
-  persistConfig: () => void    // write current config to localStorage
-  revertConfig: () => void     // restore config + propagationStartFrame from localStorage
+  persistConfig: () => void
+  revertConfig: () => void
 
   // Toasts
   toasts: Toast[]
@@ -127,8 +116,10 @@ interface AppState {
   setPointMode: (m: PointMode) => void
   addLocalPoint: (objId: string, frameIdx: number, x: number, y: number, label: 0 | 1) => void
   clearLocalPoints: (objId: string) => void
+  clearLocalPointsForFrame: (objId: string, frameIdx: number) => void
   setCurrentFrameMasks: (masks: MaskData, frame?: number | null) => void
   setSavedMask: (fidx: number, masks: MaskData) => void
+  clearSavedMaskCache: () => void
   setPendingInferenceFrame: (f: number | null) => void
   setPlaying: (v: boolean) => void
   setPropagationStatus: (s: PropagationStatus) => void
@@ -141,6 +132,13 @@ interface AppState {
   setPropagationStartFrame: (f: number) => void
   updateVideo: (updates: Partial<VideoMeta>) => void
   resetVideoState: () => void
+
+  // Anchor phase actions
+  setAnchorPhase: (v: boolean) => void
+  setAnchorFrames: (frames: number[]) => void
+  setCurrentAnchorIndex: (i: number) => void
+  addAnnotatedAnchor: (index: number) => void
+  resetAnchorState: () => void
 }
 
 const _initialConfig = loadConfig()
@@ -160,7 +158,6 @@ export const useStore = create<AppState>((set, get) => ({
   propagationStatus: 'idle',
   propagationProgress: 0,
   propagationCurrentFrame: 0,
-  // Starts at 0; overwritten by setCurrentVideo using the per-video start_frame from config.json
   propagationStartFrame: 0,
   propagationPausedAtFrame: -1,
   drawerOpen: false,
@@ -169,19 +166,16 @@ export const useStore = create<AppState>((set, get) => ({
   sessionInitialized: false,
   frameJump: 1,
   setFrameJump: (n: number) => set({ frameJump: Math.max(1, Math.round(n)) }),
-  uncertaintyData: null,
-  corrections: [],
+
+  // Anchor phase state
+  anchorPhase: false,
+  anchorFrames: [],
+  currentAnchorIndex: 0,
+  annotatedAnchorIndices: [],
+
   config: _initialConfig,
   configDirty: false,
   toasts: [],
-
-  setUncertaintyData: data => set({ uncertaintyData: data }),
-  setCorrections: records => set({ corrections: records }),
-
-  classifierResults: null,
-  showClassifierOverlay: false,
-  setClassifierResults: r => set({ classifierResults: r }),
-  setShowClassifierOverlay: v => set({ showClassifierOverlay: v }),
 
   setProject: p => set({ project: p }),
 
@@ -191,8 +185,7 @@ export const useStore = create<AppState>((set, get) => ({
       const vidData = vid ? get().project?.videos[vid] : undefined
       const alreadyPropagated = vidData?.propagation_complete ?? false
 
-      // Restore saved point prompts into localAnnotations so annotated frames
-      // show their points immediately without requiring a page session.
+      // Restore saved point prompts into localAnnotations
       const localAnnotations: Record<string, Record<string, LocalAnnotation>> = {}
       if (vidData?.point_prompts) {
         for (const [objId, framePts] of Object.entries(vidData.point_prompts)) {
@@ -206,7 +199,6 @@ export const useStore = create<AppState>((set, get) => ({
       }
 
       _savedMaskCacheOrder = []
-      // Use the per-video persisted start frame; fall back to 0
       const startFrame = vidData?.start_frame ?? 0
       set({
         currentVideoId: vid,
@@ -222,13 +214,16 @@ export const useStore = create<AppState>((set, get) => ({
         propagationStatus: alreadyPropagated ? 'done' : 'idle',
         propagationProgress: alreadyPropagated ? 1 : 0,
         sessionInitialized: false,
-        uncertaintyData: null,
-        corrections: [],
+        // Reset anchor state on video switch
+        anchorPhase: false,
+        anchorFrames: [],
+        currentAnchorIndex: 0,
+        annotatedAnchorIndices: [],
       })
     }
   },
 
-  // IMPORTANT: Never allow currentFrame to go below propagationStartFrame
+  // Never allow currentFrame to go below propagationStartFrame
   setCurrentFrame: f => {
     const { propagationStartFrame } = get()
     const clamped = Math.max(f, propagationStartFrame)
@@ -259,18 +254,25 @@ export const useStore = create<AppState>((set, get) => ({
     set({ localAnnotations: updated })
   },
 
+  clearLocalPointsForFrame: (objId, frameIdx) => {
+    const { localAnnotations } = get()
+    const objFrames = localAnnotations[objId]
+    if (!objFrames) return
+    const updated = { ...objFrames }
+    delete updated[String(frameIdx)]
+    set({ localAnnotations: { ...localAnnotations, [objId]: updated } })
+  },
+
   setCurrentFrameMasks: (masks, frame) => set({ currentFrameMasks: masks, currentFrameMasksFrame: frame ?? null }),
 
   setSavedMask: (fidx, masks) => {
     const { savedMaskCache } = get()
 
-    // Remove fidx from order tracking if already present (re-insert at end)
     _savedMaskCacheOrder = _savedMaskCacheOrder.filter(f => f !== fidx)
     _savedMaskCacheOrder.push(fidx)
 
     const newCache = { ...savedMaskCache, [fidx]: masks }
 
-    // Evict oldest frames when over the limit
     const b64sToEvict: string[] = []
     while (_savedMaskCacheOrder.length > MAX_SAVED_MASK_FRAMES) {
       const oldest = _savedMaskCacheOrder.shift()!
@@ -285,36 +287,32 @@ export const useStore = create<AppState>((set, get) => ({
     set({ savedMaskCache: newCache })
   },
 
+  clearSavedMaskCache: () => {
+    _savedMaskCacheOrder = []
+    set({ savedMaskCache: {} })
+  },
+
   setPendingInferenceFrame: f => set({ pendingInferenceFrame: f }),
-
   setPlaying: v => set({ isPlaying: v }),
-
   setPropagationStatus: s => set({ propagationStatus: s }),
-
-  setPropagationProgress: (p, frame) =>
-    set({ propagationProgress: p, propagationCurrentFrame: frame }),
-
+  setPropagationProgress: (p, frame) => set({ propagationProgress: p, propagationCurrentFrame: frame }),
   setPropagationPausedAtFrame: f => set({ propagationPausedAtFrame: f }),
-
   setDrawerOpen: v => set({ drawerOpen: v }),
   setUploadModalOpen: v => set({ uploadModalOpen: v }),
   setViewerTab: tab => set({ viewerTab: tab }),
   setSessionInitialized: v => set({ sessionInitialized: v }),
 
-  // setConfig: update in-memory only, mark dirty. Does NOT auto-save to localStorage.
   setConfig: updates => {
     const next = { ...get().config, ...updates }
     set({ config: next, configDirty: true })
   },
 
-  // persistConfig: write current in-memory config to localStorage, clear dirty flag.
   persistConfig: () => {
     const { config } = get()
     writeConfig(config)
     set({ config, configDirty: false })
   },
 
-  // revertConfig: reload the last saved config from localStorage, clear dirty flag.
   revertConfig: () => {
     const saved = loadConfig()
     set({ config: saved, configDirty: false })
@@ -350,7 +348,7 @@ export const useStore = create<AppState>((set, get) => ({
     _savedMaskCacheOrder = []
     set({
       currentFrame: 0,
-      propagationStartFrame: 0,  // Reset start frame to 0 when starting over
+      propagationStartFrame: 0,
       currentObjectId: null,
       pointMode: null,
       localAnnotations: {},
@@ -363,8 +361,29 @@ export const useStore = create<AppState>((set, get) => ({
       propagationProgress: 0,
       propagationPausedAtFrame: -1,
       sessionInitialized: false,
+      anchorPhase: false,
+      anchorFrames: [],
+      currentAnchorIndex: 0,
+      annotatedAnchorIndices: [],
     })
   },
+
+  // Anchor phase actions
+  setAnchorPhase: v => set({ anchorPhase: v }),
+  setAnchorFrames: frames => set({ anchorFrames: frames }),
+  setCurrentAnchorIndex: i => set({ currentAnchorIndex: i }),
+  addAnnotatedAnchor: index => {
+    const { annotatedAnchorIndices } = get()
+    if (!annotatedAnchorIndices.includes(index)) {
+      set({ annotatedAnchorIndices: [...annotatedAnchorIndices, index] })
+    }
+  },
+  resetAnchorState: () => set({
+    anchorPhase: false,
+    anchorFrames: [],
+    currentAnchorIndex: 0,
+    annotatedAnchorIndices: [],
+  }),
 }))
 
 // Derived selectors

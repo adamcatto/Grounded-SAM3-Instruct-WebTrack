@@ -106,16 +106,11 @@ export default function FrameViewer() {
 
   const onEnded = useCallback(() => setPlaying(false), [setPlaying])
 
-  // After a programmatic seek completes, sync the store frame to the exact
-  // time the browser actually decoded (may differ slightly from request).
-  const onSeeked = useCallback(() => {
-    const el = videoRef.current
-    if (!el || isPlaying) return
-    const frame = Math.floor(el.currentTime * fpsRef.current)
-    videoIsDriving.current = true
-    setCurrentFrame(frame)
-    requestAnimationFrame(() => { videoIsDriving.current = false })
-  }, [setCurrentFrame, isPlaying])
+  // onSeeked intentionally omitted: the video element has no native controls
+  // (pointerEvents:none) so there is no way for a user-initiated seek to
+  // diverge from the store.  Reading back el.currentTime after a programmatic
+  // seek causes I-frame snapping to silently move currentFrame by ±1.
+  const onSeeked = undefined
 
   const onError = useCallback((e: React.SyntheticEvent<HTMLVideoElement>) => {
     const el = e.currentTarget

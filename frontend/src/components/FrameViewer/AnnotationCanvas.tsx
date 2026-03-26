@@ -21,11 +21,10 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
     currentFrameMasks, currentFrameMasksFrame, setCurrentFrameMasks,
     savedMaskCache, setSavedMask,
     propagationStatus, propagationStartFrame,
-    config, uncertaintyData,
-    classifierResults, showClassifierOverlay,
+    config,
+    anchorPhase,
+    addToast,
   } = store
-
-  const confusionScore = uncertaintyData?.per_frame?.[String(currentFrame)]?.confusion_score ?? 0
 
   const [hoverLabel, setHoverLabel] = useState<string | null>(null)
   const [hoverPos, setHoverPos] = useState<{ x: number; y: number } | null>(null)
@@ -65,36 +64,15 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
     }
   }, [masksToShow, width, height])
 
-  // Build object name lookup for mask labels.
-  // When the classifier overlay is active, replace each label with the predicted
-  // class name (+ confidence).  A "→" arrow and amber colour in the table make
-  // discrepancies obvious; here we just append the predicted name so it is
-  // readable directly on the canvas without extra canvas drawing code.
   const objectNames = useMemo(() => {
-    const baseNames: Record<string, string> = {}
+    const names: Record<string, string> = {}
     if (video?.objects) {
       for (const [objId, obj] of Object.entries(video.objects)) {
-        baseNames[objId] = obj.name || objId
-      }
-    }
-
-    if (!showClassifierOverlay || !classifierResults) return baseNames
-
-    const frameAsgn = classifierResults.frameAssignments[currentFrame]
-    if (!frameAsgn) return baseNames
-
-    const names: Record<string, string> = { ...baseNames }
-    for (const [samObjId, asgn] of Object.entries(frameAsgn)) {
-      const predName = video?.objects[asgn.predictedClass]?.name ?? asgn.predictedClass
-      const pct = Math.round(asgn.confidence * 100)
-      if (asgn.predictedClass !== samObjId) {
-        names[samObjId] = `${predName} (${pct}%) ⚠`
-      } else {
-        names[samObjId] = `${predName} ✓${pct}%`
+        names[objId] = obj.name || objId
       }
     }
     return names
-  }, [video?.objects, showClassifierOverlay, classifierResults, currentFrame])
+  }, [video?.objects])
 
   // ── Render loop: draw masks + points onto canvas ──────────────────────────
 
@@ -221,7 +199,7 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
       // so the SAM session can be initialized with just this frame.
       await extractFrame(pid, vid, frameToUse)
 
-      const result = await addPoints(pid, vid, currentObjectId, frameToUse, allPoints, allLabels)
+      const result = await addPoints(pid, vid, currentObjectId, frameToUse, allPoints, allLabels, anchorPhase)
       if (result.masks) {
         // Read latest state after async call — only merge masks from the same frame
         const state = useStore.getState()
@@ -243,22 +221,17 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
           useStore.getState().updateVideo({ objects: updatedObjs })
         }
         
-        // If uncertainty was updated during annotation, merge it into store
-        if (result.uncertainty_update) {
-          useStore.getState().setUncertaintyData(result.uncertainty_update)
-        }
       }
-    } catch (err) {
+    } catch (err: unknown) {
       console.error('Failed to add point:', err)
+      // Extract the backend's detail message if available (e.g. 409 anchor-frame guard)
+      const detail =
+        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+      addToast(detail ?? 'Failed to add point', 'error')
     }
   }, [pointMode, currentObjectId, video, currentFrame, width, height, pid, vid, addLocalPoint, setCurrentFrameMasks, propagationStartFrame])
 
   const cursor = pointMode ? 'crosshair' : 'default'
-
-  const uncertaintyBorderColor =
-    confusionScore >= 0.7 ? 'rgba(239,68,68,0.8)' :
-    confusionScore >= 0.4 ? 'rgba(245,158,11,0.7)' :
-    null
 
   return (
     <>
@@ -278,27 +251,8 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
           cursor,
           display: 'block',
           boxSizing: 'border-box',
-          ...(uncertaintyBorderColor ? { boxShadow: `inset 0 0 0 3px ${uncertaintyBorderColor}` } : {}),
         }}
       />
-      {uncertaintyBorderColor && (
-        <div
-          style={{
-            position: 'absolute',
-            top: 8,
-            right: 8,
-            pointerEvents: 'none',
-            zIndex: 10,
-            color: confusionScore >= 0.7 ? '#ef4444' : '#f59e0b',
-            background: 'rgba(0,0,0,0.7)',
-            borderRadius: '0.375rem',
-            padding: '2px 8px',
-            fontSize: '11px',
-          }}
-        >
-          Identity uncertainty detected
-        </div>
-      )}
       {hoverLabel && hoverPos && (
         <div
           style={{

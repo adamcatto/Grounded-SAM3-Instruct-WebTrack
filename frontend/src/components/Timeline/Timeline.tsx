@@ -46,7 +46,7 @@ export default function Timeline() {
     currentFrame, setCurrentFrame,
     isPlaying, setPlaying,
     propagationStatus, savedMaskCache, setSavedMask,
-    propagationStartFrame, uncertaintyData,
+    propagationStartFrame,
     frameJump, setFrameJump,
   } = store
 
@@ -119,19 +119,6 @@ export default function Timeline() {
             setCurrentFrame(Math.max(startFrame, Math.min(rangeEnd, Math.round(pct * rangeLen + startFrame))))
           }}
         >
-          {/* Confusion window overlays */}
-          {uncertaintyData?.confusion_windows?.map((win, i) => {
-            const left = rangeLen > 0 ? ((win.start - startFrame) / rangeLen) * 100 : 0
-            const width = rangeLen > 0 ? ((win.end - win.start) / rangeLen) * 100 : 0
-            const color = win.avg_score >= 0.7 ? 'rgba(239,68,68,0.45)' : 'rgba(245,158,11,0.35)'
-            return (
-              <div
-                key={i}
-                className="absolute top-0 h-full rounded pointer-events-none"
-                style={{ left: `${left}%`, width: `${Math.max(0.5, width)}%`, background: color }}
-              />
-            )
-          })}
           <div
             className="absolute top-0 left-0 h-full bg-white/60 rounded-full pointer-events-none"
             style={{ width: `${progress}%` }}

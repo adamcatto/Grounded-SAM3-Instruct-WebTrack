@@ -1,7 +1,7 @@
 import React from 'react'
 import { Save } from 'lucide-react'
 import { useStore, currentVideo as selectCurrentVideo } from '../store/useStore'
-import { checkHealth, updateVideoMeta, getTrackingParams, updateTrackingParams, type TrackingParams } from '../api/client'
+import { checkHealth, updateVideoMeta } from '../api/client'
 import { useEffect, useState } from 'react'
 
 // ─── Primitive controls ────────────────────────────────────────────────────────
@@ -144,55 +144,20 @@ export default function ConfigPanel() {
   const {
     config, setConfig, configDirty, persistConfig,
     propagationStartFrame, setPropagationStartFrame, setCurrentFrame,
-    project, currentVideoId, updateVideo, addToast,
+    project, currentVideoId, updateVideo,
   } = store
 
   const pid = project?.id ?? ''
   const vid = currentVideoId ?? ''
 
   const [modelInfo, setModelInfo] = useState<{ model: string; sam_ready: boolean } | null>(null)
-  const [trackingParams, setTrackingParams] = useState<TrackingParams | null>(null)
-  const [trackingParamsDirty, setTrackingParamsDirty] = useState(false)
 
   useEffect(() => {
     checkHealth().then(h => setModelInfo({ model: h.sam_model, sam_ready: h.sam_ready })).catch(() => {})
   }, [])
 
-  // Fetch tracking params when video changes
-  useEffect(() => {
-    if (pid && vid) {
-      getTrackingParams(pid, vid)
-        .then(params => {
-          setTrackingParams(params)
-          setTrackingParamsDirty(false)
-        })
-        .catch(() => {})
-    }
-  }, [pid, vid])
-
   function handleSave() {
     persistConfig()
-  }
-
-  // Update a single tracking param locally
-  function handleTrackingParamChange<K extends keyof TrackingParams>(key: K, value: TrackingParams[K]) {
-    if (trackingParams) {
-      setTrackingParams({ ...trackingParams, [key]: value })
-      setTrackingParamsDirty(true)
-    }
-  }
-
-  // Save tracking params to backend
-  async function saveTrackingParams() {
-    if (!pid || !vid || !trackingParams) return
-    try {
-      const updated = await updateTrackingParams(pid, vid, trackingParams)
-      setTrackingParams(updated)
-      setTrackingParamsDirty(false)
-      addToast?.('Tracking params saved', 'success')
-    } catch (e) {
-      addToast?.('Failed to save tracking params', 'error')
-    }
   }
 
   // Navigate to start frame and persist to video config on backend
@@ -303,117 +268,6 @@ export default function ConfigPanel() {
             onChange={v => setConfig({ usePrevFrameMask: v })}
           />
         </Section>
-
-        {/* Track correction */}
-        <Section title="Track correction">
-          <div className="py-3">
-            <p className="text-sm text-[#ddd] font-medium mb-0.5">Correction method</p>
-            <p className="text-xs text-[#666] mb-3 leading-relaxed">
-              How to fix detected identity swaps. Deterministic swap is instant; re-propagate reruns
-              SAM from before the swap onset using the correct seed masks.
-            </p>
-            <div className="flex gap-2">
-              {(['swap', 'repropagate'] as const).map(m => (
-                <button
-                  key={m}
-                  onClick={() => setConfig({ correctionMethod: m })}
-                  className={`flex-1 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
-                    config.correctionMethod === m
-                      ? 'bg-blue-600/20 border-blue-500/60 text-blue-400'
-                      : 'border-[#333] text-[#666] hover:border-[#555] hover:text-[#aaa]'
-                  }`}
-                >
-                  {m === 'swap' ? 'Deterministic swap' : 'Re-propagate'}
-                </button>
-              ))}
-            </div>
-          </div>
-        </Section>
-
-        {/* Tracking Parameters */}
-        {trackingParams && (
-          <Section title="Tracking parameters">
-            <div className="py-3 border-b border-[#1e1e1e]">
-              <p className="text-sm text-[#ddd] font-medium mb-0.5">Propagation mode</p>
-              <p className="text-xs text-[#666] mb-3 leading-relaxed">
-                <b className="text-[#999]">Temporal tracking</b> carries each frame's prediction
-                forward as the seed for the next, and applies temporal consistency filtering to reject
-                implausible jumps. <b className="text-[#999]">Per-frame prediction</b> re-seeds SAM
-                from the original annotation prompts each batch without filtering.{' '}
-                <b className="text-[#999]">Dual candidate</b> runs both a seed-only and a temporal
-                pass per batch, then selects whichever mask has better IoU with the previous frame —
-                slower but more robust to drift. Best for long videos with similar-looking objects.
-              </p>
-              <div className="flex gap-2 flex-wrap">
-                {(['temporal_tracking', 'per_frame', 'dual_candidate'] as const).map(m => (
-                  <button
-                    key={m}
-                    onClick={() => handleTrackingParamChange('propagation_mode', m)}
-                    className={`flex-1 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
-                      (trackingParams.propagation_mode ?? 'temporal_tracking') === m
-                        ? 'bg-blue-600/20 border-blue-500/60 text-blue-400'
-                        : 'border-[#333] text-[#666] hover:border-[#555] hover:text-[#aaa]'
-                    }`}
-                  >
-                    {m === 'temporal_tracking' ? 'Temporal tracking' : m === 'per_frame' ? 'Per-frame' : 'Dual candidate'}
-                  </button>
-                ))}
-              </div>
-            </div>
-            <SliderRow
-              label="Min IoU threshold"
-              description="Minimum overlap (IoU) required between consecutive frames. Lower values allow more mask drift."
-              value={trackingParams.min_iou_threshold}
-              onChange={v => handleTrackingParamChange('min_iou_threshold', v)}
-              min={0.0}
-              max={0.5}
-              step={0.01}
-              format={v => v.toFixed(2)}
-            />
-            <SliderRow
-              label="Max area ratio"
-              description="Maximum allowed change in mask area between frames. Higher values tolerate larger size changes."
-              value={trackingParams.max_area_ratio}
-              onChange={v => handleTrackingParamChange('max_area_ratio', v)}
-              min={1.5}
-              max={10.0}
-              step={0.5}
-              format={v => `${v.toFixed(1)}×`}
-            />
-            <SliderRow
-              label="Max centroid jump"
-              description="Maximum normalized distance the mask center can move between frames (0-1 = fraction of frame)."
-              value={trackingParams.max_centroid_jump}
-              onChange={v => handleTrackingParamChange('max_centroid_jump', v)}
-              min={0.05}
-              max={0.5}
-              step={0.01}
-              format={v => v.toFixed(2)}
-            />
-            <NumberRow
-              label="Consecutive reject limit"
-              description="After this many consecutive rejected frames, accept the mask anyway to avoid getting stuck."
-              value={trackingParams.consecutive_reject_limit}
-              onChange={v => handleTrackingParamChange('consecutive_reject_limit', v)}
-              onCommit={() => {}}
-              min={1}
-              max={20}
-            />
-            <div className="py-3">
-              <button
-                onClick={saveTrackingParams}
-                disabled={!trackingParamsDirty}
-                className={`w-full py-2 rounded-lg text-xs font-medium transition-colors ${
-                  trackingParamsDirty
-                    ? 'bg-blue-600 hover:bg-blue-500 text-white'
-                    : 'bg-[#1e1e1e] text-[#555] cursor-not-allowed'
-                }`}
-              >
-                {trackingParamsDirty ? 'Save Tracking Params' : 'Tracking Params Saved'}
-              </button>
-            </div>
-          </Section>
-        )}
 
         <p className="text-xs text-[#444] leading-relaxed px-1">
           Settings are saved to your browser's local storage. Changes take effect immediately but are

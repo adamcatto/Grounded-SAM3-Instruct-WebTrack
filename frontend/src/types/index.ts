@@ -3,8 +3,6 @@ export interface ObjectDef {
   name: string
   color: string
   description?: string     // textual instruction / prompt (uses name if empty)
-  min_instances?: number   // minimum expected instances per frame (default 1)
-  max_instances?: number   // maximum expected instances per frame (default 1)
 }
 
 export interface PointPrompts {
@@ -25,13 +23,13 @@ export interface VideoMeta {
   start_frame?: number
   objects: Record<string, ObjectDef>
   point_prompts: Record<string, PointPrompts>
-  instance_groups?: Record<string, number[]>  // ui_obj_id → [sam_obj_id, ...]
   sam3_session_id: string | null
   propagated_frames: number[]
   propagation_complete: boolean
   frames_extracted?: boolean
   all_frames_extracted?: boolean
   preview_indices?: number[]
+  annotated_anchors?: number[]
 }
 
 export interface Project {
@@ -63,8 +61,6 @@ export interface PropagationEvent {
   batch_end?: number
   status?: string          // 'extracting' | 'initializing_session' for batch_start events
   total_batches?: number
-  uncertainty_score?: number  // per-frame confusion score from IdentityTracker
-  confusion_windows?: number  // count of confusion windows (in done event)
   // catch_up event fields (sent when reconnecting to a running propagation)
   frames_done?: number
   last_frame?: number
@@ -74,67 +70,4 @@ export interface PropagationEvent {
   frames_to_process?: number
   // extract_progress event fields
   extracted?: number
-}
-
-// ─── Uncertainty & Identity Correction types ──────────────────────────────────
-
-export interface ConfusionWindow {
-  start: number
-  end: number
-  obj_ids: string[]
-  avg_score: number
-}
-
-export interface UncertaintyData {
-  per_frame: Record<string, {
-    confusion_score: number
-    confused_objects?: string[]
-    temporal_rejections?: Record<string, string>
-    per_object?: Record<string, { anomaly_score: number }>
-  }>
-  confusion_windows: ConfusionWindow[]
-  similarity_matrix: Record<string, number>  // "objA_objB" → similarity score
-}
-
-// ─── Classifier types ─────────────────────────────────────────────────────────
-
-export interface ClassifierFrameData {
-  frame_idx: number
-  image: string | null  // base64 JPEG
-  masks: Record<string, string>  // obj_id → base64 grayscale PNG (0/255)
-  height: number | null
-  width: number | null
-}
-
-export interface ClassifierFramesResponse {
-  frames: ClassifierFrameData[]
-}
-
-export interface ClassifierAssignment {
-  predictedClass: string  // obj_id predicted by classifier
-  confidence: number
-  scores: Record<string, number>  // obj_id → probability
-}
-
-export interface ClassifierResults {
-  objectIds: string[]
-  frameAssignments: Record<number, Record<string, ClassifierAssignment>>  // frameIdx → samObjId → assignment
-  trainFrames: number[]
-  evalFrames: number[]
-  trainAccuracy: number  // how well model fits training data
-  evalAgreement: number  // fraction of eval frames that agree with SAM3
-}
-
-export interface CorrectionRecord {
-  id: string
-  status: 'pending' | 'applied' | 'rejected'
-  window_start: number
-  window_end: number
-  swap_onset: number
-  obj_id_a: string
-  obj_id_b: string
-  reason: string
-  avg_confusion_score: number
-  created_at: string
-  method?: string
 }

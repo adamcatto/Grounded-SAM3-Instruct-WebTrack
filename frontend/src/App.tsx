@@ -2,7 +2,7 @@ import React, { useEffect, useState, useCallback } from 'react'
 import { useStore, currentVideo as selectCurrentVideo } from './store/useStore'
 import type { ViewerTab } from './store/useStore'
 import { listProjects } from './api/client'
-import { Crosshair, PlayCircle, BrainCircuit, Settings2, Activity, GitMerge, Layers, ScanSearch } from 'lucide-react'
+import { Crosshair, PlayCircle, BrainCircuit, Settings2 } from 'lucide-react'
 import Header from './components/Header'
 import ProjectDrawer from './components/ProjectDrawer'
 import UploadModal from './components/UploadModal'
@@ -11,10 +11,6 @@ import FrameViewer from './components/FrameViewer/FrameViewer'
 import VideoPlayer from './components/VideoPlayer/VideoPlayer'
 import InferenceStatePanel from './components/InferenceStatePanel'
 import ConfigPanel from './components/ConfigPanel'
-import UncertaintyPanel from './components/UncertaintyPanel'
-import TrackCorrectionPanel from './components/TrackCorrectionPanel'
-import OcclusionPanel from './components/OcclusionPanel'
-import ClassifierPanel from './components/ClassifierPanel'
 import Timeline from './components/Timeline/Timeline'
 import LoadingScreen from './components/LoadingScreen'
 import ResizeHandle from './components/ResizeHandle'
@@ -54,10 +50,8 @@ export default function App() {
   const {
     project, currentVideoId, viewerTab,
     setProject, setCurrentVideo, setUploadModalOpen, setDrawerOpen, setViewerTab,
-    configDirty, revertConfig, corrections,
+    configDirty, revertConfig,
   } = store
-
-  const pendingCorrections = corrections.filter(c => c.status === 'pending').length
 
   // Guard tab switches away from Settings when there are unsaved changes.
   const handleSetViewerTab = useCallback((tab: ViewerTab) => {
@@ -149,31 +143,6 @@ export default function App() {
                   label="Inference State"
                   onClick={() => handleSetViewerTab('inference')}
                 />
-                <TabButton
-                  active={viewerTab === 'uncertainty'}
-                  icon={<Activity size={14} />}
-                  label="Uncertainty"
-                  onClick={() => handleSetViewerTab('uncertainty')}
-                />
-                <TabButton
-                  active={viewerTab === 'corrections'}
-                  icon={<GitMerge size={14} />}
-                  label="Corrections"
-                  onClick={() => handleSetViewerTab('corrections')}
-                  badge={pendingCorrections}
-                />
-                <TabButton
-                  active={viewerTab === 'overlaps'}
-                  icon={<Layers size={14} />}
-                  label="Overlaps"
-                  onClick={() => handleSetViewerTab('overlaps')}
-                />
-                <TabButton
-                  active={viewerTab === 'classifier'}
-                  icon={<ScanSearch size={14} />}
-                  label="Classifier"
-                  onClick={() => handleSetViewerTab('classifier')}
-                />
               </>
             )}
             <div className="flex-1" />
@@ -189,10 +158,6 @@ export default function App() {
           {viewerTab === 'annotate' && <FrameViewer />}
           {viewerTab === 'player' && <VideoPlayer />}
           {viewerTab === 'inference' && <InferenceStatePanel />}
-          {viewerTab === 'uncertainty' && <UncertaintyPanel />}
-          {viewerTab === 'corrections' && <TrackCorrectionPanel />}
-          {viewerTab === 'overlaps' && <OcclusionPanel />}
-          {viewerTab === 'classifier' && <ClassifierPanel />}
           {viewerTab === 'config' && <ConfigPanel />}
 
           {/* Horizontal resize handle between viewer and timeline */}

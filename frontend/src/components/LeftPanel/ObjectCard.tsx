@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react'
-import { Pencil, Trash2, MousePointer, MinusCircle, Check, ChevronDown, ChevronUp, PlusCircle, Save, Loader } from 'lucide-react'
+import { Pencil, Trash2, MousePointer, MinusCircle, Check, ChevronDown, ChevronUp, Save, Loader } from 'lucide-react'
 import { useStore } from '../../store/useStore'
-import { renameObject, removeObject, clearObjectPoints, updateObject, addInstance } from '../../api/client'
+import { renameObject, removeObject, clearObjectPoints, clearObjectFramePoints, updateObject } from '../../api/client'
 
 interface Props {
   objId: string
@@ -10,15 +10,14 @@ interface Props {
   isActive: boolean
   onSelect: () => void
   description?: string
-  minInstances?: number
-  maxInstances?: number
 }
 
-export default function ObjectCard({ objId, name, color, isActive, onSelect, description, minInstances = 1, maxInstances = 1 }: Props) {
+export default function ObjectCard({ objId, name, color, isActive, onSelect, description }: Props) {
   const {
-    project, currentVideoId,
+    project, currentVideoId, currentFrame,
     pointMode, setPointMode, setCurrentObject,
-    clearLocalPoints, setCurrentFrameMasks, currentFrameMasks,
+    clearLocalPoints, clearLocalPointsForFrame, setCurrentFrameMasks, currentFrameMasks,
+    savedMaskCache, setSavedMask,
     addToast,
   } = useStore()
 
@@ -27,8 +26,6 @@ export default function ObjectCard({ objId, name, color, isActive, onSelect, des
   const [removing, setRemoving] = useState(false)
   const [showDetails, setShowDetails] = useState(false)
   const [editDesc, setEditDesc] = useState(description ?? '')
-  const [editMin, setEditMin] = useState(minInstances)
-  const [editMax, setEditMax] = useState(maxInstances)
   const [savingDetails, setSavingDetails] = useState(false)
   const [detailsDirty, setDetailsDirty] = useState(false)
 
@@ -36,12 +33,6 @@ export default function ObjectCard({ objId, name, color, isActive, onSelect, des
   useEffect(() => {
     setEditDesc(description ?? '')
   }, [description])
-  useEffect(() => {
-    setEditMin(minInstances)
-  }, [minInstances])
-  useEffect(() => {
-    setEditMax(maxInstances)
-  }, [maxInstances])
 
   const pid = project?.id ?? ''
   const vid = currentVideoId ?? ''
@@ -51,11 +42,10 @@ export default function ObjectCard({ objId, name, color, isActive, onSelect, des
     if (!editName.trim() || editName === name) { setEditing(false); return }
     await renameObject(pid, vid, objId, editName.trim())
     setEditing(false)
-    // Refresh project in store - quick local update
     useStore.getState().updateVideo({
       objects: {
         ...useStore.getState().project?.videos[vid]?.objects,
-        [objId]: { id: objId, name: editName.trim(), color, description, min_instances: minInstances, max_instances: maxInstances },
+        [objId]: { id: objId, name: editName.trim(), color, description },
       },
     })
   }
@@ -63,8 +53,6 @@ export default function ObjectCard({ objId, name, color, isActive, onSelect, des
   async function handleSaveDetails() {
     const updates: Record<string, unknown> = {}
     if (editDesc !== (description ?? '')) updates.description = editDesc
-    if (editMin !== minInstances) updates.min_instances = editMin
-    if (editMax !== maxInstances) updates.max_instances = editMax
     if (Object.keys(updates).length === 0) {
       setDetailsDirty(false)
       return
@@ -89,22 +77,12 @@ export default function ObjectCard({ objId, name, color, isActive, onSelect, des
     }
   }
 
-  async function handleAddInstance() {
-    try {
-      await addInstance(pid, vid, objId)
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : String(e)
-      console.warn('addInstance failed:', msg)
-    }
-  }
-
   async function handleRemove() {
     if (!confirm(`Remove object "${name}"?`)) return
     setRemoving(true)
     try {
       await removeObject(pid, vid, objId)
       clearLocalPoints(objId)
-      // Remove masks for this object from current frame
       const newMasks = { ...currentFrameMasks }
       delete newMasks[objId]
       setCurrentFrameMasks(newMasks)
@@ -122,12 +100,20 @@ export default function ObjectCard({ objId, name, color, isActive, onSelect, des
   }
 
   async function handleClear() {
-    clearLocalPoints(objId)
-    const newMasks = { ...currentFrameMasks }
-    delete newMasks[objId]
-    setCurrentFrameMasks(newMasks)
+    // Clear only the current frame — leave all other labeled frames untouched
+    clearLocalPointsForFrame(objId, currentFrame)
+    const newLive = { ...currentFrameMasks }
+    delete newLive[objId]
+    setCurrentFrameMasks(newLive)
+    // Remove this object from the saved mask cache for the current frame only
+    const frameSaved = savedMaskCache[currentFrame]
+    if (frameSaved && frameSaved[objId]) {
+      const updated = { ...frameSaved }
+      delete updated[objId]
+      setSavedMask(currentFrame, updated)
+    }
     try {
-      await clearObjectPoints(pid, vid, objId)
+      await clearObjectFramePoints(pid, vid, objId, currentFrame)
     } catch { /* ignore */ }
   }
 
@@ -152,12 +138,6 @@ export default function ObjectCard({ objId, name, color, isActive, onSelect, des
               className="absolute -top-1 -right-1 w-3.5 h-3.5 rounded-full bg-blue-500 text-white flex items-center justify-center text-[8px] font-bold"
               title="Text description set"
             >T</span>
-          )}
-          {maxInstances > 1 && (
-            <span
-              className="absolute -bottom-1 -right-1 w-3.5 h-3.5 rounded-full bg-purple-500 text-white flex items-center justify-center text-[8px] font-bold"
-              title={`Multi-instance: ${minInstances}–${maxInstances}`}
-            >{maxInstances}</span>
           )}
         </div>
         <div className="flex-1 min-w-0">
@@ -189,7 +169,7 @@ export default function ObjectCard({ objId, name, color, isActive, onSelect, des
         <button
           onClick={e => { e.stopPropagation(); setShowDetails(!showDetails) }}
           className="p-1 text-[#555] hover:text-[#ccc] rounded"
-          title="Edit description and instances"
+          title="Edit description"
         >
           {showDetails ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
         </button>
@@ -203,7 +183,7 @@ export default function ObjectCard({ objId, name, color, isActive, onSelect, des
         </button>
       </div>
 
-      {/* Description and instances detail panel */}
+      {/* Description detail panel */}
       {showDetails && (
         <div className="px-3 pb-3 border-t border-[#222] pt-2.5" onClick={e => e.stopPropagation()}>
           <label className="block text-[10px] text-[#666] mb-1 uppercase tracking-wide">Text description</label>
@@ -214,30 +194,6 @@ export default function ObjectCard({ objId, name, color, isActive, onSelect, des
             rows={2}
             className="w-full text-xs bg-[#111] border border-[#333] rounded px-2 py-1.5 text-[#ccc] placeholder-[#444] resize-none focus:border-blue-500/60 focus:outline-none"
           />
-          <div className="flex gap-3 mt-2">
-            <div className="flex-1">
-              <label className="block text-[10px] text-[#666] mb-1 uppercase tracking-wide">Min instances</label>
-              <input
-                type="number"
-                min={1}
-                max={10}
-                value={editMin}
-                onChange={e => { setEditMin(Number(e.target.value)); setDetailsDirty(true) }}
-                className="w-full text-xs bg-[#111] border border-[#333] rounded px-2 py-1 text-[#ccc] focus:border-blue-500/60 focus:outline-none"
-              />
-            </div>
-            <div className="flex-1">
-              <label className="block text-[10px] text-[#666] mb-1 uppercase tracking-wide">Max instances</label>
-              <input
-                type="number"
-                min={1}
-                max={10}
-                value={editMax}
-                onChange={e => { setEditMax(Number(e.target.value)); setDetailsDirty(true) }}
-                className="w-full text-xs bg-[#111] border border-[#333] rounded px-2 py-1 text-[#ccc] focus:border-blue-500/60 focus:outline-none"
-              />
-            </div>
-          </div>
           <button
             onClick={handleSaveDetails}
             disabled={!detailsDirty || savingDetails}
@@ -249,14 +205,6 @@ export default function ObjectCard({ objId, name, color, isActive, onSelect, des
             {savingDetails ? <Loader size={12} className="animate-spin" /> : <Save size={12} />}
             {savingDetails ? 'Saving...' : 'Save Details'}
           </button>
-          {maxInstances > 1 && isActive && (
-            <button
-              onClick={handleAddInstance}
-              className="mt-2 flex items-center gap-1 text-xs text-purple-400 hover:text-purple-300"
-            >
-              <PlusCircle size={11} /> Add instance slot
-            </button>
-          )}
         </div>
       )}
 
