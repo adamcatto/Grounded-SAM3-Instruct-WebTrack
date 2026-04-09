@@ -418,6 +418,53 @@ async def import_video(
     return video_meta
 
 
+# ─── Browse server directory ─────────────────────────────────────────────────
+
+VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".h264", ".ts",
+                    ".m4v", ".mts", ".m2ts", ".flv", ".wmv", ".mpg", ".mpeg"}
+
+@app.get("/api/browse")
+def browse_directory(path: str = Query(...), depth: int = Query(1)):
+    """
+    List files in a server directory for folder-import selection.
+    depth=1  → current directory only (default)
+    depth=N  → recurse up to N levels
+    depth=0  → unlimited recursion
+    """
+    root = Path(path)
+    if not root.exists():
+        raise HTTPException(400, f"Path not found: {path}")
+    if not root.is_dir():
+        raise HTTPException(400, f"Not a directory: {path}")
+
+    max_depth = depth if depth > 0 else 10_000  # 0 = unlimited
+
+    def _collect(directory: Path, current_depth: int) -> list[dict]:
+        try:
+            entries = sorted(directory.iterdir(), key=lambda e: e.name.lower())
+        except PermissionError:
+            return []
+        result = []
+        for entry in entries:
+            if entry.is_file():
+                try:
+                    size = entry.stat().st_size
+                except OSError:
+                    size = 0
+                result.append({
+                    "name": entry.name,
+                    "path": str(entry),
+                    "size": size,
+                    "is_video": entry.suffix.lower() in VIDEO_EXTENSIONS,
+                })
+            elif entry.is_dir() and current_depth < max_depth:
+                result.extend(_collect(entry, current_depth + 1))
+        return result
+
+    files = _collect(root, 1)
+    return {"directory": str(root), "files": files}
+
+
 @app.get("/api/projects/{pid}/videos/{vid}")
 def get_video(pid: str, vid: str):
     video = pm.get_video(pid, vid)

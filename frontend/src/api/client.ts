@@ -50,6 +50,16 @@ export const addVideo = (pid: string, file: File, onProgress?: (pct: number) => 
 export const importVideo = (pid: string, serverPath: string) =>
   api.post<VideoMeta>(`/projects/${pid}/videos/import`, { path: serverPath }).then(r => r.data)
 
+export interface BrowseEntry {
+  name: string
+  path: string
+  size: number
+  is_video: boolean
+}
+
+export const browseDirectory = (path: string, depth = 1) =>
+  api.get<{ directory: string; files: BrowseEntry[] }>('/browse', { params: { path, depth } }).then(r => r.data)
+
 export const getVideo = (pid: string, vid: string) =>
   api.get<VideoMeta>(`/projects/${pid}/videos/${vid}`).then(r => r.data)
 

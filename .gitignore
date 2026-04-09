@@ -26,3 +26,10 @@ Thumbs.db
 
 # Video files
 sample_video/
+
+# claude
+.claude/
+CLAUDE.md
+
+# sandbox
+sandbox/
