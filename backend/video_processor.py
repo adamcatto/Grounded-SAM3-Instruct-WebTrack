@@ -265,13 +265,20 @@ def encode_mask_as_png(
     mask_np: np.ndarray,
     color_hex: str,
     alpha_fill: float = 0.45,
-    border_thickness: int = 3,
+    border_thickness: Optional[int] = None,
 ) -> str:
     """
     Convert a binary (H, W) mask to a base64-encoded RGBA PNG.
     Visual style: semi-transparent fill + glowing bright border.
+
+    border_thickness defaults to a value proportional to the mask resolution
+    (roughly 3px at 1080p, 1px at ~360p) so the border looks consistent
+    regardless of whether the video has been spatially downsampled.
     """
     H, W = mask_np.shape[:2]
+    if border_thickness is None:
+        # Scale with the shorter dimension: ~3px at 1080p, ~1px at 360p.
+        border_thickness = max(1, round(min(H, W) / 360))
     r, g, b = hex_to_rgb(color_hex)
 
     # Create RGBA overlay
@@ -542,6 +549,54 @@ def export_video_with_masks(
         progress_callback(frame_idx, frame_idx or 1)
 
     return {"total_frames": frame_idx, "fps": fps}
+
+
+# ─── Spatial Downsampling ─────────────────────────────────────────────────────
+
+def downsample_video(
+    src_path: str,
+    dst_path: str,
+    max_dim: Optional[int] = None,
+    scale_factor: Optional[float] = None,
+) -> dict:
+    """
+    Re-encode src_path → dst_path at a lower resolution.
+    Exactly one of max_dim or scale_factor must be provided.
+      max_dim     – longest side clamped to this pixel count
+      scale_factor – each dimension divided by this value (e.g. 2.0 → half size)
+    Uses libx264 with faststart. Returns {num_frames, fps, width, height}.
+    Raises RuntimeError if ffmpeg fails.
+    """
+    if scale_factor is not None:
+        # Divide both dimensions by scale_factor; round down to nearest even number
+        vf = (
+            f"scale=trunc(iw/{scale_factor}/2)*2:trunc(ih/{scale_factor}/2)*2"
+        )
+    elif max_dim is not None:
+        # Scale so longer dimension ≤ max_dim, maintain AR, ensure even dims for libx264
+        vf = (
+            f"scale=w='min(iw,{max_dim})':h='min(ih,{max_dim})'"
+            ":force_original_aspect_ratio=decrease"
+            ",scale=trunc(iw/2)*2:trunc(ih/2)*2"
+        )
+    else:
+        raise ValueError("Either max_dim or scale_factor must be provided")
+    result = subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-i", str(src_path),
+            "-vf", vf,
+            "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+            "-movflags", "+faststart",
+            str(dst_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=1800,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg downsample failed: {result.stderr[-500:]}")
+    return get_video_info(str(dst_path))
 
 
 # ─── Thumbnail Generation ──────────────────────────────────────────────────────

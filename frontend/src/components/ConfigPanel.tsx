@@ -1,7 +1,8 @@
 import React from 'react'
 import { Save } from 'lucide-react'
 import { useStore, currentVideo as selectCurrentVideo } from '../store/useStore'
-import { checkHealth, updateVideoMeta } from '../api/client'
+import { checkHealth, updateVideoMeta, downsampleVideo } from '../api/client'
+import type { DownsampleOptions } from '../api/client'
 import { useEffect, useState } from 'react'
 
 // ─── Primitive controls ────────────────────────────────────────────────────────
@@ -151,6 +152,14 @@ export default function ConfigPanel() {
   const vid = currentVideoId ?? ''
 
   const [modelInfo, setModelInfo] = useState<{ model: string; sam_ready: boolean } | null>(null)
+  const [dsMode, setDsMode] = useState<'max_dim' | 'factor'>('max_dim')
+  const [dsMaxDim, setDsMaxDim] = useState(1080)
+  const [dsFactor, setDsFactor] = useState(2)
+  const [dsRunning, setDsRunning] = useState(false)
+  const [dsMessage, setDsMessage] = useState<{ text: string; ok: boolean } | null>(null)
+  const [dsAllRunning, setDsAllRunning] = useState(false)
+  const [dsAllProgress, setDsAllProgress] = useState<{ done: number; total: number; current: string } | null>(null)
+  const [dsAllMessage, setDsAllMessage] = useState<{ text: string; ok: boolean } | null>(null)
 
   useEffect(() => {
     checkHealth().then(h => setModelInfo({ model: h.sam_model, sam_ready: h.sam_ready })).catch(() => {})
@@ -170,6 +179,56 @@ export default function ConfigPanel() {
         updateVideo({ start_frame: v })
       } catch { /* non-critical */ }
     }
+  }
+
+  async function handleDownsample() {
+    if (!pid || !vid) return
+    setDsRunning(true)
+    setDsMessage(null)
+    const ds: DownsampleOptions = dsMode === 'factor' ? { scaleFactor: dsFactor } : { maxDim: dsMaxDim }
+    try {
+      const result = await downsampleVideo(pid, vid, ds)
+      if (result.status === 'skipped') {
+        setDsMessage({ text: result.message ?? 'Already within target size.', ok: true })
+      } else {
+        updateVideo({ width: result.width, height: result.height })
+        setDsMessage({ text: `Done — ${result.width}×${result.height}`, ok: true })
+      }
+    } catch (e: unknown) {
+      const detail = (e as any)?.response?.data?.detail
+      setDsMessage({ text: detail ?? (e instanceof Error ? e.message : 'Downsample failed'), ok: false })
+    } finally {
+      setDsRunning(false)
+    }
+  }
+
+  async function handleDownsampleAll() {
+    if (!pid || !project) return
+    const videos = Object.values(project.videos)
+    if (!videos.length) return
+    setDsAllRunning(true)
+    setDsAllMessage(null)
+    setDsAllProgress({ done: 0, total: videos.length, current: '' })
+    const ds: DownsampleOptions = dsMode === 'factor' ? { scaleFactor: dsFactor } : { maxDim: dsMaxDim }
+    let skipped = 0, done = 0, failed = 0
+    for (let i = 0; i < videos.length; i++) {
+      const v = videos[i]
+      setDsAllProgress({ done: i, total: videos.length, current: v.name })
+      try {
+        const result = await downsampleVideo(pid, v.id, ds)
+        if (result.status === 'skipped') skipped++
+        else done++
+      } catch {
+        failed++
+      }
+    }
+    setDsAllProgress(null)
+    const parts = []
+    if (done) parts.push(`${done} downsampled`)
+    if (skipped) parts.push(`${skipped} skipped`)
+    if (failed) parts.push(`${failed} failed`)
+    setDsAllMessage({ text: parts.join(', ') || 'Done', ok: failed === 0 })
+    setDsAllRunning(false)
   }
 
   const maxFrame = video ? video.num_frames - 1 : 999999
@@ -208,6 +267,117 @@ export default function ConfigPanel() {
             <span className="text-xs text-[#555] ml-auto">{modelInfo?.sam_ready ? 'ready' : 'loading'}</span>
           </div>
         </div>
+
+        {/* Video */}
+        {project && (
+          <Section title="Video">
+            {/* Shared controls row */}
+            <div className="py-3 border-b border-[#1e1e1e]">
+              <p className="text-xs text-[#555] mb-2">Downsample settings</p>
+              <div className="flex items-center gap-2">
+                <select
+                  value={dsMode}
+                  onChange={e => setDsMode(e.target.value as 'max_dim' | 'factor')}
+                  disabled={dsRunning || dsAllRunning}
+                  className="text-xs text-black font-mono px-1.5 py-1 rounded border border-[#333] bg-white"
+                >
+                  <option value="max_dim">Max px</option>
+                  <option value="factor">Factor</option>
+                </select>
+                {dsMode === 'max_dim' ? (
+                  <>
+                    <input
+                      type="number"
+                      min={64}
+                      max={7680}
+                      value={dsMaxDim}
+                      onChange={e => setDsMaxDim(Math.max(64, Math.min(7680, parseInt(e.target.value) || 1080)))}
+                      disabled={dsRunning || dsAllRunning}
+                      className="w-20 text-xs text-black font-mono text-center py-1 px-2 rounded border border-[#333]"
+                    />
+                    <span className="text-xs text-[#555]">px (longest side)</span>
+                  </>
+                ) : (
+                  <select
+                    value={dsFactor}
+                    onChange={e => setDsFactor(Number(e.target.value))}
+                    disabled={dsRunning || dsAllRunning}
+                    className="text-xs text-black font-mono px-1.5 py-1 rounded border border-[#333] bg-white"
+                  >
+                    {[2, 3, 4, 6, 8].map(f => <option key={f} value={f}>{f}×</option>)}
+                  </select>
+                )}
+              </div>
+            </div>
+
+            {/* Current video row */}
+            {video && (
+            <div className="py-3 border-b border-[#1e1e1e]">
+              <div className="flex items-start gap-4">
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm text-[#ddd] font-medium">Downsample current video</p>
+                  <p className="text-xs text-[#666] mt-0.5 leading-relaxed">
+                    Current: <span className="font-mono text-[#888]">{video.width}×{video.height}</span>.
+                    Clears cached frames. Irreversible — do before labeling.
+                  </p>
+                  {dsMessage && (
+                    <p className={`text-xs mt-1.5 ${dsMessage.ok ? 'text-green-400' : 'text-red-400'}`}>
+                      {dsMessage.text}
+                    </p>
+                  )}
+                </div>
+                <button
+                  onClick={handleDownsample}
+                  disabled={dsRunning || dsAllRunning || !pid || !vid}
+                  className="px-3 py-1.5 rounded-lg text-xs font-medium bg-[#2a2a2a] hover:bg-[#333] text-[#ccc] disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-1.5 flex-shrink-0 mt-0.5"
+                >
+                  {dsRunning && <span className="inline-block w-3 h-3 border-2 border-white/30 border-t-white rounded-full animate-spin" />}
+                  {dsRunning ? 'Running…' : 'Apply'}
+                </button>
+              </div>
+            </div>
+            )}
+
+            {/* All videos row */}
+            <div className="py-3">
+              <div className="flex items-start gap-4">
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm text-[#ddd] font-medium">Downsample all videos</p>
+                  <p className="text-xs text-[#666] mt-0.5 leading-relaxed">
+                    Apply the settings above to every video in this project sequentially.
+                    Videos already within the target are skipped.
+                  </p>
+                  {dsAllProgress && (
+                    <div className="mt-1.5 space-y-1">
+                      <p className="text-xs text-[#888] truncate">
+                        {dsAllProgress.done}/{dsAllProgress.total} — {dsAllProgress.current}
+                      </p>
+                      <div className="h-1 bg-[#333] rounded-full overflow-hidden w-full">
+                        <div
+                          className="h-full bg-blue-500 transition-all duration-300"
+                          style={{ width: `${(dsAllProgress.done / dsAllProgress.total) * 100}%` }}
+                        />
+                      </div>
+                    </div>
+                  )}
+                  {dsAllMessage && (
+                    <p className={`text-xs mt-1.5 ${dsAllMessage.ok ? 'text-green-400' : 'text-red-400'}`}>
+                      {dsAllMessage.text}
+                    </p>
+                  )}
+                </div>
+                <button
+                  onClick={handleDownsampleAll}
+                  disabled={dsRunning || dsAllRunning || !pid}
+                  className="px-3 py-1.5 rounded-lg text-xs font-medium bg-[#2a2a2a] hover:bg-[#333] text-[#ccc] disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-1.5 flex-shrink-0 mt-0.5"
+                >
+                  {dsAllRunning && <span className="inline-block w-3 h-3 border-2 border-white/30 border-t-white rounded-full animate-spin" />}
+                  {dsAllRunning ? 'Running…' : 'Apply to all'}
+                </button>
+              </div>
+            </div>
+          </Section>
+        )}
 
         {/* Annotation */}
         <Section title="Annotation">

@@ -2,7 +2,7 @@ import React, { useCallback, useRef, useState, useMemo } from 'react'
 import { X, Upload, Film, Server, FolderOpen, Search, CheckSquare, Square } from 'lucide-react'
 import { useStore } from '../store/useStore'
 import { createProject, addVideo, importVideo, getProject, browseDirectory } from '../api/client'
-import type { BrowseEntry } from '../api/client'
+import type { BrowseEntry, DownsampleOptions } from '../api/client'
 
 type InputMode = 'upload' | 'server' | 'folder'
 
@@ -60,6 +60,12 @@ export default function UploadModal() {
   const [folderImportProgress, setFolderImportProgress] = useState<{ done: number; total: number } | null>(null)
   const [recursive, setRecursive] = useState(false)
   const [scanDepth, setScanDepth] = useState(3)
+
+  // Downsample (shared across all modes)
+  const [downsample, setDownsample] = useState(false)
+  const [dsMode, setDsMode] = useState<'max_dim' | 'factor'>('max_dim')
+  const [maxDim, setMaxDim] = useState(1080)
+  const [dsFactor, setDsFactor] = useState(2)
 
   // Shared
   const [extracting, setExtracting] = useState(false)
@@ -135,13 +141,18 @@ export default function UploadModal() {
     throw new Error('Frame extraction timed out')
   }
 
+  function getDsOptions(): DownsampleOptions | undefined {
+    if (!downsample) return undefined
+    return dsMode === 'factor' ? { scaleFactor: dsFactor } : { maxDim }
+  }
+
   async function handleUpload() {
     if (!selectedFile) return
     setUploading(true)
     setError('')
     try {
       const pid = await ensureProject()
-      const video = await addVideo(pid, selectedFile, pct => setUploadProgress(pct))
+      const video = await addVideo(pid, selectedFile, pct => setUploadProgress(pct), getDsOptions())
       await pollUntilReady(pid, video.id)
       handleClose()
     } catch (e: unknown) {
@@ -161,7 +172,7 @@ export default function UploadModal() {
     setError('')
     try {
       const pid = await ensureProject()
-      const video = await importVideo(pid, serverPath.trim())
+      const video = await importVideo(pid, serverPath.trim(), getDsOptions())
       await pollUntilReady(pid, video.id)
       handleClose()
     } catch (e: unknown) {
@@ -244,7 +255,7 @@ export default function UploadModal() {
       let lastVid: string | null = null
       for (let i = 0; i < toImport.length; i++) {
         const entry = toImport[i]
-        const video = await importVideo(pid, entry.path)
+        const video = await importVideo(pid, entry.path, getDsOptions())
         lastVid = video.id
         setFolderImportProgress({ done: i + 1, total: toImport.length })
       }
@@ -587,6 +598,67 @@ export default function UploadModal() {
               )}
             </div>
           )}
+
+          {/* Downsample */}
+          <div className="border border-[#2a2a2a] rounded-xl px-4 py-3 space-y-2">
+            <label className="flex items-center gap-2.5 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={downsample}
+                onChange={e => setDownsample(e.target.checked)}
+                disabled={busy}
+                className="w-3.5 h-3.5 accent-blue-500"
+              />
+              <span className="text-sm text-[#ccc] font-medium">Downsample video</span>
+            </label>
+            {downsample && (
+              <div className="pl-6 space-y-2">
+                <div className="flex gap-3">
+                  {(['max_dim', 'factor'] as const).map(m => (
+                    <label key={m} className="flex items-center gap-1.5 cursor-pointer select-none">
+                      <input
+                        type="radio"
+                        checked={dsMode === m}
+                        onChange={() => setDsMode(m)}
+                        disabled={busy}
+                        className="accent-blue-500"
+                      />
+                      <span className="text-xs text-[#aaa]">{m === 'max_dim' ? 'Max dimension' : 'Scale factor'}</span>
+                    </label>
+                  ))}
+                </div>
+                {dsMode === 'max_dim' ? (
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      min={64}
+                      max={7680}
+                      value={maxDim}
+                      onChange={e => setMaxDim(Math.max(64, Math.min(7680, parseInt(e.target.value) || 1080)))}
+                      className="w-20 text-xs text-black font-mono text-center"
+                      disabled={busy}
+                    />
+                    <span className="text-xs text-[#555]">px — longest side clamped to this value</span>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-2">
+                    <select
+                      value={dsFactor}
+                      onChange={e => setDsFactor(Number(e.target.value))}
+                      disabled={busy}
+                      className="text-xs text-black font-mono px-2 py-1 rounded border border-[#333] bg-white"
+                    >
+                      {[2, 3, 4, 6, 8].map(f => <option key={f} value={f}>{f}×</option>)}
+                    </select>
+                    <span className="text-xs text-[#555]">each dimension divided by this factor</span>
+                  </div>
+                )}
+                <p className="text-xs text-[#555] leading-relaxed">
+                  Re-encodes with ffmpeg. Happens in the background after import.
+                </p>
+              </div>
+            )}
+          </div>
 
           {/* Error */}
           {error && (

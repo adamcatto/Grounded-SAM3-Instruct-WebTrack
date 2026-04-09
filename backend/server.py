@@ -28,6 +28,7 @@ from sse_starlette.sse import EventSourceResponse
 from project_manager import ProjectManager
 from sam_predictor import SAMPredictor, _get_predictor
 from video_processor import (
+    downsample_video,
     encode_mask_as_png,
     ensure_faststart,
     export_video_with_masks,
@@ -296,6 +297,8 @@ async def add_video(
     pid: str,
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
+    max_dim: Optional[int] = Form(None),
+    scale_factor: Optional[float] = Form(None),
 ):
     project = pm.get_project(pid)
     if project is None:
@@ -332,17 +335,39 @@ async def add_video(
     shutil.move(tmp_path, str(perm_path))
     pm.update_video(pid, vid, {"source_path": str(perm_path)})
 
-    # Extract preview frames and apply faststart in background
-    frames_dir = str(pm.frames_dir(pid, vid))
-
     def do_post_upload():
-        try:
-            # Apply faststart so browser can stream the MP4 immediately
-            ensure_faststart(str(perm_path))
-        except Exception as e:
-            logger.warning(f"faststart failed for {pid}/{vid}: {e}")
-        # No longer extracting preview frames — frames are extracted on
-        # demand when the user annotates.
+        current_path = perm_path
+        needs_ds = (
+            (max_dim and max_dim > 0 and max(info["width"], info["height"]) > max_dim)
+            or (scale_factor and scale_factor > 1.0)
+        )
+        if needs_ds:
+            tmp_ds = current_path.with_suffix(".ds_tmp.mp4")
+            try:
+                ds_info = downsample_video(
+                    str(current_path), str(tmp_ds),
+                    max_dim=max_dim or None,
+                    scale_factor=scale_factor or None,
+                )
+                tmp_ds.replace(current_path)
+                pm.update_video(pid, vid, {
+                    "width": ds_info["width"],
+                    "height": ds_info["height"],
+                    "num_frames": ds_info["num_frames"],
+                })
+                logger.info(f"Downsampled {pid}/{vid} to {ds_info['width']}x{ds_info['height']}")
+            except Exception as e:
+                logger.warning(f"Downsample failed for {pid}/{vid}: {e}")
+                tmp_ds.unlink(missing_ok=True)
+                try:
+                    ensure_faststart(str(current_path))
+                except Exception:
+                    pass
+        else:
+            try:
+                ensure_faststart(str(current_path))
+            except Exception as e:
+                logger.warning(f"faststart failed for {pid}/{vid}: {e}")
         pm.update_video(pid, vid, {
             "frames_extracted": True,
             "all_frames_extracted": False,
@@ -357,6 +382,8 @@ async def add_video(
 
 class ImportVideoRequest(BaseModel):
     path: str
+    max_dim: Optional[int] = None
+    scale_factor: Optional[float] = None
 
 
 @app.post("/api/projects/{pid}/videos/import", status_code=201)
@@ -396,18 +423,46 @@ async def import_video(
     vid = video_meta["id"]
 
     # Copy the source video into the project directory (we need our own copy
-    # so we can apply faststart without modifying the original).
+    # so we can apply faststart / downsample without modifying the original).
     perm_path = pm.video_dir(pid, vid) / f"source{src.suffix}"
     shutil.copy2(str(src), str(perm_path))
     pm.update_video(pid, vid, {"source_path": str(perm_path)})
 
-    # Apply faststart in background (no preview extraction — on-demand)
+    max_dim = req.max_dim
+    scale_factor = req.scale_factor
+
     def do_post_import():
-        try:
-            # Apply faststart so browser can stream the MP4 immediately
-            ensure_faststart(str(perm_path))
-        except Exception as e:
-            logger.warning(f"faststart failed for imported {pid}/{vid}: {e}")
+        needs_ds = (
+            (max_dim and max_dim > 0 and max(info["width"], info["height"]) > max_dim)
+            or (scale_factor and scale_factor > 1.0)
+        )
+        if needs_ds:
+            tmp_ds = perm_path.with_suffix(".ds_tmp.mp4")
+            try:
+                ds_info = downsample_video(
+                    str(perm_path), str(tmp_ds),
+                    max_dim=max_dim or None,
+                    scale_factor=scale_factor or None,
+                )
+                tmp_ds.replace(perm_path)
+                pm.update_video(pid, vid, {
+                    "width": ds_info["width"],
+                    "height": ds_info["height"],
+                    "num_frames": ds_info["num_frames"],
+                })
+                logger.info(f"Downsampled imported {pid}/{vid} to {ds_info['width']}x{ds_info['height']}")
+            except Exception as e:
+                logger.warning(f"Downsample failed for imported {pid}/{vid}: {e}")
+                tmp_ds.unlink(missing_ok=True)
+                try:
+                    ensure_faststart(str(perm_path))
+                except Exception:
+                    pass
+        else:
+            try:
+                ensure_faststart(str(perm_path))
+            except Exception as e:
+                logger.warning(f"faststart failed for imported {pid}/{vid}: {e}")
         pm.update_video(pid, vid, {
             "frames_extracted": True,
             "all_frames_extracted": False,
@@ -463,6 +518,92 @@ def browse_directory(path: str = Query(...), depth: int = Query(1)):
 
     files = _collect(root, 1)
     return {"directory": str(root), "files": files}
+
+
+# ─── Downsample existing video ───────────────────────────────────────────────
+
+class DownsampleRequest(BaseModel):
+    max_dim: Optional[int] = None
+    scale_factor: Optional[float] = None
+
+
+@app.post("/api/projects/{pid}/videos/{vid}/downsample")
+async def downsample_video_endpoint(pid: str, vid: str, req: DownsampleRequest):
+    """
+    Spatially downsample the source video in-place.
+    Provide either max_dim (longest side ≤ N px) or scale_factor (divide each dimension by N).
+    Clears cached frames (annotated_frames/ and frames/) since the resolution changes.
+    This is a blocking request — it returns once ffmpeg finishes.
+    """
+    if not req.max_dim and not req.scale_factor:
+        raise HTTPException(400, "Provide either max_dim or scale_factor")
+    if req.max_dim is not None and req.max_dim <= 0:
+        raise HTTPException(400, "max_dim must be > 0")
+    if req.scale_factor is not None and req.scale_factor <= 1.0:
+        raise HTTPException(400, "scale_factor must be > 1.0")
+
+    video = pm.get_video(pid, vid)
+    if video is None:
+        raise HTTPException(404, "Video not found")
+
+    source_path = video.get("source_path", "")
+    if not source_path or not Path(source_path).exists():
+        raise HTTPException(404, "Video source file not found")
+
+    current_w = video.get("width", 0)
+    current_h = video.get("height", 0)
+    if req.max_dim and max(current_w, current_h) <= req.max_dim:
+        return {
+            "status": "skipped",
+            "message": f"Video is already within {req.max_dim}px ({current_w}×{current_h})",
+            "width": current_w,
+            "height": current_h,
+        }
+
+    p = Path(source_path)
+
+    def _run():
+        tmp_out = p.with_name(p.stem + ".ds_tmp.mp4")
+        try:
+            ds_info = downsample_video(
+                str(p), str(tmp_out),
+                max_dim=req.max_dim or None,
+                scale_factor=req.scale_factor or None,
+            )
+            # Replace original with downsampled (already faststart-optimized)
+            if p.suffix.lower() != ".mp4":
+                new_p = p.with_suffix(".mp4")
+                tmp_out.replace(new_p)
+                p.unlink(missing_ok=True)
+                pm.update_video(pid, vid, {"source_path": str(new_p)})
+            else:
+                tmp_out.replace(p)
+            # Clear cached frames — resolution changed so they're stale
+            for frames_dir in [pm.frames_dir(pid, vid), pm.annotated_frames_dir(pid, vid)]:
+                if frames_dir.exists():
+                    shutil.rmtree(str(frames_dir))
+                frames_dir.mkdir(parents=True, exist_ok=True)
+            pm.update_video(pid, vid, {
+                "width": ds_info["width"],
+                "height": ds_info["height"],
+                "num_frames": ds_info["num_frames"],
+            })
+            return ds_info
+        except Exception:
+            tmp_out.unlink(missing_ok=True)
+            raise
+
+    try:
+        ds_info = await asyncio.to_thread(_run)
+    except Exception as e:
+        raise HTTPException(500, f"Downsample failed: {e}")
+
+    return {
+        "status": "done",
+        "width": ds_info["width"],
+        "height": ds_info["height"],
+        "num_frames": ds_info["num_frames"],
+    }
 
 
 @app.get("/api/projects/{pid}/videos/{vid}")

@@ -36,9 +36,16 @@ export const deleteProject = (pid: string) =>
 
 // ─── Videos ──────────────────────────────────────────────────────────────────
 
-export const addVideo = (pid: string, file: File, onProgress?: (pct: number) => void) => {
+export interface DownsampleOptions {
+  maxDim?: number
+  scaleFactor?: number
+}
+
+export const addVideo = (pid: string, file: File, onProgress?: (pct: number) => void, ds?: DownsampleOptions) => {
   const form = new FormData()
   form.append('file', file)
+  if (ds?.maxDim) form.append('max_dim', String(ds.maxDim))
+  if (ds?.scaleFactor) form.append('scale_factor', String(ds.scaleFactor))
   return api.post<VideoMeta>(`/projects/${pid}/videos`, form, {
     headers: { 'Content-Type': 'multipart/form-data' },
     onUploadProgress: e => {
@@ -47,8 +54,19 @@ export const addVideo = (pid: string, file: File, onProgress?: (pct: number) => 
   }).then(r => r.data)
 }
 
-export const importVideo = (pid: string, serverPath: string) =>
-  api.post<VideoMeta>(`/projects/${pid}/videos/import`, { path: serverPath }).then(r => r.data)
+export const importVideo = (pid: string, serverPath: string, ds?: DownsampleOptions) =>
+  api.post<VideoMeta>(`/projects/${pid}/videos/import`, {
+    path: serverPath,
+    max_dim: ds?.maxDim ?? null,
+    scale_factor: ds?.scaleFactor ?? null,
+  }).then(r => r.data)
+
+export const downsampleVideo = (pid: string, vid: string, ds: DownsampleOptions) =>
+  api.post<{ status: string; width: number; height: number; num_frames?: number; message?: string }>(
+    `/projects/${pid}/videos/${vid}/downsample`,
+    { max_dim: ds.maxDim ?? null, scale_factor: ds.scaleFactor ?? null },
+    { timeout: 1800_000 },
+  ).then(r => r.data)
 
 export interface BrowseEntry {
   name: string
