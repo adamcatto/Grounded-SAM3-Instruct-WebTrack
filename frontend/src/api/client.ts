@@ -266,10 +266,11 @@ export const resumeFromFrame = (pid: string, vid: string, resumeFrame: number, c
     { resume_frame: resumeFrame, clear_from_frame: clearFromFrame }
   ).then(r => r.data)
 
-export const startPropagationSSE = (pid: string, vid: string, startFrame = 0, resumeFrom = -1, endFrame = -1) => {
+export const startPropagationSSE = (pid: string, vid: string, startFrame = 0, resumeFrom = -1, endFrame = -1, useAllAnchors = false) => {
   const params = new URLSearchParams({ start_frame: String(startFrame) })
   if (resumeFrom >= 0) params.set('resume_from', String(resumeFrom))
   if (endFrame >= 0) params.set('end_frame', String(endFrame))
+  if (useAllAnchors) params.set('use_all_anchors', 'true')
   return new EventSource(`/api/projects/${pid}/videos/${vid}/propagate?${params}`)
 }
 

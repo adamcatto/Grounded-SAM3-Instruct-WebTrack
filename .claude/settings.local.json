@@ -53,7 +53,8 @@
       "Bash(grep -n \"def build_sam3_video_model\\\\|return.*Sam3Video\\\\|Sam3VideoInference\\\\|Sam3VideoBase\" /opt/software/Grounded-SAM3-Instruct-WebTrack/.sam3_src/sam3/model/*.py)",
       "Bash(conda run:*)",
       "Bash(/opt/conda/envs/sam3/bin/python -m py_compile /opt/software/Grounded-SAM3-Instruct-WebTrack/backend/server.py)",
-      "Bash(/home/lauren/.pyenv/versions/3.14.0/bin/python -m py_compile /opt/software/Grounded-SAM3-Instruct-WebTrack/backend/server.py)"
+      "Bash(/home/lauren/.pyenv/versions/3.14.0/bin/python -m py_compile /opt/software/Grounded-SAM3-Instruct-WebTrack/backend/server.py)",
+      "Bash(./node_modules/.bin/tsc --noEmit)"
     ]
   }
 }

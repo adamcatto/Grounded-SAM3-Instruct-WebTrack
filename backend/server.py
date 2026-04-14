@@ -1668,6 +1668,7 @@ async def _run_propagation_bg(
     all_prompts: dict,
     state: PropagationState,
     end_frame: int = -1,
+    use_all_anchors: bool = False,
 ) -> None:
     """
     Forward-only batch propagation.
@@ -1678,10 +1679,21 @@ async def _run_propagation_bg(
         resume continuity), when P1 > 0 and a mask file for P1-1 exists.
       - Seeds every user-labeled frame within [P1, P2] from their point prompts
         (sorted ascending so SAM sees them in order).
+      - When use_all_anchors=True, also extracts and seeds all user-labeled frames
+        outside [P1, P2] into the SAM session as global context.  These context
+        frames don't influence forward_start — propagation still begins from the
+        earliest in-batch seed — but SAM's memory attends to them.
       - Runs forward propagation from the earliest seeded frame to P2.
     Batches with no seeds (no labeled frames, no cross-batch mask) are skipped.
     """
     loop = asyncio.get_event_loop()
+
+    # All frame indices that have user-labeled point prompts (used for all-anchors mode).
+    all_labeled_frames: list[int] = sorted({
+        int(fidx_str)
+        for frame_prompts in all_prompts.values()
+        for fidx_str in frame_prompts.keys()
+    })
 
     # Compute simple sequential batches
     effective_end = end_frame if (end_frame >= 0 and end_frame < num_frames) else num_frames - 1
@@ -1805,6 +1817,17 @@ async def _run_propagation_bg(
                         })
                 await future
 
+                # All-anchors mode: extract user-labeled frames outside [P1, P2] so
+                # SAM can attend to them as global context during this batch.
+                if use_all_anchors:
+                    extra_frames = [f for f in all_labeled_frames if f < P1 or f > P2]
+                    for af in extra_frames:
+                        af_out = Path(tmp_dir) / f"{af:06d}.jpg"
+                        if not af_out.exists():
+                            await loop.run_in_executor(
+                                None, extract_frame_range, source_path, tmp_dir, af, af + 1
+                            )
+
                 await publish("batch_start", {
                     "batch": batch_idx,
                     "batch_start": P1,
@@ -1824,8 +1847,11 @@ async def _run_propagation_bg(
                         await loop.run_in_executor(None, _seed_from_npz, P1, prev_npz)
                         seeded_frames.append(P1)
 
-                # Seed every user-labeled frame inside this batch, sorted by frame index.
-                def _seed_labeled_frames() -> list[int]:
+                # Seed every user-labeled frame that is in the current session.
+                # Returns (in_batch, context_only): frames in [P1,P2] drive forward_start;
+                # context frames outside the batch give SAM global memory without
+                # pushing the propagation start point backwards.
+                def _seed_labeled_frames() -> tuple[list[int], list[int]]:
                     frame_map = sam._frame_maps.get((pid, vid), [])
                     items: list[tuple[int, int, dict]] = []
                     for obj_id_str, frame_prompts in all_prompts.items():
@@ -1838,22 +1864,32 @@ async def _run_propagation_bg(
                             if fidx in frame_map:
                                 items.append((fidx, obj_id_int, prompt))
                     items.sort(key=lambda x: x[0])
-                    seeded: list[int] = []
+                    in_batch: list[int] = []
+                    context_only: list[int] = []
                     for fidx, obj_id_int, prompt in items:
                         try:
                             sam.add_points(
                                 pid, vid, frame_idx=fidx, obj_id=obj_id_int,
                                 points=prompt["points"], labels=prompt["labels"],
                             )
-                            if fidx not in seeded:
-                                seeded.append(fidx)
+                            if P1 <= fidx <= P2:
+                                if fidx not in in_batch:
+                                    in_batch.append(fidx)
+                            else:
+                                if fidx not in context_only:
+                                    context_only.append(fidx)
                         except Exception as e:
                             logger.warning(
                                 f"Seed labeled frame: obj {obj_id_int} frame {fidx}: {e}"
                             )
-                    return seeded
+                    return in_batch, context_only
 
-                labeled_in_batch = await loop.run_in_executor(None, _seed_labeled_frames)
+                labeled_in_batch, labeled_context = await loop.run_in_executor(None, _seed_labeled_frames)
+                if labeled_context:
+                    logger.info(
+                        f"Batch {batch_idx} [{P1},{P2}]: seeded {len(labeled_context)} "
+                        f"context frame(s) outside batch: {labeled_context}"
+                    )
                 seeded_frames.extend(labeled_in_batch)
 
                 if not seeded_frames:
@@ -1922,7 +1958,7 @@ async def _run_propagation_bg(
 # ─── Propagation SSE endpoint ─────────────────────────────────────────────────
 
 @app.get("/api/projects/{pid}/videos/{vid}/propagate")
-async def propagate_video(pid: str, vid: str, start_frame: int = 0, resume_from: int = -1, end_frame: int = -1):
+async def propagate_video(pid: str, vid: str, start_frame: int = 0, resume_from: int = -1, end_frame: int = -1, use_all_anchors: bool = False):
     """
     Stream propagation results as Server-Sent Events.
 
@@ -1981,6 +2017,7 @@ async def propagate_video(pid: str, vid: str, start_frame: int = 0, resume_from:
                 pid, vid, actual_start, source_path, num_frames,
                 masks_dir, bboxes_dir, objects, all_prompts, state,
                 end_frame=end_frame,
+                use_all_anchors=use_all_anchors,
             )
         )
     else:

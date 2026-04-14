@@ -425,6 +425,21 @@ export default function ConfigPanel() {
           />
         </Section>
 
+        {/* Tracking */}
+        <Section title="Tracking">
+          <ToggleRow
+            label="Default to all-anchor context mode"
+            description={
+              'When all anchor frames are labeled and you click "Start Tracking", ' +
+              'pre-select the "All anchor frames as context" method. Each batch will ' +
+              'load all labeled frames into SAM\'s session for global context, which ' +
+              'may improve accuracy when objects change appearance across batches.'
+            }
+            value={config.useAllAnchors}
+            onChange={v => setConfig({ useAllAnchors: v })}
+          />
+        </Section>
+
         {/* Single-frame prediction */}
         <Section title="Single-frame prediction">
           <ToggleRow

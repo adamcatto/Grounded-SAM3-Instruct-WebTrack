@@ -26,6 +26,7 @@ export default function LeftPanel() {
     resetVideoState, updateVideo,
     setProject, setSavedMask, savedMaskCache, clearSavedMaskCache,
     addToast,
+    config,
     // Anchor phase
     anchorPhase, setAnchorPhase,
     anchorFrames, setAnchorFrames,
@@ -61,6 +62,13 @@ export default function LeftPanel() {
   const [trackRangeStart, setTrackRangeStart] = useState('')
   const [trackRangeEnd, setTrackRangeEnd] = useState('')
 
+  // Tracking method modal (shown when all anchors are labeled)
+  const [showTrackMethodModal, setShowTrackMethodModal] = useState(false)
+  const [trackMethodChoice, setTrackMethodChoice] = useState<'sequential' | 'all_anchors'>('sequential')
+
+  // Next-video prompt (shown when all anchors labeled and project has more videos)
+  const [showNextVideoModal, setShowNextVideoModal] = useState(false)
+
   // Swap masks modal
   const [showSwapModal, setShowSwapModal] = useState(false)
   const [swapObjA, setSwapObjA] = useState('')
@@ -78,6 +86,14 @@ export default function LeftPanel() {
   const objects = video ? Object.values(video.objects) : []
   const pid = project?.id ?? ''
   const vid = currentVideoId ?? ''
+
+  // Next video in project order (if any)
+  const nextVideoId = (() => {
+    if (!project || !currentVideoId) return null
+    const ids = Object.keys(project.videos)
+    const idx = ids.indexOf(currentVideoId)
+    return idx >= 0 && idx + 1 < ids.length ? ids[idx + 1] : null
+  })()
 
   const isTracking = propagationStatus === 'running'
   const isPaused = propagationStatus === 'paused'
@@ -184,6 +200,10 @@ export default function LeftPanel() {
       // All anchors labeled — exit annotation phase
       setAnchorPhase(false)
       setCurrentAnchorIndex(anchorFrames.length) // mark as complete
+      // If there's another video in the project, prompt the user
+      if (nextVideoId) {
+        setShowNextVideoModal(true)
+      }
       return
     }
 
@@ -193,6 +213,19 @@ export default function LeftPanel() {
   }
 
   function handleStartTracking() {
+    // When all anchors are labeled, prompt the user to choose the tracking method.
+    // Otherwise start immediately with the default (sequential) approach.
+    if (!hasObjects) return
+    if (allAnchorsLabeled) {
+      setTrackMethodChoice(config.useAllAnchors ? 'all_anchors' : 'sequential')
+      setShowTrackMethodModal(true)
+    } else {
+      _doStartTracking(false)
+    }
+  }
+
+  function _doStartTracking(useAllAnchors: boolean) {
+    setShowTrackMethodModal(false)
     if (!hasObjects) return
     setTrackingError('')
     setTrackingRetryMsg('')
@@ -204,7 +237,7 @@ export default function LeftPanel() {
     setTotalFramesToProcess(0)
     setActualStartFrame(propagationStartFrame)
     totalBatchesRef.current = 1
-    _connectSSE(0)
+    _connectSSE(0, undefined, -1, useAllAnchors)
   }
 
   function handleStartTrackRange() {
@@ -247,7 +280,7 @@ export default function LeftPanel() {
 
   // ── SSE Propagation ──────────────────────────────────────────────────────────
 
-  function _connectSSE(retryCount: number, explicitStart?: number, endFrame = -1) {
+  function _connectSSE(retryCount: number, explicitStart?: number, endFrame = -1, useAllAnchors = false) {
     const MAX_RETRIES = 3
     activeEsRef.current?.close()
 
@@ -257,7 +290,7 @@ export default function LeftPanel() {
       return
     }
     const effectiveStart = explicitStart ?? propagationStartFrame
-    const es = startPropagationSSE(pid, vid, effectiveStart, -1, endFrame)
+    const es = startPropagationSSE(pid, vid, effectiveStart, -1, endFrame, useAllAnchors)
     activeEsRef.current = es
 
     es.addEventListener('init', (e: MessageEvent) => {
@@ -334,7 +367,7 @@ export default function LeftPanel() {
         const attempt = retryCount + 1
         setTrackingRetryMsg(`Connection lost. Retrying (${attempt}/${MAX_RETRIES})...`)
         setPropagationStatus('running')
-        setTimeout(() => _connectSSE(attempt, explicitStart, endFrame), 3000)
+        setTimeout(() => _connectSSE(attempt, explicitStart, endFrame, useAllAnchors), 3000)
       } else {
         setPropagationStatus('error')
         setTrackingError(`Connection lost after ${MAX_RETRIES} retries. Check that backend is running.`)
@@ -1178,6 +1211,107 @@ export default function LeftPanel() {
             >
               Cancel
             </button>
+          </div>
+        </div>
+      )}
+
+      {/* Next-video prompt — shown when all anchors are labeled and another video exists */}
+      {showNextVideoModal && nextVideoId && project && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+          <div className="bg-[#1a1a1a] rounded-xl border border-[#333] p-5 w-84 shadow-xl">
+            <h3 className="text-sm font-semibold text-[#eee] mb-1">All anchor frames labeled</h3>
+            <p className="text-xs text-[#666] mb-5 leading-relaxed">
+              Would you like to start tracking this video now, or move on to the next video
+              (<span className="text-[#aaa]">{project.videos[nextVideoId]?.name}</span>) to label its anchor frames first?
+            </p>
+            <div className="flex flex-col gap-2">
+              <button
+                onClick={() => {
+                  setShowNextVideoModal(false)
+                  handleStartTracking()
+                }}
+                className="btn btn-primary w-full py-2 text-xs font-medium"
+              >
+                Start tracking this video
+              </button>
+              <button
+                onClick={() => {
+                  setShowNextVideoModal(false)
+                  store.setCurrentVideo(nextVideoId)
+                }}
+                className="btn btn-secondary w-full py-2 text-xs"
+              >
+                Go to next video &rarr; {project.videos[nextVideoId]?.name}
+              </button>
+              <button
+                onClick={() => setShowNextVideoModal(false)}
+                className="btn btn-ghost w-full py-2 text-xs text-[#555] hover:text-[#aaa]"
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Tracking method modal */}
+      {showTrackMethodModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+          <div className="bg-[#1a1a1a] rounded-xl border border-[#333] p-5 w-84 shadow-xl">
+            <h3 className="text-sm font-semibold text-[#eee] mb-1">Choose tracking method</h3>
+            <p className="text-xs text-[#555] mb-4 leading-relaxed">
+              All anchor frames have been labeled. Select how SAM seeds each propagation batch.
+            </p>
+
+            <div className="space-y-2 mb-5">
+              {/* Option A: sequential */}
+              <button
+                onClick={() => setTrackMethodChoice('sequential')}
+                className={`w-full text-left rounded-lg border px-3 py-2.5 transition-colors ${
+                  trackMethodChoice === 'sequential'
+                    ? 'border-blue-500 bg-blue-500/10'
+                    : 'border-[#333] bg-[#111] hover:border-[#444]'
+                }`}
+              >
+                <p className="text-xs font-medium text-[#ddd] mb-0.5">Sequential batches</p>
+                <p className="text-[10px] text-[#666] leading-relaxed">
+                  Each 1 000-frame batch seeds from its own labeled frames and the previous
+                  batch's last mask. Fast and memory-efficient.
+                </p>
+              </button>
+
+              {/* Option B: all anchors */}
+              <button
+                onClick={() => setTrackMethodChoice('all_anchors')}
+                className={`w-full text-left rounded-lg border px-3 py-2.5 transition-colors ${
+                  trackMethodChoice === 'all_anchors'
+                    ? 'border-blue-500 bg-blue-500/10'
+                    : 'border-[#333] bg-[#111] hover:border-[#444]'
+                }`}
+              >
+                <p className="text-xs font-medium text-[#ddd] mb-0.5">All anchor frames as context</p>
+                <p className="text-[10px] text-[#666] leading-relaxed">
+                  Every labeled anchor frame is loaded into each batch's SAM session as a
+                  global context seed. May improve accuracy when objects change appearance
+                  across batches. Slightly slower per batch.
+                </p>
+              </button>
+            </div>
+
+            <div className="flex gap-2">
+              <button
+                onClick={() => setShowTrackMethodModal(false)}
+                className="btn btn-ghost flex-1 py-2 text-xs"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => _doStartTracking(trackMethodChoice === 'all_anchors')}
+                className="btn btn-primary flex-1 py-2 text-xs font-medium"
+              >
+                Start Tracking
+              </button>
+            </div>
           </div>
         </div>
       )}

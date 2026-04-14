@@ -20,6 +20,7 @@ export interface AppConfig {
   showMasks: boolean
   maskOpacity: number   // 0–1
   pointSize: number     // scale factor relative to default (1.0)
+  useAllAnchors: boolean  // default tracking method when anchor frames are labeled
 }
 
 const CONFIG_KEY = 'sam3wt_config'
@@ -29,6 +30,7 @@ const CONFIG_DEFAULTS: AppConfig = {
   showMasks: true,
   maskOpacity: 0.85,
   pointSize: 1.0,
+  useAllAnchors: false,
 }
 
 function loadConfig(): AppConfig {

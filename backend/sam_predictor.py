@@ -4,6 +4,7 @@ Manages sessions keyed by (project_id, video_id).
 """
 
 import logging
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -76,6 +77,10 @@ class SAMPredictor:
         # frame index.  Preview frames are named by real index (e.g. 001902.jpg), so we
         # must translate before every handle_request call.
         self._frame_maps: dict[tuple, list[int]] = {}
+        # Serializes all SAM state mutations.  SAM3 asserts that each (frame, object)
+        # pair has exactly one tracker state; two concurrent add_prompt calls for the
+        # same object corrupt the session permanently.
+        self.lock = threading.Lock()
 
     # ── Status helpers ────────────────────────────────────────────────────────
 
@@ -233,6 +238,20 @@ class SAMPredictor:
         - Text-only segmentation (via add_text_prompt)
         - Identity tracking during propagation
         """
+        with self.lock:
+            return self._add_points_locked(pid, vid, frame_idx, obj_id, points, labels, text)
+
+    def _add_points_locked(
+        self,
+        pid: str,
+        vid: str,
+        frame_idx: int,
+        obj_id: int,
+        points: list,
+        labels: list,
+        text: Optional[str] = None,
+    ) -> dict:
+        """Inner implementation; must be called with self.lock held."""
         session_id = self.get_session_id(pid, vid)
         if session_id is None:
             raise ValueError(f"No active session for {pid}/{vid}. Call init_session first.")

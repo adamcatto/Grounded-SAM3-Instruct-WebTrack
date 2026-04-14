@@ -596,7 +596,12 @@ def downsample_video(
     )
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg downsample failed: {result.stderr[-500:]}")
-    return get_video_info(str(dst_path))
+    info = get_video_info(str(dst_path))
+    if info["num_frames"] <= 0 or info["width"] <= 0 or info["height"] <= 0:
+        raise RuntimeError(
+            f"ffmpeg produced a broken output (no frames/dimensions): {result.stderr[-300:]}"
+        )
+    return info
 
 
 # ─── Thumbnail Generation ──────────────────────────────────────────────────────
