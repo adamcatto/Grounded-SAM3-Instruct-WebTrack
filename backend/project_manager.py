@@ -46,6 +46,14 @@ class ProjectManager:
         slug = re.sub(r"[^\w\-.]", "_", name).strip("_.-")
         return slug[:64]
 
+    def _find_video_dir(self, pid: str, vid: str) -> Optional[Path]:
+        """Locate the video directory by scanning for dirs starting with vid."""
+        videos_root = self._project_dir(pid) / "videos"
+        for d in videos_root.iterdir():
+            if d.name == vid or d.name.startswith(vid + "_"):
+                return d
+        return None
+
     def _find_project_dir(self, pid: str) -> Optional[Path]:
         """Locate the project directory by scanning for dirs starting with pid."""
         for d in BASE_DIR.iterdir():
@@ -118,7 +126,9 @@ class ProjectManager:
         if config is None:
             raise ValueError(f"Project {pid} not found")
         vid = str(uuid.uuid4())[:8]
-        video_dir = self._project_dir(pid) / "videos" / vid
+        slug = self._slugify(name)
+        dir_name = f"{vid}_{slug}" if slug else vid
+        video_dir = self._project_dir(pid) / "videos" / dir_name
         video_dir.mkdir(parents=True)
         (video_dir / "frames").mkdir()
         (video_dir / "masks").mkdir()
@@ -166,8 +176,8 @@ class ProjectManager:
             raise ValueError(f"Project {pid} not found")
         config["videos"].pop(vid, None)
         self._save_config(pid, config)
-        video_dir = self._project_dir(pid) / "videos" / vid
-        if video_dir.exists():
+        video_dir = self._find_video_dir(pid, vid)
+        if video_dir is not None and video_dir.exists():
             shutil.rmtree(video_dir)
 
     # ─── Objects ─────────────────────────────────────────────────────────────
@@ -318,7 +328,10 @@ class ProjectManager:
     # ─── Paths ───────────────────────────────────────────────────────────────
 
     def video_dir(self, pid: str, vid: str) -> Path:
-        return self._project_dir(pid) / "videos" / vid
+        d = self._find_video_dir(pid, vid)
+        if d is None:
+            raise ValueError(f"Video {vid} not found in project {pid}")
+        return d
 
     def frames_dir(self, pid: str, vid: str) -> Path:
         return self.video_dir(pid, vid) / "frames"

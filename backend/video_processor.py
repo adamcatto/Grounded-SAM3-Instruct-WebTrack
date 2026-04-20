@@ -505,6 +505,16 @@ def export_video_with_masks(
         stderr=subprocess.PIPE,
     )
 
+    # Drain ffmpeg stderr in a background thread to prevent the OS pipe
+    # buffer (64 KB) from filling up and deadlocking the encode on long videos.
+    import threading
+    _stderr_chunks: list[bytes] = []
+    def _drain_stderr():
+        for chunk in iter(lambda: ffmpeg_proc.stderr.read(4096), b""):
+            _stderr_chunks.append(chunk)
+    _stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+    _stderr_thread.start()
+
     frame_idx = 0
     try:
         while True:
@@ -540,8 +550,9 @@ def export_video_with_masks(
     except Exception:
         pass
     ret_code = ffmpeg_proc.wait(timeout=300)
+    _stderr_thread.join(timeout=10)
     if ret_code != 0:
-        stderr_out = ffmpeg_proc.stderr.read().decode(errors="replace")
+        stderr_out = b"".join(_stderr_chunks).decode(errors="replace")
         raise RuntimeError(f"ffmpeg encoding failed (exit {ret_code}): {stderr_out[-500:]}")
 
     # Emit final progress at 100%
