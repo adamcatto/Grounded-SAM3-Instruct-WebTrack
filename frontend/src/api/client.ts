@@ -54,11 +54,12 @@ export const addVideo = (pid: string, file: File, onProgress?: (pct: number) => 
   }).then(r => r.data)
 }
 
-export const importVideo = (pid: string, serverPath: string, ds?: DownsampleOptions) =>
+export const importVideo = (pid: string, serverPath: string, ds?: DownsampleOptions, symlink?: boolean) =>
   api.post<VideoMeta>(`/projects/${pid}/videos/import`, {
     path: serverPath,
     max_dim: ds?.maxDim ?? null,
     scale_factor: ds?.scaleFactor ?? null,
+    symlink: symlink ?? false,
   }).then(r => r.data)
 
 export const downsampleVideo = (pid: string, vid: string, ds: DownsampleOptions) =>

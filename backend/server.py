@@ -28,7 +28,7 @@ from sse_starlette.sse import EventSourceResponse
 from project_manager import ProjectManager
 from sam_predictor import SAMPredictor, _get_predictor
 from video_processor import (
-    downsample_video,
+    compute_ds_dims,
     encode_mask_as_png,
     ensure_faststart,
     export_video_with_masks,
@@ -42,6 +42,11 @@ from video_processor import (
     generate_thumbnail,
     composite_masks_as_png,
 )
+
+
+def _video_ds_params(video: dict) -> tuple[Optional[int], Optional[float]]:
+    """Return (max_dim, scale_factor) stored in video metadata for lazy downsampling."""
+    return video.get("downsample_max_dim"), video.get("downsample_scale_factor")
 
 STREAM_BATCH_SIZE = 1000  # frames per propagation batch / anchor interval
 
@@ -335,43 +340,26 @@ async def add_video(
     shutil.move(tmp_path, str(perm_path))
     pm.update_video(pid, vid, {"source_path": str(perm_path)})
 
+    # Compute effective dimensions for lazy downsampling (no re-encoding)
+    ds_max_dim = max_dim if (max_dim and max_dim > 0) else None
+    ds_scale_factor = scale_factor if (scale_factor and scale_factor > 1.0) else None
+    eff_w, eff_h = compute_ds_dims(info["width"], info["height"], ds_max_dim, ds_scale_factor)
+
+    updates: dict = {"frames_extracted": True, "all_frames_extracted": False}
+    if ds_max_dim is not None:
+        updates["downsample_max_dim"] = ds_max_dim
+    if ds_scale_factor is not None:
+        updates["downsample_scale_factor"] = ds_scale_factor
+    if (eff_w, eff_h) != (info["width"], info["height"]):
+        updates["width"] = eff_w
+        updates["height"] = eff_h
+
     def do_post_upload():
-        current_path = perm_path
-        needs_ds = (
-            (max_dim and max_dim > 0 and max(info["width"], info["height"]) > max_dim)
-            or (scale_factor and scale_factor > 1.0)
-        )
-        if needs_ds:
-            tmp_ds = current_path.with_suffix(".ds_tmp.mp4")
-            try:
-                ds_info = downsample_video(
-                    str(current_path), str(tmp_ds),
-                    max_dim=max_dim or None,
-                    scale_factor=scale_factor or None,
-                )
-                tmp_ds.replace(current_path)
-                pm.update_video(pid, vid, {
-                    "width": ds_info["width"],
-                    "height": ds_info["height"],
-                    "num_frames": ds_info["num_frames"],
-                })
-                logger.info(f"Downsampled {pid}/{vid} to {ds_info['width']}x{ds_info['height']}")
-            except Exception as e:
-                logger.warning(f"Downsample failed for {pid}/{vid}: {e}")
-                tmp_ds.unlink(missing_ok=True)
-                try:
-                    ensure_faststart(str(current_path))
-                except Exception:
-                    pass
-        else:
-            try:
-                ensure_faststart(str(current_path))
-            except Exception as e:
-                logger.warning(f"faststart failed for {pid}/{vid}: {e}")
-        pm.update_video(pid, vid, {
-            "frames_extracted": True,
-            "all_frames_extracted": False,
-        })
+        try:
+            ensure_faststart(str(perm_path))
+        except Exception as e:
+            logger.warning(f"faststart failed for {pid}/{vid}: {e}")
+        pm.update_video(pid, vid, updates)
 
     background_tasks.add_task(do_post_upload)
 
@@ -384,6 +372,7 @@ class ImportVideoRequest(BaseModel):
     path: str
     max_dim: Optional[int] = None
     scale_factor: Optional[float] = None
+    symlink: bool = False
 
 
 @app.post("/api/projects/{pid}/videos/import", status_code=201)
@@ -396,7 +385,7 @@ async def import_video(
     if project is None:
         raise HTTPException(404, "Project not found")
 
-    src = Path(req.path)
+    src = Path(req.path).resolve()
     if not src.exists():
         raise HTTPException(400, f"File not found: {req.path}")
     if not src.is_file():
@@ -411,62 +400,54 @@ async def import_video(
     except Exception as e:
         raise HTTPException(400, f"Invalid video file: {e}")
 
+    # Compute effective dimensions for lazy downsampling (frames are resized on extraction;
+    # the source file is NEVER modified regardless of symlink/copy mode).
+    ds_max_dim = req.max_dim if (req.max_dim and req.max_dim > 0) else None
+    ds_scale_factor = req.scale_factor if (req.scale_factor and req.scale_factor > 1.0) else None
+    eff_w, eff_h = compute_ds_dims(info["width"], info["height"], ds_max_dim, ds_scale_factor)
+
     video_meta = pm.add_video(
         pid=pid,
         name=src.name,
         source_path=str(src),
         num_frames=info["num_frames"],
         fps=info["fps"],
-        width=info["width"],
-        height=info["height"],
+        width=eff_w,
+        height=eff_h,
     )
     vid = video_meta["id"]
 
-    # Copy the source video into the project directory (we need our own copy
-    # so we can apply faststart / downsample without modifying the original).
     perm_path = pm.video_dir(pid, vid) / f"source{src.suffix}"
-    shutil.copy2(str(src), str(perm_path))
-    pm.update_video(pid, vid, {"source_path": str(perm_path)})
 
-    max_dim = req.max_dim
-    scale_factor = req.scale_factor
+    if req.symlink:
+        # Create a symlink — original file is never touched.
+        os.symlink(str(src), str(perm_path))
+        logger.info(f"Symlinked {src} → {perm_path}")
+    else:
+        shutil.copy2(str(src), str(perm_path))
+
+    updates: dict = {
+        "source_path": str(perm_path),
+        "frames_extracted": True,
+        "all_frames_extracted": False,
+    }
+    if ds_max_dim is not None:
+        updates["downsample_max_dim"] = ds_max_dim
+    if ds_scale_factor is not None:
+        updates["downsample_scale_factor"] = ds_scale_factor
+
+    pm.update_video(pid, vid, updates)
 
     def do_post_import():
-        needs_ds = (
-            (max_dim and max_dim > 0 and max(info["width"], info["height"]) > max_dim)
-            or (scale_factor and scale_factor > 1.0)
-        )
-        if needs_ds:
-            tmp_ds = perm_path.with_suffix(".ds_tmp.mp4")
-            try:
-                ds_info = downsample_video(
-                    str(perm_path), str(tmp_ds),
-                    max_dim=max_dim or None,
-                    scale_factor=scale_factor or None,
-                )
-                tmp_ds.replace(perm_path)
-                pm.update_video(pid, vid, {
-                    "width": ds_info["width"],
-                    "height": ds_info["height"],
-                    "num_frames": ds_info["num_frames"],
-                })
-                logger.info(f"Downsampled imported {pid}/{vid} to {ds_info['width']}x{ds_info['height']}")
-            except Exception as e:
-                logger.warning(f"Downsample failed for imported {pid}/{vid}: {e}")
-                tmp_ds.unlink(missing_ok=True)
-                try:
-                    ensure_faststart(str(perm_path))
-                except Exception:
-                    pass
+        if req.symlink:
+            # Never apply faststart to the symlink target — it would modify the original.
+            # The /faststart endpoint provides an explicit escape hatch if needed.
+            pass
         else:
             try:
                 ensure_faststart(str(perm_path))
             except Exception as e:
                 logger.warning(f"faststart failed for imported {pid}/{vid}: {e}")
-        pm.update_video(pid, vid, {
-            "frames_extracted": True,
-            "all_frames_extracted": False,
-        })
 
     background_tasks.add_task(do_post_import)
 
@@ -530,10 +511,9 @@ class DownsampleRequest(BaseModel):
 @app.post("/api/projects/{pid}/videos/{vid}/downsample")
 async def downsample_video_endpoint(pid: str, vid: str, req: DownsampleRequest):
     """
-    Spatially downsample the source video in-place.
-    Provide either max_dim (longest side ≤ N px) or scale_factor (divide each dimension by N).
-    Clears cached frames (annotated_frames/ and frames/) since the resolution changes.
-    This is a blocking request — it returns once ffmpeg finishes.
+    Set lazy downsample parameters for a video.
+    Frames are resized on extraction — the source file is never modified.
+    Clears cached frames/ and annotated_frames/ so they are re-extracted at the new size.
     """
     if not req.max_dim and not req.scale_factor:
         raise HTTPException(400, "Provide either max_dim or scale_factor")
@@ -546,63 +526,49 @@ async def downsample_video_endpoint(pid: str, vid: str, req: DownsampleRequest):
     if video is None:
         raise HTTPException(404, "Video not found")
 
+    # Derive native dims from the source file (ignoring any prior lazy-ds stored dims).
     source_path = video.get("source_path", "")
     if not source_path or not Path(source_path).exists():
         raise HTTPException(404, "Video source file not found")
 
-    current_w = video.get("width", 0)
-    current_h = video.get("height", 0)
-    if req.max_dim and max(current_w, current_h) <= req.max_dim:
+    try:
+        native = get_video_info(str(Path(source_path).resolve()))
+    except Exception as e:
+        raise HTTPException(500, f"Cannot read video info: {e}")
+
+    ds_max_dim = req.max_dim if req.max_dim and req.max_dim > 0 else None
+    ds_scale_factor = req.scale_factor if req.scale_factor and req.scale_factor > 1.0 else None
+
+    eff_w, eff_h = compute_ds_dims(native["width"], native["height"], ds_max_dim, ds_scale_factor)
+
+    if (eff_w, eff_h) == (native["width"], native["height"]):
         return {
             "status": "skipped",
-            "message": f"Video is already within {req.max_dim}px ({current_w}×{current_h})",
-            "width": current_w,
-            "height": current_h,
+            "message": f"Video is already within the requested size ({eff_w}×{eff_h})",
+            "width": eff_w,
+            "height": eff_h,
+            "num_frames": native["num_frames"],
         }
 
-    p = Path(source_path)
+    # Clear cached frames — they were extracted at the old resolution.
+    for d in [pm.frames_dir(pid, vid), pm.annotated_frames_dir(pid, vid)]:
+        if d.exists():
+            shutil.rmtree(str(d))
+        d.mkdir(parents=True, exist_ok=True)
 
-    def _run():
-        tmp_out = p.with_name(p.stem + ".ds_tmp.mp4")
-        try:
-            ds_info = downsample_video(
-                str(p), str(tmp_out),
-                max_dim=req.max_dim or None,
-                scale_factor=req.scale_factor or None,
-            )
-            # Replace original with downsampled (already faststart-optimized)
-            if p.suffix.lower() != ".mp4":
-                new_p = p.with_suffix(".mp4")
-                tmp_out.replace(new_p)
-                p.unlink(missing_ok=True)
-                pm.update_video(pid, vid, {"source_path": str(new_p)})
-            else:
-                tmp_out.replace(p)
-            # Clear cached frames — resolution changed so they're stale
-            for frames_dir in [pm.frames_dir(pid, vid), pm.annotated_frames_dir(pid, vid)]:
-                if frames_dir.exists():
-                    shutil.rmtree(str(frames_dir))
-                frames_dir.mkdir(parents=True, exist_ok=True)
-            pm.update_video(pid, vid, {
-                "width": ds_info["width"],
-                "height": ds_info["height"],
-                "num_frames": ds_info["num_frames"],
-            })
-            return ds_info
-        except Exception:
-            tmp_out.unlink(missing_ok=True)
-            raise
+    updates: dict = {"width": eff_w, "height": eff_h}
+    # Clear any previously stored ds params before storing new ones.
+    updates["downsample_max_dim"] = ds_max_dim
+    updates["downsample_scale_factor"] = ds_scale_factor
 
-    try:
-        ds_info = await asyncio.to_thread(_run)
-    except Exception as e:
-        raise HTTPException(500, f"Downsample failed: {e}")
+    pm.update_video(pid, vid, updates)
+    logger.info(f"Lazy downsample set for {pid}/{vid}: {eff_w}×{eff_h}")
 
     return {
         "status": "done",
-        "width": ds_info["width"],
-        "height": ds_info["height"],
-        "num_frames": ds_info["num_frames"],
+        "width": eff_w,
+        "height": eff_h,
+        "num_frames": native["num_frames"],
     }
 
 
@@ -750,8 +716,12 @@ def get_frame(pid: str, vid: str, fidx: int, thumb: bool = False):
     if not frame_path.exists():
         source_path = video.get("source_path")
         if source_path and Path(source_path).exists():
+            ds_max_dim, ds_scale_factor = _video_ds_params(video)
             try:
-                extract_frame_range(source_path, str(frames_dir), fidx, fidx + 1)
+                extract_frame_range(
+                    source_path, str(frames_dir), fidx, fidx + 1,
+                    max_dim=ds_max_dim, scale_factor=ds_scale_factor,
+                )
             except Exception:
                 pass
 
@@ -787,8 +757,12 @@ def extract_annotated_frame(pid: str, vid: str, fidx: int):
     frame_path = ann_dir / f"{fidx:06d}.jpg"
 
     if not frame_path.exists():
+        ds_max_dim, ds_scale_factor = _video_ds_params(video)
         try:
-            extract_frame_range(source_path, str(ann_dir), fidx, fidx + 1)
+            extract_frame_range(
+                source_path, str(ann_dir), fidx, fidx + 1,
+                max_dim=ds_max_dim, scale_factor=ds_scale_factor,
+            )
         except Exception as e:
             raise HTTPException(500, f"Failed to extract frame {fidx}: {e}")
 
@@ -1669,6 +1643,8 @@ async def _run_propagation_bg(
     state: PropagationState,
     end_frame: int = -1,
     use_all_anchors: bool = False,
+    ds_max_dim: Optional[int] = None,
+    ds_scale_factor: Optional[float] = None,
 ) -> None:
     """
     Forward-only batch propagation.
@@ -1801,7 +1777,10 @@ async def _run_propagation_bg(
 
                 future = loop.run_in_executor(
                     None,
-                    lambda: extract_frame_range(source_path, tmp_dir, P1, P2 + 1, _progress_cb)
+                    lambda: extract_frame_range(
+                        source_path, tmp_dir, P1, P2 + 1, _progress_cb,
+                        max_dim=ds_max_dim, scale_factor=ds_scale_factor,
+                    )
                 )
                 _last_reported = -1
                 while not future.done():
@@ -1825,7 +1804,11 @@ async def _run_propagation_bg(
                         af_out = Path(tmp_dir) / f"{af:06d}.jpg"
                         if not af_out.exists():
                             await loop.run_in_executor(
-                                None, extract_frame_range, source_path, tmp_dir, af, af + 1
+                                None,
+                                lambda af=af: extract_frame_range(
+                                    source_path, tmp_dir, af, af + 1,
+                                    max_dim=ds_max_dim, scale_factor=ds_scale_factor,
+                                ),
                             )
 
                 await publish("batch_start", {
@@ -2012,12 +1995,15 @@ async def propagate_video(pid: str, vid: str, start_frame: int = 0, resume_from:
         state.user_start_frame = start_frame
         state.is_running = True
         state.is_paused = False
+        ds_max_dim, ds_scale_factor = _video_ds_params(video)
         state.task = asyncio.create_task(
             _run_propagation_bg(
                 pid, vid, actual_start, source_path, num_frames,
                 masks_dir, bboxes_dir, objects, all_prompts, state,
                 end_frame=end_frame,
                 use_all_anchors=use_all_anchors,
+                ds_max_dim=ds_max_dim,
+                ds_scale_factor=ds_scale_factor,
             )
         )
     else:

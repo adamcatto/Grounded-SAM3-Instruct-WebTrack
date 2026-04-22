@@ -108,6 +108,34 @@ def ensure_faststart(video_path: str) -> str:
 
 # ─── Frame Extraction ─────────────────────────────────────────────────────────
 
+def compute_ds_dims(
+    w: int, h: int,
+    max_dim: Optional[int] = None,
+    scale_factor: Optional[float] = None,
+) -> tuple[int, int]:
+    """Return (new_w, new_h) after applying lazy-downsample parameters."""
+    if scale_factor is not None and scale_factor > 1.0:
+        return max(1, int(w / scale_factor)), max(1, int(h / scale_factor))
+    if max_dim is not None and max_dim > 0 and max(w, h) > max_dim:
+        if w >= h:
+            return max_dim, max(1, int(round(h * max_dim / w)))
+        else:
+            return max(1, int(round(w * max_dim / h))), max_dim
+    return w, h
+
+
+def _ds_resize(
+    frame: np.ndarray,
+    max_dim: Optional[int] = None,
+    scale_factor: Optional[float] = None,
+) -> np.ndarray:
+    h, w = frame.shape[:2]
+    new_w, new_h = compute_ds_dims(w, h, max_dim, scale_factor)
+    if (new_w, new_h) == (w, h):
+        return frame
+    return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+
 def get_video_info(video_path: str) -> dict:
     """Return num_frames, fps, width, height for a video file."""
     cap = cv2.VideoCapture(str(video_path))
@@ -121,7 +149,10 @@ def get_video_info(video_path: str) -> dict:
     return {"num_frames": num_frames, "fps": fps, "width": width, "height": height}
 
 
-def extract_frames(video_path: str, out_dir: str, progress_callback=None) -> dict:
+def extract_frames(
+    video_path: str, out_dir: str, progress_callback=None,
+    max_dim: Optional[int] = None, scale_factor: Optional[float] = None,
+) -> dict:
     """
     Extract all frames from a video as 000000.jpg, 000001.jpg, ...
     Returns {num_frames, fps, width, height}.
@@ -143,6 +174,7 @@ def extract_frames(video_path: str, out_dir: str, progress_callback=None) -> dic
         ret, frame = cap.read()
         if not ret:
             break
+        frame = _ds_resize(frame, max_dim, scale_factor)
         out_file = out_path / f"{frame_idx:06d}.jpg"
         cv2.imwrite(str(out_file), frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
         frame_idx += 1
@@ -150,11 +182,13 @@ def extract_frames(video_path: str, out_dir: str, progress_callback=None) -> dic
             progress_callback(frame_idx, total)
 
     cap.release()
-    return {"num_frames": frame_idx, "fps": fps, "width": width, "height": height}
+    eff_w, eff_h = compute_ds_dims(width, height, max_dim, scale_factor)
+    return {"num_frames": frame_idx, "fps": fps, "width": eff_w, "height": eff_h}
 
 
 def extract_preview_frames(
-    video_path: str, out_dir: str, max_preview: int = 80
+    video_path: str, out_dir: str, max_preview: int = 80,
+    max_dim: Optional[int] = None, scale_factor: Optional[float] = None,
 ) -> dict:
     """
     Extract a small set of evenly-spaced preview frames for the video player.
@@ -194,24 +228,27 @@ def extract_preview_frames(
         ret, frame = cap.read()
         if not ret:
             continue
+        frame = _ds_resize(frame, max_dim, scale_factor)
         out_file = out_path / f"{idx:06d}.jpg"
         cv2.imwrite(str(out_file), frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
         extracted.append(idx)
 
     cap.release()
+    eff_w, eff_h = compute_ds_dims(width, height, max_dim, scale_factor)
     return {
         "num_frames": total,
         "preview_count": len(extracted),
         "preview_indices": extracted,
         "fps": fps,
-        "width": width,
-        "height": height,
+        "width": eff_w,
+        "height": eff_h,
     }
 
 
 def extract_frame_range(
     video_path: str, out_dir: str, start: int, end: int,
     progress_callback=None,
+    max_dim: Optional[int] = None, scale_factor: Optional[float] = None,
 ) -> dict:
     """
     Extract frames [start, end) from a video.  Skips frames that already exist
@@ -241,6 +278,7 @@ def extract_frame_range(
         ret, frame = cap.read()
         if not ret:
             break
+        frame = _ds_resize(frame, max_dim, scale_factor)
         cv2.imwrite(str(out_file), frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
         extracted += 1
         if progress_callback and extracted % 10 == 0:

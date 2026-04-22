@@ -61,6 +61,9 @@ export default function UploadModal() {
   const [recursive, setRecursive] = useState(false)
   const [scanDepth, setScanDepth] = useState(3)
 
+  // Symlink (server/folder modes only)
+  const [useSymlink, setUseSymlink] = useState(false)
+
   // Downsample (shared across all modes)
   const [downsample, setDownsample] = useState(false)
   const [dsMode, setDsMode] = useState<'max_dim' | 'factor'>('max_dim')
@@ -97,6 +100,7 @@ export default function UploadModal() {
     setFolderImportProgress(null)
     setIncludePattern('*')
     setExcludePattern('')
+    setUseSymlink(false)
   }
 
   function handleFile(file: File) {
@@ -172,7 +176,7 @@ export default function UploadModal() {
     setError('')
     try {
       const pid = await ensureProject()
-      const video = await importVideo(pid, serverPath.trim(), getDsOptions())
+      const video = await importVideo(pid, serverPath.trim(), getDsOptions(), useSymlink)
       await pollUntilReady(pid, video.id)
       handleClose()
     } catch (e: unknown) {
@@ -255,7 +259,7 @@ export default function UploadModal() {
       let lastVid: string | null = null
       for (let i = 0; i < toImport.length; i++) {
         const entry = toImport[i]
-        const video = await importVideo(pid, entry.path, getDsOptions())
+        const video = await importVideo(pid, entry.path, getDsOptions(), useSymlink)
         lastVid = video.id
         setFolderImportProgress({ done: i + 1, total: toImport.length })
       }
@@ -599,6 +603,31 @@ export default function UploadModal() {
             </div>
           )}
 
+          {/* Symlink (server/folder modes only) */}
+          {(inputMode === 'server' || inputMode === 'folder') && (
+            <div className="border border-[#2a2a2a] rounded-xl px-4 py-3 space-y-1">
+              <label className="flex items-center gap-2.5 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={useSymlink}
+                  onChange={e => setUseSymlink(e.target.checked)}
+                  disabled={busy}
+                  className="w-3.5 h-3.5 accent-blue-500"
+                />
+                <span className="text-sm text-[#ccc] font-medium">Symlink (don't copy)</span>
+              </label>
+              <p className="text-xs text-[#555] pl-6 leading-relaxed">
+                Creates a symlink to the original file instead of copying it — saves disk space.
+                The original is <strong className="text-[#888]">never modified</strong>.
+                {useSymlink && downsample && (
+                  <span className="block mt-1 text-amber-400/80">
+                    Downsampling is applied lazily per-frame when extracted — the source file is unchanged.
+                  </span>
+                )}
+              </p>
+            </div>
+          )}
+
           {/* Downsample */}
           <div className="border border-[#2a2a2a] rounded-xl px-4 py-3 space-y-2">
             <label className="flex items-center gap-2.5 cursor-pointer select-none">
@@ -654,7 +683,7 @@ export default function UploadModal() {
                   </div>
                 )}
                 <p className="text-xs text-[#555] leading-relaxed">
-                  Re-encodes with ffmpeg. Happens in the background after import.
+                  Frames are resized lazily on extraction — no re-encoding of the source file.
                 </p>
               </div>
             )}
