@@ -1,5 +1,5 @@
 import React, { useCallback, useRef, useState, useMemo } from 'react'
-import { X, Upload, Film, Server, FolderOpen, Search, CheckSquare, Square } from 'lucide-react'
+import { X, Upload, Film, Server, FolderOpen, Search, CheckSquare, Square, AlertTriangle } from 'lucide-react'
 import { useStore } from '../store/useStore'
 import { createProject, addVideo, importVideo, getProject, browseDirectory } from '../api/client'
 import type { BrowseEntry, DownsampleOptions } from '../api/client'
@@ -31,10 +31,35 @@ function formatSize(bytes: number): string {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`
 }
 
+/** FastAPI `{ detail }` shape (string or validation error list). */
+function formatAxiosDetail(err: unknown): string {
+  const ax = err as { response?: { data?: { detail?: unknown } } }
+  const detail = ax?.response?.data?.detail
+  if (typeof detail === 'string') return detail
+  if (Array.isArray(detail)) {
+    return detail
+      .map((item: unknown) =>
+        typeof item === 'object' && item !== null && 'msg' in item
+          ? String((item as { msg: unknown }).msg)
+          : String(item),
+      )
+      .join('; ')
+  }
+  if (detail !== undefined && detail !== null) return String(detail)
+  return err instanceof Error ? err.message : 'Import failed'
+}
+
+type ImportProceedPrompt = {
+  failedName: string
+  detail: string
+  remainingCount: number
+}
+
 export default function UploadModal() {
   const {
     uploadModalOpen, setUploadModalOpen,
     project, setProject, setCurrentVideo,
+    addToast,
   } = useStore()
 
   const [projectName, setProjectName] = useState('')
@@ -57,7 +82,14 @@ export default function UploadModal() {
   const [excludePattern, setExcludePattern] = useState('')
   const [checkedPaths, setCheckedPaths] = useState<Set<string>>(new Set())
   const [folderImporting, setFolderImporting] = useState(false)
-  const [folderImportProgress, setFolderImportProgress] = useState<{ done: number; total: number } | null>(null)
+  const [folderImportProgress, setFolderImportProgress] = useState<{
+    phase: number
+    total: number
+    importedOk: number
+    skipped: number
+  } | null>(null)
+  const [importProceedPrompt, setImportProceedPrompt] = useState<ImportProceedPrompt | null>(null)
+  const proceedResolverRef = useRef<((v: boolean) => void) | null>(null)
   const [recursive, setRecursive] = useState(false)
   const [scanDepth, setScanDepth] = useState(3)
 
@@ -101,6 +133,14 @@ export default function UploadModal() {
     setIncludePattern('*')
     setExcludePattern('')
     setUseSymlink(false)
+    setImportProceedPrompt(null)
+    proceedResolverRef.current = null
+  }
+
+  function resolveImportProceed(cont: boolean) {
+    proceedResolverRef.current?.(cont)
+    proceedResolverRef.current = null
+    setImportProceedPrompt(null)
   }
 
   function handleFile(file: File) {
@@ -180,13 +220,7 @@ export default function UploadModal() {
       await pollUntilReady(pid, video.id)
       handleClose()
     } catch (e: unknown) {
-      if (e instanceof Error) {
-        const axiosErr = e as any
-        const detail = axiosErr?.response?.data?.detail
-        setError(detail ?? e.message)
-      } else {
-        setError('Import failed')
-      }
+      setError(formatAxiosDetail(e))
     } finally {
       setImporting(false)
       setExtracting(false)
@@ -251,32 +285,84 @@ export default function UploadModal() {
       setError('No files selected')
       return
     }
+    const promptContinue = (info: ImportProceedPrompt) =>
+      new Promise<boolean>(resolve => {
+        proceedResolverRef.current = resolve
+        setImportProceedPrompt(info)
+      })
+
     setFolderImporting(true)
     setError('')
-    setFolderImportProgress({ done: 0, total: toImport.length })
+    let successCount = 0
+    let lastVid: string | null = null
+    const skipped: { name: string; detail: string }[] = []
+
     try {
       const pid = await ensureProject()
-      let lastVid: string | null = null
-      for (let i = 0; i < toImport.length; i++) {
+      for (let i = 0; i < toImport.length; ) {
         const entry = toImport[i]
-        const video = await importVideo(pid, entry.path, getDsOptions(), useSymlink)
-        lastVid = video.id
-        setFolderImportProgress({ done: i + 1, total: toImport.length })
+        setFolderImportProgress({
+          phase: i + 1,
+          total: toImport.length,
+          importedOk: successCount,
+          skipped: skipped.length,
+        })
+        try {
+          const video = await importVideo(pid, entry.path, getDsOptions(), useSymlink)
+          lastVid = video.id
+          successCount++
+          i++
+        } catch (e: unknown) {
+          const detail = formatAxiosDetail(e)
+          const remainingCount = toImport.length - i - 1
+          const proceed = await promptContinue({
+            failedName: entry.name,
+            detail,
+            remainingCount,
+          })
+          if (!proceed) {
+            const freshProject = await getProject(pid).catch(() => null)
+            if (freshProject) setProject(freshProject)
+            if (successCount === 0 && skipped.length === 0) {
+              setError(`Could not import ${entry.name}: ${detail}`)
+            } else {
+              setError(
+                `Stopped after ${successCount} successful import${successCount !== 1 ? 's' : ''}. Problem file: ${entry.name}: ${detail}`,
+              )
+            }
+            return
+          }
+          skipped.push({ name: entry.name, detail })
+          i++
+        }
       }
-      // Refresh project and navigate to last imported video
       if (lastVid) {
         setExtracting(true)
         await pollUntilReady(pid, lastVid)
       }
       handleClose()
+      if (skipped.length > 0) {
+        if (successCount > 0)
+          addToast(
+            `Imported ${successCount} video(s); skipped ${skipped.length} (${skipped.map(s => s.name).join(', ')}).`,
+            'info',
+          )
+        else
+          addToast(
+            `Skipped ${skipped.length} ${skipped.length === 1 ? 'file' : 'files'} (${skipped.map(s => s.name).join(', ')}).`,
+            'info',
+          )
+      }
     } catch (e: unknown) {
-      const axiosErr = e as any
-      const detail = axiosErr?.response?.data?.detail
-      setError(detail ?? (e instanceof Error ? e.message : 'Import failed'))
+      setError(formatAxiosDetail(e))
     } finally {
       setFolderImporting(false)
       setExtracting(false)
       setFolderImportProgress(null)
+      const pending = proceedResolverRef.current
+      proceedResolverRef.current = null
+      setImportProceedPrompt(null)
+      pending?.(false)
     }
   }
 
@@ -577,7 +663,7 @@ export default function UploadModal() {
                   {extracting
                     ? 'Extracting frames...'
                     : folderImporting && folderImportProgress
-                      ? `Importing ${folderImportProgress.done} / ${folderImportProgress.total}...`
+                      ? `Importing · file ${folderImportProgress.phase} / ${folderImportProgress.total}${folderImportProgress.importedOk > 0 ? ` (${folderImportProgress.importedOk} done)` : ''}${folderImportProgress.skipped ? ` (${folderImportProgress.skipped} skipped)` : ''}`
                       : importing
                         ? 'Importing...'
                         : `Uploading... ${uploadProgress}%`}
@@ -590,7 +676,7 @@ export default function UploadModal() {
                     width: extracting || importing
                       ? '100%'
                       : folderImporting && folderImportProgress
-                        ? `${(folderImportProgress.done / folderImportProgress.total) * 100}%`
+                        ? `${(folderImportProgress.phase / folderImportProgress.total) * 100}%`
                         : `${uploadProgress}%`
                   }}
                 />
@@ -728,7 +814,7 @@ export default function UploadModal() {
               {folderImporting ? (
                 <>
                   <span className="inline-block w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                  {extracting ? 'Extracting...' : `Importing ${folderImportProgress?.done ?? 0}/${folderImportProgress?.total ?? 0}...`}
+                  {extracting ? 'Extracting...' : `Importing ${folderImportProgress?.phase ?? 0}/${folderImportProgress?.total ?? 0}...`}
                 </>
               ) : (
                 <>
@@ -761,6 +847,50 @@ export default function UploadModal() {
           )}
         </div>
       </div>
+      {importProceedPrompt && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/75 p-4 pointer-events-auto">
+          <div className="bg-[#252525] border border-[#3a3a3a] rounded-xl max-w-lg w-full p-5 shadow-2xl pointer-events-auto">
+            <div className="flex gap-3">
+              <AlertTriangle size={22} className="text-amber-400 flex-shrink-0 mt-0.5" />
+              <div className="min-w-0 flex-1 space-y-2">
+                <h3 className="text-sm font-semibold text-white">Could not import this video</h3>
+                <p className="text-xs font-medium text-[#ccc] truncate" title={importProceedPrompt.failedName}>
+                  {importProceedPrompt.failedName}
+                </p>
+                <p className="text-xs text-amber-200/90 break-words">{importProceedPrompt.detail}</p>
+                {importProceedPrompt.remainingCount > 0 ? (
+                  <p className="text-xs text-[#888] leading-relaxed pt-1">
+                    {importProceedPrompt.remainingCount} other file
+                    {importProceedPrompt.remainingCount !== 1 ? 's' : ''} in this batch can still be imported.
+                    Continue with those and skip this one?
+                  </p>
+                ) : (
+                  <p className="text-xs text-[#888] leading-relaxed pt-1">
+                    This was the last file in the batch. You can skip it and finish, or stop and keep what was
+                    already imported.
+                  </p>
+                )}
+              </div>
+            </div>
+            <div className="flex flex-wrap gap-2 justify-end mt-5">
+              <button
+                type="button"
+                className="btn btn-secondary px-4"
+                onClick={() => resolveImportProceed(false)}
+              >
+                {importProceedPrompt.remainingCount > 0 ? 'Stop import' : 'Stop'}
+              </button>
+              <button
+                type="button"
+                className="btn btn-primary px-4"
+                onClick={() => resolveImportProceed(true)}
+              >
+                {importProceedPrompt.remainingCount > 0 ? 'Continue with rest' : 'Skip file & finish'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
