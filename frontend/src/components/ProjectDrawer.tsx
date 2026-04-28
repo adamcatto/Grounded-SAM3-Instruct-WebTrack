@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useMemo, useState } from 'react'
 import { X, Plus, Film, FolderOpen, Trash2 } from 'lucide-react'
 import { useStore } from '../store/useStore'
 import { listProjects, createProject, deleteProject } from '../api/client'
@@ -62,7 +62,12 @@ export default function ProjectDrawer() {
     setDrawerOpen(false)
   }
 
-  const currentVideos = project ? Object.values(project.videos) : []
+  const currentVideos = useMemo(() => {
+    if (!project) return []
+    return Object.values(project.videos).sort((a, b) =>
+      a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }),
+    )
+  }, [project])
 
   return (
     <>

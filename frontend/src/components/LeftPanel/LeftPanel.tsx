@@ -48,6 +48,9 @@ export default function LeftPanel() {
   const [trackFrame, setTrackFrame] = useState(0)
   const activeEsRef = useRef<EventSource | null>(null)
 
+  /** Anchor index → wall ms when user landed on that anchor to label it (for duration analytics). */
+  const anchorEnteredMsRef = useRef<Record<number, number>>({})
+
   // Clear masks modal state
   const [showClearMasksModal, setShowClearMasksModal] = useState(false)
   const [clearRangeFrom, setClearRangeFrom] = useState('')
@@ -133,6 +136,10 @@ export default function LeftPanel() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pid, vid])
 
+  useEffect(() => {
+    anchorEnteredMsRef.current = {}
+  }, [vid])
+
   // ── Add Object ──────────────────────────────────────────────────────────────
 
   async function handleAddObject() {
@@ -173,8 +180,14 @@ export default function LeftPanel() {
       setAnchorFrames(anchor_frames)
       setCurrentAnchorIndex(0)
       setAnchorPhase(true)
+      anchorEnteredMsRef.current = {}
+      anchorEnteredMsRef.current[0] = Date.now()
       // Navigate to first anchor frame
       setCurrentFrame(anchor_frames[0] ?? propagationStartFrame)
+      addToast(
+        "You're being timed — per-anchor and whole-video durations are saved in your project.",
+        'success',
+      )
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : 'Failed to get anchor frames'
       setTrackingError(msg)
@@ -184,30 +197,54 @@ export default function LeftPanel() {
   async function handleCommitAnchor() {
     if (!anchorPhase || anchorFrames.length === 0) return
     const frameIdx = anchorFrames[currentAnchorIndex]
+    const ai = currentAnchorIndex
+    const finished_ms = Date.now()
+    let entered_ms = anchorEnteredMsRef.current[ai]
+    if (entered_ms === undefined) entered_ms = finished_ms
+    const labelingTiming = { entered_ms, finished_ms }
+    const frameSecStr = Math.max(0, (finished_ms - entered_ms) / 1000).toFixed(2)
 
+    let wholeVideoWallMs: number | undefined
     try {
-      await commitAnchorFrame(pid, vid, frameIdx, currentAnchorIndex)
-      addAnnotatedAnchor(currentAnchorIndex)
+      await commitAnchorFrame(pid, vid, frameIdx, ai, labelingTiming)
+      addAnnotatedAnchor(ai)
+      try {
+        const fresh = await getProject(pid)
+        setProject(fresh)
+        const w = fresh.videos[vid]?.anchor_labeling_timing?.video?.whole_video_labeling_wall_ms
+        if (typeof w === 'number') wholeVideoWallMs = w
+      } catch {
+        /* keep local state — timing is persisted server-side anyway */
+      }
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : 'Failed to commit anchor frame'
       setTrackingError(msg)
       return
     }
 
-    const nextIndex = currentAnchorIndex + 1
+    const nextIndex = ai + 1
+    const isLastAnchor = nextIndex >= anchorFrames.length
 
-    if (nextIndex >= anchorFrames.length) {
-      // All anchors labeled — exit annotation phase
+    if (isLastAnchor && wholeVideoWallMs != null) {
+      const totalSecStr = (wholeVideoWallMs / 1000).toFixed(2)
+      addToast(
+        `This anchor frame: ${frameSecStr}s\nTotal for video: ${totalSecStr}s`,
+        'success',
+      )
+    } else {
+      addToast(`This anchor frame: ${frameSecStr}s`, 'success')
+    }
+
+    if (isLastAnchor) {
       setAnchorPhase(false)
-      setCurrentAnchorIndex(anchorFrames.length) // mark as complete
-      // If there's another video in the project, prompt the user
+      setCurrentAnchorIndex(anchorFrames.length)
       if (nextVideoId) {
         setShowNextVideoModal(true)
       }
       return
     }
 
-    // Advance to next anchor
+    anchorEnteredMsRef.current[nextIndex] = Date.now()
     setCurrentAnchorIndex(nextIndex)
     setCurrentFrame(anchorFrames[nextIndex])
   }

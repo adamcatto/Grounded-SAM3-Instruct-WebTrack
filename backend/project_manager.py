@@ -151,6 +151,7 @@ class ProjectManager:
             "all_frames_extracted": False,
             "preview_indices": [],
             "annotated_anchors": [],
+            "anchor_labeling_timing": {"frames": {}, "video": {}},
         }
         config["videos"][vid] = video_meta
         self._save_config(pid, config)

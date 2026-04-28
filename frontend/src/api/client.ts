@@ -285,10 +285,24 @@ export interface AnchorFramesResponse {
 export const getAnchorFrames = (pid: string, vid: string) =>
   api.get<AnchorFramesResponse>(`/projects/${pid}/videos/${vid}/anchor_frames`).then(r => r.data)
 
-export const commitAnchorFrame = (pid: string, vid: string, frameIdx: number, anchorIndex: number) =>
+export interface AnchorFrameLabelingTiming {
+  entered_ms: number
+  finished_ms: number
+}
+
+export const commitAnchorFrame = (
+  pid: string,
+  vid: string,
+  frameIdx: number,
+  anchorIndex: number,
+  labelingTiming?: AnchorFrameLabelingTiming,
+) =>
   api.post<{ status: string; committed_frame: number; anchor_index: number }>(
     `/projects/${pid}/videos/${vid}/anchors/${frameIdx}/commit`,
-    { anchor_index: anchorIndex }
+    {
+      anchor_index: anchorIndex,
+      labeling_timing: labelingTiming ?? undefined,
+    },
   ).then(r => r.data)
 
 // ─── Export SSE ───────────────────────────────────────────────────────────────

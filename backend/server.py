@@ -691,6 +691,8 @@ def reset_video(pid: str, vid: str):
         "frames_extracted": False,
         "all_frames_extracted": False,
         "preview_indices": [],
+        "annotated_anchors": [],
+        "anchor_labeling_timing": {"frames": {}, "video": {}},
     })
 
     # Verify reset was successful
@@ -1612,8 +1614,16 @@ def get_anchor_frames(pid: str, vid: str):
     return {"anchor_frames": anchors, "count": len(anchors)}
 
 
+class AnchorLabelingTiming(BaseModel):
+    """Client wall-clock timestamps (ms since epoch); used for anchor labeling analytics."""
+
+    entered_ms: int    # User landed on this anchor frame to label it (after finishing previous anchor)
+    finished_ms: int   # User clicked Done / next frame on this anchor
+
+
 class CommitAnchorRequest(BaseModel):
     anchor_index: int  # 0-based index in the anchor frames list
+    labeling_timing: Optional[AnchorLabelingTiming] = None
 
 
 @app.post("/api/projects/{pid}/videos/{vid}/anchors/{frame_idx}/commit")
@@ -1624,7 +1634,34 @@ def commit_anchor_frame(pid: str, vid: str, frame_idx: int, req: CommitAnchorReq
     annotated = list(video.get("annotated_anchors", []))
     if frame_idx not in annotated:
         annotated = sorted(annotated + [frame_idx])
-    pm.update_video(pid, vid, {"annotated_anchors": annotated})
+    updates: dict = {"annotated_anchors": annotated}
+
+    if req.labeling_timing is not None:
+        lt = req.labeling_timing
+        dur = max(0, lt.finished_ms - lt.entered_ms)
+        fk = str(int(frame_idx))
+        alt = dict(video.get("anchor_labeling_timing") or {})
+        frames = dict(alt.get("frames") or {})
+        frames[fk] = {
+            "entered_frontend_ms": lt.entered_ms,
+            "committed_ms": lt.finished_ms,
+            "duration_ms": dur,
+        }
+        vinfo = dict(alt.get("video") or {})
+        first = vinfo.get("first_anchor_entered_ms")
+        if first is None or lt.entered_ms < first:
+            vinfo["first_anchor_entered_ms"] = lt.entered_ms
+        vinfo["last_anchor_committed_ms"] = lt.finished_ms
+        fe = vinfo.get("first_anchor_entered_ms")
+        if fe is not None:
+            vinfo["whole_video_labeling_wall_ms"] = lt.finished_ms - fe
+        vinfo["sum_anchor_durations_ms"] = sum(int(f.get("duration_ms", 0) or 0) for f in frames.values())
+
+        alt["frames"] = frames
+        alt["video"] = vinfo
+        updates["anchor_labeling_timing"] = alt
+
+    pm.update_video(pid, vid, updates)
     return {"status": "ok", "committed_frame": frame_idx, "anchor_index": req.anchor_index}
 
 

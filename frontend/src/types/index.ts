@@ -12,6 +12,30 @@ export interface PointPrompts {
   }
 }
 
+/** Persisted anchor annotation timing — keys are real video frame indices (strings). */
+export interface AnchorLabelFrameTiming {
+  /** When the user navigated onto this anchor to label it (after finishing the previous anchor). */
+  entered_frontend_ms: number
+  /** When the user clicked Done / next on this anchor. */
+  committed_ms: number
+  /** committed_ms − entered_frontend_ms */
+  duration_ms: number
+}
+
+export interface AnchorLabelingTimingVideoAgg {
+  first_anchor_entered_ms?: number | null
+  last_anchor_committed_ms?: number | null
+  /** Wall time from landing on the first anchor through committing the last anchor. */
+  whole_video_labeling_wall_ms?: number | null
+  /** Sum of per-anchor `duration_ms` values. */
+  sum_anchor_durations_ms?: number | null
+}
+
+export interface AnchorLabelingTimingConfig {
+  frames: Record<string, AnchorLabelFrameTiming>
+  video: AnchorLabelingTimingVideoAgg
+}
+
 export interface VideoMeta {
   id: string
   name: string
@@ -30,6 +54,7 @@ export interface VideoMeta {
   all_frames_extracted?: boolean
   preview_indices?: number[]
   annotated_anchors?: number[]
+  anchor_labeling_timing?: AnchorLabelingTimingConfig
 }
 
 export interface Project {

@@ -41,7 +41,7 @@ function ToastItem({ id, message, type, onRemove }: {
       style={{ animation: 'fadeSlideIn 0.15s ease-out' }}
     >
       {icon}
-      <span className="flex-1 leading-relaxed">{message}</span>
+      <span className="flex-1 leading-relaxed whitespace-pre-line">{message}</span>
       <button
         onClick={() => onRemove(id)}
         className="flex-shrink-0 text-[#555] hover:text-[#aaa] transition-colors mt-0.5"
