@@ -90,11 +90,11 @@ export default function UploadModal() {
   } | null>(null)
   const [importProceedPrompt, setImportProceedPrompt] = useState<ImportProceedPrompt | null>(null)
   const proceedResolverRef = useRef<((v: boolean) => void) | null>(null)
-  const [recursive, setRecursive] = useState(false)
-  const [scanDepth, setScanDepth] = useState(3)
+  const [recursive, setRecursive] = useState(true)
+  const [scanDepth, setScanDepth] = useState(0)
 
   // Symlink (server/folder modes only)
-  const [useSymlink, setUseSymlink] = useState(false)
+  const [useSymlink, setUseSymlink] = useState(true)
 
   // Downsample (shared across all modes)
   const [downsample, setDownsample] = useState(false)
@@ -132,7 +132,9 @@ export default function UploadModal() {
     setFolderImportProgress(null)
     setIncludePattern('*')
     setExcludePattern('')
-    setUseSymlink(false)
+    setUseSymlink(true)
+    setRecursive(true)
+    setScanDepth(0)
     setImportProceedPrompt(null)
     proceedResolverRef.current = null
   }
