@@ -55,6 +55,14 @@ export interface VideoMeta {
   preview_indices?: number[]
   annotated_anchors?: number[]
   anchor_labeling_timing?: AnchorLabelingTimingConfig
+  /** Derived from annotated_anchors covering all batch anchor indices; persists in config. */
+  anchor_labeling_complete?: boolean
+  /** Sync-friendly tracking state separate from SSE in-memory propagation. */
+  whole_video_inference?: {
+    status?: 'none' | 'running' | 'complete' | 'failed'
+    updated_at?: string | null
+    host?: string | null
+  }
 }
 
 export interface Project {

@@ -13,7 +13,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-BASE_DIR = Path.home() / ".sam3_zero_projects"
+from anchor_helpers import is_anchor_labeling_complete
+
+_env_projects = (os.environ.get("SAM3_PROJECTS_DIR") or "").strip()
+BASE_DIR = Path(_env_projects).expanduser() if _env_projects else Path.home() / ".sam3_zero_projects"
 
 OBJECT_COLORS = [
     "#5B8DD9",  # blue
@@ -73,7 +76,8 @@ class ProjectManager:
             cfg = d / "config.json"
             if cfg.exists():
                 try:
-                    projects.append(json.loads(cfg.read_text()))
+                    raw = json.loads(cfg.read_text())
+                    projects.append(self._normalize_project_config(raw))
                 except Exception:
                     pass
         return projects
@@ -101,7 +105,7 @@ class ProjectManager:
         cfg = d / "config.json"
         if not cfg.exists():
             return None
-        return json.loads(cfg.read_text())
+        return self._normalize_project_config(json.loads(cfg.read_text()))
 
     def update_project(self, pid: str, updates: dict) -> dict:
         config = self.get_project(pid)
@@ -152,6 +156,12 @@ class ProjectManager:
             "preview_indices": [],
             "annotated_anchors": [],
             "anchor_labeling_timing": {"frames": {}, "video": {}},
+            "anchor_labeling_complete": False,
+            "whole_video_inference": {
+                "status": "none",
+                "updated_at": None,
+                "host": None,
+            },
         }
         config["videos"][vid] = video_meta
         self._save_config(pid, config)
@@ -324,7 +334,35 @@ class ProjectManager:
         if config is None or vid not in config["videos"]:
             return
         config["videos"][vid]["propagation_complete"] = True
+        winf = dict(config["videos"][vid].get("whole_video_inference") or {})
+        winf["status"] = "complete"
+        winf["updated_at"] = datetime.now(timezone.utc).isoformat()
+        config["videos"][vid]["whole_video_inference"] = winf
         self._save_config(pid, config)
+
+    def set_video_inference_status(
+        self,
+        pid: str,
+        vid: str,
+        status: str,
+        host: str | None = None,
+    ) -> Optional[dict]:
+        allowed = frozenset({"none", "running", "complete", "failed"})
+        if status not in allowed:
+            raise ValueError(f"invalid inference status: {status!r}")
+        config = self.get_project(pid)
+        if config is None or vid not in config["videos"]:
+            return None
+        winf = dict(config["videos"][vid].get("whole_video_inference") or {})
+        winf["status"] = status
+        winf["updated_at"] = datetime.now(timezone.utc).isoformat()
+        if host is not None:
+            winf["host"] = host
+        if status == "none":
+            winf["host"] = None
+        config["videos"][vid]["whole_video_inference"] = winf
+        self._save_config(pid, config)
+        return config["videos"][vid]
 
     # ─── Paths ───────────────────────────────────────────────────────────────
 
@@ -347,6 +385,31 @@ class ProjectManager:
         return self.video_dir(pid, vid) / "bboxes"
 
     # ─── Internal ────────────────────────────────────────────────────────────
+
+    def _normalize_video_meta(self, vm: dict) -> dict:
+        out = dict(vm)
+        winf_raw = out.get("whole_video_inference") or {}
+        winf = dict(winf_raw) if isinstance(winf_raw, dict) else {}
+        winf.setdefault("status", "none")
+        winf.setdefault("updated_at", None)
+        winf.setdefault("host", None)
+        if out.get("propagation_complete"):
+            winf["status"] = "complete"
+        out["whole_video_inference"] = winf
+        inferred = is_anchor_labeling_complete(out)
+        if "anchor_labeling_complete" not in vm:
+            out["anchor_labeling_complete"] = inferred
+        else:
+            out["anchor_labeling_complete"] = bool(vm.get("anchor_labeling_complete")) or inferred
+        return out
+
+    def _normalize_project_config(self, config: dict) -> dict:
+        out = dict(config)
+        vids = {}
+        for vid, vm in (config.get("videos") or {}).items():
+            vids[vid] = self._normalize_video_meta(vm if isinstance(vm, dict) else {})
+        out["videos"] = vids
+        return out
 
     def _save_config(self, pid: str, config: dict):
         cfg_path = self._project_dir(pid) / "config.json"

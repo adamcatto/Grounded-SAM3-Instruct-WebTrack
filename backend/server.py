@@ -6,6 +6,7 @@ Supports SAM3 (primary) with SAM2 fallback.
 import asyncio
 import functools
 import os
+import socket
 import json
 import logging
 import shutil
@@ -25,6 +26,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
+from anchor_helpers import STREAM_BATCH_SIZE, compute_anchor_frames
 from project_manager import ProjectManager
 from sam_predictor import SAMPredictor, _get_predictor
 from video_processor import (
@@ -47,8 +49,6 @@ from video_processor import (
 def _video_ds_params(video: dict) -> tuple[Optional[int], Optional[float]]:
     """Return (max_dim, scale_factor) stored in video metadata for lazy downsampling."""
     return video.get("downsample_max_dim"), video.get("downsample_scale_factor")
-
-STREAM_BATCH_SIZE = 1000  # frames per propagation batch / anchor interval
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -693,6 +693,8 @@ def reset_video(pid: str, vid: str):
         "preview_indices": [],
         "annotated_anchors": [],
         "anchor_labeling_timing": {"frames": {}, "video": {}},
+        "anchor_labeling_complete": False,
+        "whole_video_inference": {"status": "none", "updated_at": None, "host": None},
     })
 
     # Verify reset was successful
@@ -1107,7 +1109,7 @@ def add_points(pid: str, vid: str, oid: str, req: AddPointsRequest):
     if req.anchor_mode:
         start_f = video.get("start_frame", 0)
         num_frames_v = video["num_frames"]
-        anchor_frames = _compute_anchor_frames(start_f, num_frames_v, STREAM_BATCH_SIZE)
+        anchor_frames = compute_anchor_frames(start_f, num_frames_v, STREAM_BATCH_SIZE)
         if req.frame_idx not in anchor_frames:
             raise HTTPException(
                 409,
@@ -1581,28 +1583,6 @@ async def export_video_sse(pid: str, vid: str):
 
 # ─── Anchor frame helpers ─────────────────────────────────────────────────────
 
-def _compute_anchor_frames(start_frame: int, num_frames: int, batch_size: int) -> list[int]:
-    """Compute anchor frames for bidirectional batch propagation.
-
-    The first anchor is at start_frame so the user labels the very beginning of
-    the video and propagation starts immediately from there (forward only, since
-    nothing comes before start_frame).  Subsequent anchors sit at the midpoint
-    of each following batch window, giving equal forward/backward SAM context.
-
-    Examples (batch_size=1000):
-      start=0, num_frames=3500 → [0, 1000, 2000, 3000, 3499]
-      start=0, num_frames=3000 → [0, 1000, 2000]
-      start=0, num_frames=100  → [0, 99]
-    """
-    last = num_frames - 1
-    anchors = list(range(start_frame, num_frames, batch_size))
-    if not anchors:
-        anchors = [last]
-    elif anchors[-1] != last:
-        anchors.append(last)
-    return anchors
-
-
 @app.get("/api/projects/{pid}/videos/{vid}/anchor_frames")
 def get_anchor_frames(pid: str, vid: str):
     video = pm.get_video(pid, vid)
@@ -1610,7 +1590,7 @@ def get_anchor_frames(pid: str, vid: str):
         raise HTTPException(404, "Video not found")
     start = video.get("start_frame", 0)
     num_frames = video["num_frames"]
-    anchors = _compute_anchor_frames(start, num_frames, STREAM_BATCH_SIZE)
+    anchors = compute_anchor_frames(start, num_frames, STREAM_BATCH_SIZE)
     return {"anchor_frames": anchors, "count": len(anchors)}
 
 
@@ -1660,6 +1640,12 @@ def commit_anchor_frame(pid: str, vid: str, frame_idx: int, req: CommitAnchorReq
         alt["frames"] = frames
         alt["video"] = vinfo
         updates["anchor_labeling_timing"] = alt
+
+    start = int(video.get("start_frame") or 0)
+    num_frames_v = int(video["num_frames"])
+    req_anchors = compute_anchor_frames(start, num_frames_v, STREAM_BATCH_SIZE)
+    ann_set = set(annotated)
+    updates["anchor_labeling_complete"] = bool(req_anchors) and all(a in ann_set for a in req_anchors)
 
     pm.update_video(pid, vid, updates)
     return {"status": "ok", "committed_frame": frame_idx, "anchor_index": req.anchor_index}
@@ -1972,6 +1958,10 @@ async def _run_propagation_bg(
     except Exception as e:
         logger.error(f"Propagation error: {e}", exc_info=True)
         state.is_running = False
+        try:
+            pm.set_video_inference_status(pid, vid, "failed", socket.gethostname())
+        except Exception as e2:
+            logger.warning(f"Could not persist inference failed status: {e2}")
         await publish("error", {"error": str(e)})
 
 
@@ -2032,6 +2022,10 @@ async def propagate_video(pid: str, vid: str, start_frame: int = 0, resume_from:
         state.user_start_frame = start_frame
         state.is_running = True
         state.is_paused = False
+        try:
+            pm.set_video_inference_status(pid, vid, "running", socket.gethostname())
+        except Exception as e:
+            logger.warning(f"Persist inference running status: {e}")
         ds_max_dim, ds_scale_factor = _video_ds_params(video)
         state.task = asyncio.create_task(
             _run_propagation_bg(
@@ -2094,6 +2088,7 @@ def get_propagation_status(pid: str, vid: str):
         "propagation_complete": video.get("propagation_complete", False),
         "last_frame": max(propagated) if propagated else -1,
         "start_frame": state.start_frame if state.is_running else 0,
+        "whole_video_inference": video.get("whole_video_inference") or {},
     }
 
 
