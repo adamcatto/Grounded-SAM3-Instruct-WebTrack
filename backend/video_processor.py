@@ -9,6 +9,7 @@ import logging
 import shutil
 import subprocess
 import struct
+import zipfile
 from pathlib import Path
 from typing import Optional
 
@@ -410,9 +411,16 @@ def save_bboxes_json(out_path: str, bboxes: dict):
 
 
 def load_masks_npz(npz_path: str) -> dict:
-    """Load masks from npz. Returns {obj_id: binary_mask_HW}."""
-    data = np.load(str(npz_path))
-    return {k.replace("obj_", ""): data[k].astype(bool) for k in data.files}
+    """Load masks from npz. Returns {obj_id: binary_mask_HW}. Corrupt/missing reads as {}."""
+    path = Path(npz_path)
+    if not path.is_file():
+        return {}
+    try:
+        with np.load(str(path)) as data:
+            return {k.replace("obj_", ""): data[k].astype(bool) for k in data.files}
+    except (OSError, zipfile.BadZipFile, EOFError, ValueError) as e:
+        logger.warning("Unreadable mask npz (truncated or corrupt): %s — %s", path, e)
+        return {}
 
 
 def load_bboxes_json(json_path: str) -> dict:
