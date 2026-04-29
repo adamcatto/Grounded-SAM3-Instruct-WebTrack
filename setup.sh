@@ -37,6 +37,13 @@ cd "$SCRIPT_DIR/frontend"
 npm install
 cd "$SCRIPT_DIR"
 
+# Point git at tracked hooks (.githooks/prepare-commit-msg strips Cursor commit trailers).
+if git -C "$SCRIPT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+  git -C "$SCRIPT_DIR" config core.hooksPath .githooks
+  echo ""
+  echo "Git hooks registered (see .githooks/; strips Made-with: Cursor trailers on commit)."
+fi
+
 echo ""
 echo "Step 4/4: Downloading SAM3 model weights..."
 echo "  NOTE: The SAM3 model is gated on HuggingFace."
