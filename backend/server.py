@@ -1963,6 +1963,21 @@ async def _run_propagation_bg(
         except Exception as e2:
             logger.warning(f"Could not persist inference failed status: {e2}")
         await publish("error", {"error": str(e)})
+    finally:
+        # Each batch calls init_session(pid, vid, …), which closes the previous batch's
+        # session for this (pid, vid) only. Nothing closed the final batch's session, and
+        # init_session for another video closes only that video's key — leaving every
+        # finished video's last SAM session (and GPU state) pinned until restart.
+        def _cleanup_sam_propagation_session():
+            try:
+                sam.close_session(pid, vid)
+            except Exception as ce:
+                logger.warning(f"close_session after propagate {pid}/{vid}: {ce}")
+
+        try:
+            await loop.run_in_executor(None, _cleanup_sam_propagation_session)
+        except Exception as ce:
+            logger.warning(f"Propagator SAM cleanup executor failed ({pid}/{vid}): {ce}")
 
 
 # ─── Propagation SSE endpoint ─────────────────────────────────────────────────
