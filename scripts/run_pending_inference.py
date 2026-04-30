@@ -4,7 +4,8 @@ Run whole-video propagation (tracking) only for videos that are ready:
 
   • anchor labeling is complete (all anchor frames committed in the UI)
   • propagation_complete is False
-  • whole_video_inference.status is not "running"; "failed" is skipped unless --retry-failed
+  • whole_video_inference.status is not "running" (failed/complete/none are OK to queue when
+    incomplete)
 
 Requires the SAM backend (uvicorn server:app) to be reachable.
 
@@ -13,7 +14,8 @@ Examples:
   uvicorn server:app --host 127.0.0.1 --port 8000   # elsewhere
   python scripts/run_pending_inference.py … --backend http://127.0.0.1:8000 [--list-only] [--quiet-stream]
 
-  • RUN/SKIP summary is printed first in all cases; --list-only exits before SSE.
+  • RUN/SKIP eligibility is written to stderr via os.write (unbuffered), so it appears
+    immediately even with `conda run`; SSE progress still prints on stdout.
   • Without --quiet-stream, propagation progress is mirrored on this terminal from SSE events.
 """
 
@@ -22,6 +24,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import os
 import socket
 import sys
 import urllib.error
@@ -38,12 +41,27 @@ from anchor_helpers import is_anchor_labeling_complete  # noqa: E402
 from project_manager import ProjectManager  # noqa: E402
 
 
+def _emit_plan_lines(lines: list[str]) -> None:
+    """Write plan to stderr (fd 2) directly — bypasses Python/conda stdout block buffering."""
+
+    for s in lines:
+        blob = (s + "\n").encode("utf-8", errors="replace")
+        try:
+            os.write(2, blob)
+        except OSError:
+            try:
+                sys.__stderr__.write(s + "\n")
+                sys.__stderr__.flush()
+            except Exception:
+                pass
+
+
 def _log_sse_to_terminal(ev: str, data: dict[str, Any], *, stream_active: list[bool]) -> None:
     """Print one SSE event line (or carriage-return status for progress streams)."""
 
     def _end_carry():
         if stream_active[0]:
-            print(file=sys.stdout)
+            print(file=sys.stdout, flush=True)
             stream_active[0] = False
 
     if ev == "heartbeat":
@@ -171,7 +189,7 @@ def propagation_sse(
         if data_parts or ev_name is not None:
             flush_block()
         if stream_log and stream_active_carry[0]:
-            print(file=sys.stdout)
+            print(file=sys.stdout, flush=True)
             stream_active_carry[0] = False
     except urllib.error.HTTPError as e:
         body = ""
@@ -192,12 +210,7 @@ def propagation_sse(
     return True, last_payload, ""
 
 
-def video_eligibility(
-    vid: str,
-    vm: dict,
-    *,
-    retry_failed: bool,
-) -> Tuple[bool, str]:
+def video_eligibility(vid: str, vm: dict) -> Tuple[bool, str]:
     inferred = is_anchor_labeling_complete(vm)
     anchored = bool(vm.get("anchor_labeling_complete")) or inferred
     if not anchored:
@@ -210,8 +223,6 @@ def video_eligibility(
     st = (winf.get("status") or "none").strip() or "none"
     if st == "running":
         return False, "inference_running (another job or stale — use --clear-stuck)"
-    if st == "failed" and not retry_failed:
-        return False, "previous failed (--retry-failed to queue)"
     if st == "complete" and not vm.get("propagation_complete"):
         return False, "status complete but propagation_complete false (repair config)"
 
@@ -219,6 +230,11 @@ def video_eligibility(
     if not any(prompts.values()):
         return False, "no point prompts in config"
 
+    if st == "failed":
+        return (
+            True,
+            "ready for propagation (retry after previous failed inference; anchors labeled, propagation incomplete)",
+        )
     return True, "ready for propagation (anchors labeled, propagation incomplete, inference not blocking)"
 
 
@@ -247,7 +263,11 @@ def main() -> int:
         action="store_true",
         help="Pass use_all_anchors=true on propagate (matches all-anchors web tracking).",
     )
-    ap.add_argument("--retry-failed", action="store_true")
+    ap.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help=argparse.SUPPRESS,  # obsolete: failures queue by default; kept for CLI compatibility
+    )
     ap.add_argument(
         "--list-only",
         action="store_true",
@@ -272,44 +292,57 @@ def main() -> int:
     ap.add_argument(
         "--quiet-stream",
         action="store_true",
-        help="Do not print per-event propagation progress from SSE (still prints RUN/SKIP and final outcomes).",
+        help="Suppress per-event SSE progress on stdout (eligibility still on stderr first; done/error lines may still print).",
     )
 
     args = ap.parse_args()
 
     pm = ProjectManager()
 
+    cfg_path_explicit: Path | None = None
     if args.project_dir:
         pd = Path(args.project_dir).expanduser().resolve()
         cfg_path = pd / "config.json"
         if not cfg_path.is_file():
-            print(f"No config.json under {pd}", file=sys.stderr)
+            print(f"No config.json under {pd}", file=sys.stderr, flush=True)
             return 2
+        cfg_path_explicit = cfg_path
         project = pm._normalize_project_config(json.loads(cfg_path.read_text()))
         pid = project["id"]
     elif args.pid:
         pid = args.pid.strip()
         project = pm.get_project(pid)
         if project is None:
-            print(f"Project {pid!r} not found under SAM3 projects root.", file=sys.stderr)
+            print(f"Project {pid!r} not found under SAM3 projects root.", file=sys.stderr, flush=True)
             return 2
     else:
-        print("Provide --project-dir or --pid", file=sys.stderr)
+        print("Provide --project-dir or --pid", file=sys.stderr, flush=True)
         return 2
 
-    backend = args.backend.rstrip("/")
-    if backend.endswith("/api"):
-        api_base = backend
-    else:
-        api_base = backend + "/api"
+    def _reload_project_after_disk_mutations() -> bool:
+        nonlocal project, pid
+        if cfg_path_explicit is not None and cfg_path_explicit.is_file():
+            project = pm._normalize_project_config(json.loads(cfg_path_explicit.read_text()))
+            pid = project["id"]
+            return True
+        refreshed = pm.get_project(pid)
+        if refreshed is None:
+            print(
+                f"Cannot reload project {pid!r} from ProjectManager roots "
+                f"(SAM3_PROJECTS_DIR). Re-run with matching env or pass --project-dir.",
+                file=sys.stderr,
+                flush=True,
+            )
+            return False
+        project = refreshed
+        return True
 
     if args.clear_stuck:
         for vid in list((project.get("videos") or {})):
             vm = project["videos"][vid]
             if (vm.get("whole_video_inference") or {}).get("status") == "running":
                 clear_stuck_running(pm, pid, vid)
-        project = pm.get_project(pid)
-        if project is None:
+        if not _reload_project_after_disk_mutations():
             return 2
 
     vid_filter = set(args.videos) if args.videos else None
@@ -320,15 +353,8 @@ def main() -> int:
         if vid_filter is not None and vid not in vid_filter:
             filtered_out.append(vid)
             continue
-        ok, msg = video_eligibility(vid, vm, retry_failed=args.retry_failed)
+        ok, msg = video_eligibility(vid, vm)
         pending.append((vid, vm, ok, msg))
-
-    pname = project.get("name") or ""
-    print(f"project={pid}" + (f" ({pname})" if pname else ""))
-    if filtered_out:
-        print(
-            f"\nNot considered (--videos filter; excluded: {', '.join(sorted(filtered_out))})"
-        )
 
     will_run: list[Tuple[str, str]] = []
     will_skip: list[Tuple[str, str]] = []
@@ -340,37 +366,69 @@ def main() -> int:
         else:
             will_skip.append((label, msg))
 
-    print("\n── Will run whole-video inference ──")
+    pname = project.get("name") or ""
+    plan_lines: list[str] = [
+        "run_pending_inference — eligibility (next: propagation over HTTP unless --list-only)",
+        "",
+        "project=" + pid + (f" ({pname})" if pname else ""),
+    ]
+    if filtered_out:
+        plan_lines.extend(
+            (
+                "",
+                "Not considered (--videos filter; excluded: " + ", ".join(sorted(filtered_out)) + ")",
+            )
+        )
+
+    plan_lines.extend(("", "── Will run whole-video inference ──"))
     if will_run:
         for label, msg in will_run:
-            print(f"  RUN    {label}")
-            print(f"         {msg}")
+            plan_lines.append(f"  RUN    {label}")
+            plan_lines.append(f"         {msg}")
     else:
-        print("  (none)")
+        plan_lines.append("  (none)")
 
-    print("\n── Skipping (not running inference) ──")
+    plan_lines.extend(("", "── Skipping (not running inference) ──"))
     if will_skip:
         for label, msg in will_skip:
-            print(f"  SKIP   {label}")
-            print(f"         reason: {msg}")
+            plan_lines.append(f"  SKIP   {label}")
+            plan_lines.append(f"         reason: {msg}")
     else:
-        print("  (none)")
+        plan_lines.append("  (none)")
 
     n_run = len(will_run)
     n_skip = len(will_skip)
-    print(f"\nSummary: {n_run} to propagate, {n_skip} skipped{' (plus ' + str(len(filtered_out)) + ' excluded by --videos)' if filtered_out else ''}.")
+    plan_lines.extend(
+        (
+            "",
+            f"Summary: {n_run} to propagate, {n_skip} skipped"
+            f"{(' (plus ' + str(len(filtered_out)) + ' excluded by --videos)') if filtered_out else ''}.",
+        )
+    )
+
+    _emit_plan_lines(plan_lines)
 
     if args.list_only:
-        print("\n(--list-only: RUN/SKIP above applies; no propagation HTTP/SSE.)")
+        _emit_plan_lines(["", "(--list-only: no SSE / propagation.)", ""])
         return 0
 
     to_run = [(vid, vm) for vid, vm, ok, _ in sorted(pending, key=lambda x: x[0]) if ok]
     if not to_run:
-        print("\nNo videos to propagate (nothing eligible).")
+        _emit_plan_lines(["No videos to propagate (nothing eligible).", ""])
         return 0
 
+    backend = args.backend.rstrip("/")
+    api_base = backend if backend.endswith("/api") else backend + "/api"
+
     run_ids = [x[0] for x in to_run]
-    print(f"\n── Starting propagation for {len(to_run)} video(s): {', '.join(run_ids)} ──")
+    _emit_plan_lines(
+        [
+            "",
+            "── Starting propagation (SSE progress on stdout follows) ──",
+            f"  videos ({len(to_run)}): {', '.join(run_ids)}",
+            "",
+        ]
+    )
 
     hostname = socket.gethostname()
 
@@ -378,7 +436,7 @@ def main() -> int:
     for vid, vm in to_run:
         vname = (vm.get("name") or "").strip()
         label = f"{vid}" + (f" ({vname})" if vname else "")
-        print(f"\n>>> Propagate {label} …")
+        print(f"\n>>> Propagate {label} …", flush=True)
         ok, last, err = propagation_sse(
             api_base,
             pid,
@@ -388,7 +446,7 @@ def main() -> int:
             stream_log=not args.quiet_stream,
         )
         if not ok:
-            print(f"(error) SSE failed: {err}", file=sys.stderr)
+            print(f"(error) SSE failed: {err}", file=sys.stderr, flush=True)
             try:
                 pm.set_video_inference_status(pid, vid, "failed", host=hostname)
             except Exception:
@@ -397,9 +455,9 @@ def main() -> int:
             continue
         refreshed = pm.get_video(pid, vid)
         if refreshed and refreshed.get("propagation_complete"):
-            print(f">>> Done ({vid}) last_event={last!r}")
+            print(f">>> Done ({vid}) last_event={last!r}", flush=True)
         else:
-            print(f">>> Incomplete for {vid}; last_sse={last!r}", file=sys.stderr)
+            print(f">>> Incomplete for {vid}; last_sse={last!r}", file=sys.stderr, flush=True)
             try:
                 pm.set_video_inference_status(pid, vid, "failed", host=hostname)
             except Exception:
