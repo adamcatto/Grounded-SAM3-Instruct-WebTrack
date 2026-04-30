@@ -10,6 +10,7 @@ export default function ProjectDrawer() {
   const {
     drawerOpen, setDrawerOpen,
     project, setProject, setCurrentVideo,
+    currentVideoId,
     setUploadModalOpen,
   } = useStore()
 
@@ -197,7 +198,11 @@ export default function ProjectDrawer() {
                 <button
                   key={v.id}
                   onClick={() => handleSelectVideo(v.id)}
-                  className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-left text-sm hover:bg-[#1a1a1a] text-[#ccc] transition-colors"
+                  className={`w-full flex items-center gap-2 px-3 py-2 rounded-lg text-left text-sm transition-colors border ${
+                    currentVideoId === v.id
+                      ? 'bg-blue-600/18 text-[#dce9ff] border-blue-500/35 hover:bg-blue-600/24'
+                      : 'border-transparent text-[#ccc] hover:bg-[#1a1a1a]'
+                  }`}
                 >
                   <Film size={14} className="flex-shrink-0 mt-0.5" />
                   <div className="flex-1 min-w-0">
