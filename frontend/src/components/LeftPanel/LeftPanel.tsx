@@ -40,6 +40,8 @@ export default function LeftPanel() {
     resetAnchorState,
     anchorRemainderInferencing,
     setAnchorRemainderInferencing,
+    anchorRemainderAwaitingCommit,
+    setAnchorRemainderAwaitingCommit,
     setAnnotatedAnchorIndices,
     invalidateSavedMaskFrame,
   } = store
@@ -70,7 +72,6 @@ export default function LeftPanel() {
     anchorsDone: number
     anchorsQueued: number
   } | null>(null)
-  const [anchorRemainderAwaitingCommit, setAnchorRemainderAwaitingCommit] = useState(false)
   /** Shown while remainder inference runs but review UI / mask fetch is not active yet */
   const [anchorRemainderProgressText, setAnchorRemainderProgressText] = useState('')
   const [anchorReviewBusy, setAnchorReviewBusy] = useState(false)

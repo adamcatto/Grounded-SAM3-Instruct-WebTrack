@@ -93,6 +93,8 @@ interface AppState {
   currentAnchorIndex: number                             // which anchor user is on (0-based)
   annotatedAnchorIndices: number[]                       // which anchor indices have been committed
   anchorRemainderInferencing: boolean                   // SAM auto-filling remaining anchors
+  /** User edited a predicted anchor and must commit with Done, next */
+  anchorRemainderAwaitingCommit: boolean
 
   // UI
   viewerTab: ViewerTab
@@ -146,6 +148,7 @@ interface AppState {
   addAnnotatedAnchor: (index: number) => void
   setAnnotatedAnchorIndices: (indices: number[]) => void
   setAnchorRemainderInferencing: (v: boolean) => void
+  setAnchorRemainderAwaitingCommit: (v: boolean) => void
   invalidateSavedMaskFrame: (fidx: number) => void
   resetAnchorState: () => void
 }
@@ -182,6 +185,7 @@ export const useStore = create<AppState>((set, get) => ({
   currentAnchorIndex: 0,
   annotatedAnchorIndices: [],
   anchorRemainderInferencing: false,
+  anchorRemainderAwaitingCommit: false,
 
   config: _initialConfig,
   configDirty: false,
@@ -230,6 +234,7 @@ export const useStore = create<AppState>((set, get) => ({
         currentAnchorIndex: 0,
         annotatedAnchorIndices: [],
         anchorRemainderInferencing: false,
+        anchorRemainderAwaitingCommit: false,
       })
     }
   },
@@ -377,6 +382,7 @@ export const useStore = create<AppState>((set, get) => ({
       currentAnchorIndex: 0,
       annotatedAnchorIndices: [],
       anchorRemainderInferencing: false,
+      anchorRemainderAwaitingCommit: false,
     })
   },
 
@@ -393,6 +399,7 @@ export const useStore = create<AppState>((set, get) => ({
   setAnnotatedAnchorIndices: indices =>
     set({ annotatedAnchorIndices: [...new Set(indices)].sort((a, b) => a - b) }),
   setAnchorRemainderInferencing: v => set({ anchorRemainderInferencing: v }),
+  setAnchorRemainderAwaitingCommit: v => set({ anchorRemainderAwaitingCommit: v }),
   invalidateSavedMaskFrame: fidx => {
     const { savedMaskCache } = get()
     if (savedMaskCache[fidx] === undefined) return
@@ -407,6 +414,7 @@ export const useStore = create<AppState>((set, get) => ({
     currentAnchorIndex: 0,
     annotatedAnchorIndices: [],
     anchorRemainderInferencing: false,
+    anchorRemainderAwaitingCommit: false,
   }),
 }))
 

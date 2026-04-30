@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react'
-import { Info } from 'lucide-react'
+import { GripVertical, Info } from 'lucide-react'
 import { useStore, currentVideo as selectCurrentVideo } from '../../store/useStore'
 import { videoSourceUrl, frameUrl } from '../../api/client'
 import AnnotationCanvas from './AnnotationCanvas'
@@ -18,11 +18,27 @@ import AnnotationCanvas from './AnnotationCanvas'
 export default function FrameViewer() {
   const store = useStore()
   const video = selectCurrentVideo(store)
-  const { project, currentVideoId, currentFrame, setCurrentFrame, isPlaying, setPlaying, pointMode } = store
+  const {
+    project,
+    currentVideoId,
+    currentFrame,
+    setCurrentFrame,
+    isPlaying,
+    setPlaying,
+    pointMode,
+    anchorPhase,
+    anchorFrames,
+    currentAnchorIndex,
+    anchorRemainderInferencing,
+    anchorRemainderAwaitingCommit,
+  } = store
 
   const containerRef = useRef<HTMLDivElement>(null)
+  const frameStackRef = useRef<HTMLDivElement>(null)
+  const anchorReturnPanelRef = useRef<HTMLDivElement>(null)
   const videoRef = useRef<HTMLVideoElement>(null)
   const [dimensions, setDimensions] = useState({ width: 0, height: 0 })
+  const [anchorReturnOffsets, setAnchorReturnOffsets] = useState({ right: 12, bottom: 12 })
   const [showTip, setShowTip] = useState(true)
 
   // Prevent feedback loop: video timeupdate -> setCurrentFrame -> seek effect
@@ -61,6 +77,10 @@ export default function FrameViewer() {
   useEffect(() => {
     const el = videoRef.current
     if (el) el.load()
+  }, [vid])
+
+  useEffect(() => {
+    setAnchorReturnOffsets({ right: 12, bottom: 12 })
   }, [vid])
 
   // ── Play / Pause ──────────────────────────────────────────────────────────
@@ -141,6 +161,54 @@ export default function FrameViewer() {
     return () => window.removeEventListener('keydown', handleKeyDown)
   }, [currentFrame, video, setCurrentFrame, store.propagationStartFrame])
 
+  const targetAnchorFrame =
+    anchorFrames.length > 0 && currentAnchorIndex >= 0 && currentAnchorIndex < anchorFrames.length
+      ? anchorFrames[currentAnchorIndex]
+      : null
+
+  const anchorLabelingActive =
+    anchorPhase &&
+    targetAnchorFrame != null &&
+    !(anchorRemainderInferencing && !anchorRemainderAwaitingCommit)
+
+  const showAnchorReturnChip =
+    anchorLabelingActive &&
+    !isPlaying &&
+    dimensions.width > 0 &&
+    currentFrame !== targetAnchorFrame
+
+  const handleAnchorReturnDragStart = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    e.preventDefault()
+    e.stopPropagation()
+    const panel = anchorReturnPanelRef.current
+    const stack = frameStackRef.current
+    if (!panel || !stack) return
+    const startX = e.clientX
+    const startY = e.clientY
+    const startRight = anchorReturnOffsets.right
+    const startBottom = anchorReturnOffsets.bottom
+    const cw = stack.clientWidth
+    const ch = stack.clientHeight
+    const pad = 6
+    function move(ev: MouseEvent) {
+      const pw = panel.offsetWidth
+      const ph = panel.offsetHeight
+      const dx = ev.clientX - startX
+      const dy = ev.clientY - startY
+      let nr = startRight - dx
+      let nb = startBottom - dy
+      nr = Math.max(pad, Math.min(cw - pad - pw, nr))
+      nb = Math.max(pad, Math.min(ch - pad - ph, nb))
+      setAnchorReturnOffsets({ right: nr, bottom: nb })
+    }
+    function up() {
+      window.removeEventListener('mousemove', move)
+      window.removeEventListener('mouseup', up)
+    }
+    window.addEventListener('mousemove', move)
+    window.addEventListener('mouseup', up)
+  }, [anchorReturnOffsets.right, anchorReturnOffsets.bottom])
+
   // ── Helpers ───────────────────────────────────────────────────────────────
 
   function fmt(frame: number, fps: number) {
@@ -174,6 +242,7 @@ export default function FrameViewer() {
     >
       {dimensions.width > 0 && (
         <div
+          ref={frameStackRef}
           style={{
             position: 'relative',
             width: dimensions.width,
@@ -222,6 +291,38 @@ export default function FrameViewer() {
 
           {/* Layer 2: Annotation canvas */}
           <AnnotationCanvas width={dimensions.width} height={dimensions.height} videoRef={videoRef} />
+
+          {showAnchorReturnChip && targetAnchorFrame != null && (
+            <div
+              ref={anchorReturnPanelRef}
+              role="dialog"
+              aria-label="Return to anchor frame"
+              className="absolute z-20 w-[min(calc(100%-16px),260px)] rounded-xl border border-blue-600/35 bg-[#111]/95 shadow-xl backdrop-blur-sm overflow-hidden"
+              style={{ right: anchorReturnOffsets.right, bottom: anchorReturnOffsets.bottom }}
+            >
+              <div
+                className="flex items-center gap-2 px-2.5 py-1.5 border-b border-[#333] bg-[#161616]/95 cursor-grab active:cursor-grabbing select-none"
+                onMouseDown={handleAnchorReturnDragStart}
+              >
+                <GripVertical size={14} className="text-[#666] flex-shrink-0" aria-hidden />
+                <span className="text-[11px] font-medium text-blue-300/95 truncate">
+                  Anchor {currentAnchorIndex + 1} · frame #{targetAnchorFrame}
+                </span>
+              </div>
+              <div className="p-2.5 space-y-2">
+                <p className="text-[11px] text-[#888] leading-snug">
+                  You moved to frame #{currentFrame}. Go back to finish this anchor before Done, next?
+                </p>
+                <button
+                  type="button"
+                  className="btn btn-primary w-full py-1.5 text-xs font-medium"
+                  onClick={() => setCurrentFrame(targetAnchorFrame)}
+                >
+                  Go to anchor frame #{targetAnchorFrame}
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
