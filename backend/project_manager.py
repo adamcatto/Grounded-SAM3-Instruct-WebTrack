@@ -384,6 +384,9 @@ class ProjectManager:
     def bboxes_dir(self, pid: str, vid: str) -> Path:
         return self.video_dir(pid, vid) / "bboxes"
 
+    def masks_sqlite_path(self, pid: str, vid: str) -> Path:
+        return self.video_dir(pid, vid) / "masks.sqlite"
+
     # ─── Internal ────────────────────────────────────────────────────────────
 
     def _normalize_video_meta(self, vm: dict) -> dict:

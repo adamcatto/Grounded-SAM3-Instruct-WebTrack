@@ -16,7 +16,7 @@ _BACKEND = Path(__file__).resolve().parents[1] / "backend"
 if str(_BACKEND) not in sys.path:
     sys.path.insert(0, str(_BACKEND))
 
-from video_processor import load_masks_npz  # noqa: E402
+from mask_store import VideoMaskStorage
 
 from .tqdm_optional import try_tqdm
 
@@ -29,7 +29,6 @@ class VideoTrackContext:
     video_name: str
     config: dict[str, Any]
     video_dir: Path
-    masks_dir: Path
 
 
 def load_project_config(project_dir: Path) -> dict[str, Any]:
@@ -49,7 +48,7 @@ def video_storage_dir(project_dir: Path, vid: str) -> Path | None:
 
 def _masks_cover_all_frames(
     video: dict[str, Any],
-    masks_dir: Path,
+    video_dir: Path,
     *,
     progress: bool = False,
     progress_desc: str | None = None,
@@ -66,8 +65,9 @@ def _masks_cover_all_frames(
             leave=False,
             unit="frm",
         )
+    ms = VideoMaskStorage(video_dir)
     for fi in rng:
-        if not (masks_dir / f"{fi:06d}.npz").is_file():
+        if not ms.has_masks(fi):
             return False
     return True
 
@@ -87,34 +87,32 @@ def _try_make_complete_context(
     vdir = video_storage_dir(project_dir, vid)
     if vdir is None:
         return None, "missing video directory"
-    masks = vdir / "masks"
     if not v.get("propagation_complete"):
         return None, "propagation_complete is false"
     ok = _masks_cover_all_frames(
         v,
-        masks,
+        vdir,
         progress=verify_progress,
         progress_desc=verify_desc,
     )
     if not ok:
-        return None, "missing mask npz for some frames"
+        return None, "missing saved masks for some frames"
     return (
         VideoTrackContext(
             video_id=str(vid),
             video_name=str(v.get("name") or vid),
             config=dict(v),
             video_dir=vdir,
-            masks_dir=masks,
         ),
         None,
     )
 
 
-def is_fully_tracked(video: dict[str, Any], masks_dir: Path) -> bool:
-    """Require propagation flag and an npz mask file for every frame in range."""
+def is_fully_tracked(video: dict[str, Any], video_dir: Path) -> bool:
+    """Require propagation flag and persisted masks for every frame in range."""
     if not video.get("propagation_complete"):
         return False
-    return _masks_cover_all_frames(video, masks_dir, progress=False)
+    return _masks_cover_all_frames(video, video_dir, progress=False)
 
 
 def partition_complete_videos(
@@ -216,7 +214,7 @@ def build_centroid_timelines(
     total_fr = max(0, n - start)
 
     logger.info(
-        'Loading centroid timelines for "%s" (%s): frames %d..%d (%d frames), reading masks/*.npz',
+        'Loading centroid timelines for "%s" (%s): frames %d..%d (%d frames), reading persisted masks',
         ctx.video_name,
         ctx.video_id,
         start,
@@ -236,9 +234,10 @@ def build_centroid_timelines(
             unit="frm",
         )
 
+    ms = VideoMaskStorage(ctx.video_dir)
+
     for fi in frame_iter:
-        path = ctx.masks_dir / f"{fi:06d}.npz"
-        masks = load_masks_npz(str(path))
+        masks = ms.load_masks_dense(fi)
         row = fi - start
         for k, m in masks.items():
             if k not in all_series:

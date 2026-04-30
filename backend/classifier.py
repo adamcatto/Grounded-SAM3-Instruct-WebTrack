@@ -32,6 +32,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from mask_store import VideoMaskStorage
+
 logger = logging.getLogger(__name__)
 
 BACKBONE_NAME = "facebook/dinov2-small"
@@ -159,7 +161,7 @@ def train_and_infer(
     pid: str,
     vid: str,
     frames_dir: Path,
-    masks_dir: Path,
+    video_dir: Path,
     video_source: str,
     frame_range: range,
     obj_ids: list[str],
@@ -187,7 +189,7 @@ def train_and_infer(
     _cancel_flags[(pid, vid)] = cancel_ev
     try:
         yield from _run(
-            cancel_ev, frames_dir, masks_dir, video_source,
+            cancel_ev, frames_dir, video_dir, video_source,
             list(frame_range), obj_ids, epochs, lr, train_ratio, eval_ratio,
         )
     finally:
@@ -199,7 +201,7 @@ def train_and_infer(
 def _run(
     cancel_ev: threading.Event,
     frames_dir: Path,
-    masks_dir: Path,
+    video_dir: Path,
     video_source: str,
     frame_indices: list[int],
     obj_ids: list[str],
@@ -212,10 +214,12 @@ def _run(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Classifier: training on {device}, backbone={BACKBONE_NAME}")
 
+    ms = VideoMaskStorage(video_dir)
+
     # ── 1. Find frames that have saved masks in the requested range ────────────
     frames_with_masks = [
         f for f in frame_indices
-        if (masks_dir / f"{f:06d}.npz").exists()
+        if ms.has_masks(f)
     ]
     if len(frames_with_masks) < 4:
         yield {
@@ -249,8 +253,8 @@ def _run(
         if img is None:
             logger.warning(f"Classifier: cannot load frame {fidx}")
             continue
-        npz = dict(np.load(str(masks_dir / f"{fidx:06d}.npz")))
-        label = _build_label(npz, obj_ids)
+        masks_dict = ms.load_masks_dense(fidx)
+        label = _build_label(masks_dict, obj_ids)
         if int(label.max()) == 0:
             continue   # no object pixels in this frame — skip
         train_data.append((_preprocess(img), label))
@@ -344,7 +348,7 @@ def _run(
             img = _load_frame(fidx, frames_dir, cap2)
             if img is None:
                 continue
-            npz = dict(np.load(str(masks_dir / f"{fidx:06d}.npz")))
+            masks_dict = ms.load_masks_dense(fidx)
 
             img_t    = _preprocess(img).to(device)
             logits   = model(img_t)[0]           # [N+1, H, W]
@@ -353,7 +357,7 @@ def _run(
 
             frame_asgn: dict[str, dict] = {}
             for sam_id in obj_ids:
-                mask_np = npz.get(sam_id)
+                mask_np = masks_dict.get(sam_id)
                 if mask_np is None:
                     continue
                 m_rs = cv2.resize(

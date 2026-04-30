@@ -437,6 +437,25 @@ def composite_masks_as_png(
     return base64.b64encode(buf.getvalue()).decode()
 
 
+def bbox_norm_xywh_score_from_mask(mask: np.ndarray) -> tuple[list[float], float]:
+    """Normalized xywh bbox [0,1] + score from a binary mask (matches server semantics)."""
+    m = np.squeeze(mask).astype(bool)
+    ys, xs = np.where(m)
+    if len(xs) == 0:
+        return [0.0, 0.0, 0.0, 0.0], 0.0
+    h, w = m.shape[:2]
+    y0, y1 = ys.min(), ys.max()
+    x0, x1 = xs.min(), xs.max()
+    nw = max(1, w)
+    nh = max(1, h)
+    return [
+        float(x0) / nw,
+        float(y0) / nh,
+        float(x1 - x0 + 1) / nw,
+        float(y1 - y0 + 1) / nh,
+    ], 1.0
+
+
 # ─── Output Persistence ───────────────────────────────────────────────────────
 
 def save_masks_npz(out_path: str, masks: dict):
@@ -557,18 +576,18 @@ def overlay_masks_on_frame(
 def export_video_with_masks(
     source_path: str,
     out_path: str,
-    masks_dir: str,
+    video_dir: str,
     colors: dict,       # {obj_id_str: hex_color}
     labels: dict,       # {obj_id_str: label_text}
     num_frames_hint: int = 0,
     progress_callback=None,  # fn(frame_idx: int, total: int)
 ) -> dict:
     """
-    Write source_path to out_path as H.264 MP4, overlaying masks from
-    masks_dir/{frame_idx:06d}.npz for each frame.
+    Write source_path to out_path as H.264 MP4, overlaying masks from the video's
+    mask storage (`masks.sqlite` and/or legacy masks/*.npz).
 
     Does NOT read or modify any SAM session state, annotated_frames, or
-    inference data — only reads the source video and masks/*.npz files.
+    inference data — only reads the source video and persisted masks.
 
     Returns {"total_frames": N, "fps": fps}.
     """
@@ -581,7 +600,9 @@ def export_video_with_masks(
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or num_frames_hint or 1000
 
-    masks_path = Path(masks_dir)
+    from mask_store import VideoMaskStorage
+
+    ms = VideoMaskStorage(video_dir)
     emit_every = max(30, total // 200)
 
     ffmpeg_proc = subprocess.Popen(
@@ -616,14 +637,12 @@ def export_video_with_masks(
             ret, frame = cap.read()
             if not ret:
                 break
-            npz_path = masks_path / f"{frame_idx:06d}.npz"
-            if npz_path.exists():
-                try:
-                    raw_masks = load_masks_npz(str(npz_path))
-                    if raw_masks:
-                        frame = overlay_masks_on_frame(frame, raw_masks, colors, labels)
-                except Exception as e:
-                    logger.warning(f"Mask overlay failed for frame {frame_idx}: {e}")
+            try:
+                raw_masks = ms.load_masks_dense(frame_idx)
+                if raw_masks:
+                    frame = overlay_masks_on_frame(frame, raw_masks, colors, labels)
+            except Exception as e:
+                logger.warning(f"Mask overlay failed for frame {frame_idx}: {e}")
             ffmpeg_proc.stdin.write(frame.tobytes())
             frame_idx += 1
             if progress_callback and frame_idx % emit_every == 0:

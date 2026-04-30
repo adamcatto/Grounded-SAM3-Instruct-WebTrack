@@ -33,21 +33,18 @@ from anchor_helpers import (
 )
 from project_manager import ProjectManager
 from sam_predictor import SAMPredictor, _get_predictor
+from mask_store import VideoMaskStorage
 from video_processor import (
     compute_ds_dims,
+    composite_masks_as_png,
     encode_mask_as_png,
     ensure_faststart,
     export_video_with_masks,
     extract_frames,
     extract_frame_indices,
     extract_frame_range,
-    get_video_info,
-    load_bboxes_json,
-    load_masks_npz,
-    save_bboxes_json,
-    save_masks_npz,
     generate_thumbnail,
-    composite_masks_as_png,
+    get_video_info,
 )
 
 
@@ -294,18 +291,10 @@ def _persist_predicted_anchor_frame(pid: str, vid: str, frame_idx: int,
     """Persist masks and bboxes for an auto-filled anchor (no synthetic point prompts)."""
     if not masks_by_oid:
         return
-    masks_dir = pm.masks_dir(pid, vid)
-    bbox_dir = pm.bboxes_dir(pid, vid)
-    masks_path = masks_dir / f"{frame_idx:06d}.npz"
-
-    merged_masks: dict[str, np.ndarray] = {}
-    if masks_path.exists():
-        try:
-            previous = load_masks_npz(str(masks_path))
-            for kk, bm in previous.items():
-                merged_masks[str(kk)] = bm.astype(np.uint8)
-        except Exception:
-            pass
+    ms = VideoMaskStorage(pm.video_dir(pid, vid))
+    merged_masks: dict[str, np.ndarray] = {
+        str(k): np.asarray(v).astype(np.uint8) for k, v in ms.load_masks_dense(frame_idx).items()
+    }
 
     bbox_json: dict[str, list] = {}
     for oid_int, m in masks_by_oid.items():
@@ -314,9 +303,7 @@ def _persist_predicted_anchor_frame(pid: str, vid: str, frame_idx: int,
         bx, score = _bbox_norm_xywh_score(merged_masks[cfg_key] > 0)
         bbox_json[cfg_key] = list(bx) + [score]
 
-    save_masks_npz(str(masks_path), merged_masks)
-    save_bboxes_json(str(bbox_dir / f"{frame_idx:06d}.json"), bbox_json)
-
+    ms.save_frame(frame_idx, merged_masks, bbox_json)
     _invalidate_mask_cache(pid, vid)
 
 
@@ -576,23 +563,24 @@ def _get_instance_color(obj_id: str, objects: dict) -> str:
 
 # ─── Mask encode cache ────────────────────────────────────────────────────────
 # encode_mask_as_png is expensive (numpy + cv2 contour/dilate + PIL PNG encode).
-# Cache results keyed by (npz_path, mtime_ns) so repeated GET /masks/{fidx}
-# requests (e.g. scrubbing back to a visited frame) are instant.
+# Cache keyed by (pid, vid, frame_idx, sqlite_revision_or_legacy_mtime_ns).
 
 _mask_encode_cache: dict[tuple, dict] = {}
 _MASK_CACHE_MAX = 2000  # max entries (~2 KB overhead per entry, masks are large)
 
 
-def _get_encoded_masks(masks_path: Path, objects: dict) -> dict:
-    """Load and encode masks with an in-memory cache keyed by (path, mtime)."""
-    if not masks_path.exists():
+def _get_encoded_masks(pid: str, vid: str, fidx: int, objects: dict) -> dict:
+    """Load and encode masks with an in-memory cache keyed by storage revision."""
+    ms = VideoMaskStorage(pm.video_dir(pid, vid))
+    if not ms.has_masks(fidx):
         return {}
-    mtime_ns = masks_path.stat().st_mtime_ns
-    key = (str(masks_path), mtime_ns)
+
+    rev_part = ms.png_cache_revision_part(fidx)
+    key = ("masks_png", pid, vid, int(fidx), rev_part)
     if key in _mask_encode_cache:
         return _mask_encode_cache[key]
 
-    raw_masks = load_masks_npz(str(masks_path))
+    raw_masks = ms.load_masks_dense(fidx)
     mask_b64: dict[str, str] = {}
     for obj_id, mask in raw_masks.items():
         obj_color = _get_instance_color(str(obj_id), objects)
@@ -609,9 +597,9 @@ def _get_encoded_masks(masks_path: Path, objects: dict) -> dict:
 
 
 def _invalidate_mask_cache(pid: str, vid: str) -> None:
-    """Remove all cached entries for a given video (call after propagation/save)."""
-    prefix = str(pm.masks_dir(pid, vid))
-    for k in [k for k in _mask_encode_cache if k[0].startswith(prefix)]:
+    """Remove all cached PNG entries for a given video."""
+    prefix = ("masks_png", pid, vid)
+    for k in [k for k in _mask_encode_cache if isinstance(k, tuple) and len(k) >= 4 and k[:3] == prefix]:
         del _mask_encode_cache[k]
 
 
@@ -1072,6 +1060,8 @@ def reset_video(pid: str, vid: str):
     # Invalidate in-memory mask cache for this video
     _invalidate_mask_cache(pid, vid)
 
+    VideoMaskStorage(pm.video_dir(pid, vid)).wipe_sqlite_file()
+
     # Wipe masks, bboxes, and frame directories
     masks_dir = pm.masks_dir(pid, vid)
     bboxes_dir = pm.bboxes_dir(pid, vid)
@@ -1330,21 +1320,19 @@ def get_session_state(pid: str, vid: str):
     # Point prompts from project config
     point_prompts: dict = video.get("point_prompts", {})
 
-    # Saved masks on disk
-    masks_dir = pm.masks_dir(pid, vid)
+    # Saved masks on disk (SQLite store + legacy npz)
+    ms = VideoMaskStorage(pm.video_dir(pid, vid))
     saved_mask_frames: list[int] = []
     saved_mask_obj_counts: dict[int, int] = {}
-    if masks_dir.exists():
-        for npz_file in sorted(masks_dir.glob("*.npz")):
+    try:
+        saved_mask_frames = ms.iter_saved_frame_indices_sorted()
+        for fidx in saved_mask_frames:
             try:
-                fidx = int(npz_file.stem)
-                saved_mask_frames.append(fidx)
-                # Count how many objects are in each npz
-                import numpy as np
-                data = np.load(str(npz_file))
-                saved_mask_obj_counts[fidx] = len(data.files)
+                saved_mask_obj_counts[fidx] = ms.mask_object_count(fidx)
             except Exception:
-                pass
+                saved_mask_obj_counts[fidx] = 0
+    except Exception:
+        pass
 
     # Annotated frames on disk
     ann_dir = pm.annotated_frames_dir(pid, vid)
@@ -1674,9 +1662,10 @@ def add_points(pid: str, vid: str, oid: str, req: AddPointsRequest):
     # masks for this frame.  Merge with existing npz so objects not yet in the
     # current session still retain their saved masks.
     if raw_masks:
-        masks_path = pm.masks_dir(pid, vid) / f"{req.frame_idx:06d}.npz"
-        existing = load_masks_npz(str(masks_path)) if masks_path.exists() else {}
-        save_masks_npz(str(masks_path), {**existing, **raw_masks})
+        ms = VideoMaskStorage(pm.video_dir(pid, vid))
+        existing = ms.load_masks_dense(req.frame_idx)
+        merged = {**existing, **{str(k): np.asarray(v) for k, v in raw_masks.items()}}
+        ms.save_frame(req.frame_idx, merged, None)
         _invalidate_mask_cache(pid, vid)
 
     return {"frame_idx": req.frame_idx, "masks": mask_b64}
@@ -1697,15 +1686,11 @@ def clear_object_points(pid: str, vid: str, oid: str):
 def clear_object_frame_points(pid: str, vid: str, oid: str, frame_idx: int):
     """Clear point prompts and saved mask for a single object on a single frame."""
     pm.clear_object_frame_prompt(pid, vid, oid, frame_idx)
-    # Remove this object's mask from the frame's NPZ (leave other objects intact)
-    masks_path = pm.masks_dir(pid, vid) / f"{frame_idx:06d}.npz"
-    if masks_path.exists():
-        existing = load_masks_npz(str(masks_path))
+    ms = VideoMaskStorage(pm.video_dir(pid, vid))
+    if ms.has_masks(frame_idx):
+        existing = ms.load_masks_dense(frame_idx)
         remaining = {k: v for k, v in existing.items() if k != oid}
-        if remaining:
-            save_masks_npz(str(masks_path), remaining)
-        else:
-            masks_path.unlink()
+        ms.save_frame(frame_idx, remaining, None)
         _invalidate_mask_cache(pid, vid)
     return {"status": "ok"}
 
@@ -1720,21 +1705,11 @@ class SwapMasksRequest(BaseModel):
 @app.post("/api/projects/{pid}/videos/{vid}/masks/swap")
 def swap_object_masks(pid: str, vid: str, req: SwapMasksRequest):
     """Swap masks (and bboxes) between two objects across a range of frames."""
-    masks_dir = pm.masks_dir(pid, vid)
-    bboxes_dir = pm.bboxes_dir(pid, vid)
-
-    if not masks_dir.exists():
-        return {"status": "ok", "frames_swapped": 0}
-
+    ms = VideoMaskStorage(pm.video_dir(pid, vid))
+    indices = ms.iter_frame_indices_in_range(req.from_frame, req.to_frame)
     swapped = 0
-    for npz_path in sorted(masks_dir.glob("*.npz")):
-        fidx = int(npz_path.stem)
-        if req.from_frame >= 0 and fidx < req.from_frame:
-            continue
-        if req.to_frame >= 0 and fidx > req.to_frame:
-            continue
-
-        masks = load_masks_npz(str(npz_path))
+    for fidx in indices:
+        masks = ms.load_masks_dense(fidx)
         has_a = req.obj_a in masks
         has_b = req.obj_b in masks
         if not has_a and not has_b:
@@ -1746,20 +1721,16 @@ def swap_object_masks(pid: str, vid: str, req: SwapMasksRequest):
             masks[req.obj_a] = b_mask
         if a_mask is not None:
             masks[req.obj_b] = a_mask
-        save_masks_npz(str(npz_path), masks)
 
-        # Swap bboxes too
-        bbox_path = bboxes_dir / f"{fidx:06d}.json"
-        if bbox_path.exists():
-            bboxes = json.loads(bbox_path.read_text())
-            a_bbox = bboxes.pop(req.obj_a, None)
-            b_bbox = bboxes.pop(req.obj_b, None)
-            if b_bbox is not None:
-                bboxes[req.obj_a] = b_bbox
-            if a_bbox is not None:
-                bboxes[req.obj_b] = a_bbox
-            bbox_path.write_text(json.dumps(bboxes, indent=2))
+        bboxes = ms.load_bboxes(fidx)
+        a_bbox = bboxes.pop(req.obj_a, None)
+        b_bbox = bboxes.pop(req.obj_b, None)
+        if b_bbox is not None:
+            bboxes[req.obj_a] = b_bbox
+        if a_bbox is not None:
+            bboxes[req.obj_b] = a_bbox
 
+        ms.save_frame(fidx, masks, bboxes)
         swapped += 1
 
     _invalidate_mask_cache(pid, vid)
@@ -1777,11 +1748,11 @@ def get_saved_mask(pid: str, vid: str, fidx: int):
     if video is None:
         raise HTTPException(404, "Video not found")
 
-    masks_path = pm.masks_dir(pid, vid) / f"{fidx:06d}.npz"
-    if not masks_path.exists():
+    ms = VideoMaskStorage(pm.video_dir(pid, vid))
+    if not ms.has_masks(fidx):
         return JSONResponse({"masks": {}}, headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
 
-    mask_b64 = _get_encoded_masks(masks_path, video["objects"])
+    mask_b64 = _get_encoded_masks(pid, vid, fidx, video["objects"])
     return JSONResponse(
         {"frame_idx": fidx, "masks": mask_b64},
         headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
@@ -1794,24 +1765,11 @@ def _delete_masks_in_range(
     to_frame: Optional[int] = None,
 ) -> int:
     """
-    Delete mask/bbox files in [from_frame, to_frame] (both inclusive, None = unbounded).
-    Returns number of frame files deleted.
+    Delete mask/bbox rows and legacy files in [from_frame, to_frame]
+    (both inclusive, None = unbounded).
+    Returns count of distinct frame indices cleared.
     """
-    masks_dir = pm.masks_dir(pid, vid)
-    bboxes_dir = pm.bboxes_dir(pid, vid)
-    deleted = 0
-    for npz in sorted(masks_dir.glob("*.npz")):
-        fidx = int(npz.stem)
-        if from_frame is not None and fidx < from_frame:
-            continue
-        if to_frame is not None and fidx > to_frame:
-            continue
-        npz.unlink()
-        bbox = bboxes_dir / f"{fidx:06d}.json"
-        if bbox.exists():
-            bbox.unlink()
-        deleted += 1
-    return deleted
+    return VideoMaskStorage(pm.video_dir(pid, vid)).delete_masks_range(from_frame, to_frame)
 
 
 @app.delete("/api/projects/{pid}/videos/{vid}/masks/{fidx}")
@@ -1821,15 +1779,17 @@ def delete_frame_masks(pid: str, vid: str, fidx: int):
     if video is None:
         raise HTTPException(404, "Video not found")
 
+    ms = VideoMaskStorage(pm.video_dir(pid, vid))
     masks_path = pm.masks_dir(pid, vid) / f"{fidx:06d}.npz"
     bboxes_path = pm.bboxes_dir(pid, vid) / f"{fidx:06d}.json"
 
     deleted = []
-    if masks_path.exists():
-        masks_path.unlink()
+    had_masks = ms.has_masks(fidx) or masks_path.exists()
+    had_bbox = bboxes_path.exists()
+    ms.delete_frame(fidx)
+    if had_masks:
         deleted.append("masks")
-    if bboxes_path.exists():
-        bboxes_path.unlink()
+    if had_bbox:
         deleted.append("bboxes")
 
     _invalidate_mask_cache(pid, vid)
@@ -1884,11 +1844,11 @@ def get_composite_mask(pid: str, vid: str, fidx: int):
     if video is None:
         raise HTTPException(404, "Video not found")
 
-    masks_path = pm.masks_dir(pid, vid) / f"{fidx:06d}.npz"
-    if not masks_path.exists():
+    ms = VideoMaskStorage(pm.video_dir(pid, vid))
+    if not ms.has_masks(fidx):
         raise HTTPException(404, "No mask for this frame")
 
-    raw_masks = load_masks_npz(str(masks_path))
+    raw_masks = ms.load_masks_dense(fidx)
     objects = video["objects"]
     colors = {obj_id: obj.get("color", "#5B8DD9") for obj_id, obj in objects.items()}
 
@@ -1917,8 +1877,8 @@ def clear_frame_from_inference(pid: str, vid: str, frame_idx: int):
 async def export_video_sse(pid: str, vid: str):
     """
     Stream export progress as Server-Sent Events while writing an annotated
-    MP4 to disk.  Reads only the source video and masks/*.npz files — does
-    not touch SAM sessions, annotated_frames, or inference state.
+    MP4 to disk.  Reads only the source video and persisted masks for this video
+    (`masks.sqlite` and/or legacy masks/*.npz) — does not touch SAM sessions, annotated_frames, or inference state.
 
     Progress events: {"frame": N, "total": T, "progress": 0.0-1.0}
     Done event:      {"path": "/abs/path/export.mp4", "total_frames": N}
@@ -1933,7 +1893,7 @@ async def export_video_sse(pid: str, vid: str):
     objects = video["objects"]
     colors = {oid: obj.get("color", "#5B8DD9") for oid, obj in objects.items()}
     labels_map = {oid: obj.get("name", f"Object {oid}") for oid, obj in objects.items()}
-    masks_dir = str(pm.masks_dir(pid, vid))
+    video_dir_export = str(pm.video_dir(pid, vid))
     out_path = pm.video_dir(pid, vid) / "export.mp4"
 
     async def event_gen():
@@ -1956,7 +1916,7 @@ async def export_video_sse(pid: str, vid: str):
                 result = export_video_with_masks(
                     source_path=source_path,
                     out_path=str(out_path),
-                    masks_dir=masks_dir,
+                    video_dir=video_dir_export,
                     colors=colors,
                     labels=labels_map,
                     num_frames_hint=video.get("num_frames", 0),
@@ -2136,8 +2096,7 @@ async def _run_propagation_bg(
     start_frame: int,
     source_path: str,
     num_frames: int,
-    masks_dir,
-    bboxes_dir,
+    video_dir: Path,
     objects: dict,
     all_prompts: dict,
     state: PropagationState,
@@ -2152,7 +2111,7 @@ async def _run_propagation_bg(
     Processes frames start_frame..num_frames-1 in STREAM_BATCH_SIZE chunks.
     Each batch [P1, P2]:
       - Seeds P1 from the previous frame's saved mask (cross-batch continuity /
-        resume continuity), when P1 > 0 and a mask file for P1-1 exists.
+        resume continuity), when P1 > 0 and masks exist for frame P1-1.
       - Seeds every user-labeled frame within [P1, P2] from their point prompts
         (sorted ascending so SAM sees them in order).
       - When use_all_anchors=True, also extracts and seeds all user-labeled frames
@@ -2192,20 +2151,23 @@ async def _run_propagation_bg(
         "total_batches": total_batches,
     })
 
-    def _seed_from_npz(frame_idx: int, npz_path: Path):
-        """Load masks from npz and add as mask prompts at frame_idx."""
-        if not Path(npz_path).exists():
+    def _seed_from_saved_previous(seed_at_frame: int) -> None:
+        prev = seed_at_frame - 1
+        if prev < 0:
+            return
+        ms_seed = VideoMaskStorage(video_dir)
+        if not ms_seed.has_masks(prev):
             return
         try:
-            saved = load_masks_npz(str(npz_path))
+            saved = ms_seed.load_masks_dense(prev)
             for obj_id_str, mask in saved.items():
                 obj_id_int = int(obj_id_str.split("_")[0]) if "_" in obj_id_str else int(obj_id_str)
                 try:
-                    sam.add_mask_prompt(pid, vid, frame_idx=frame_idx, obj_id=obj_id_int, mask=mask)
+                    sam.add_mask_prompt(pid, vid, frame_idx=seed_at_frame, obj_id=obj_id_int, mask=mask)
                 except Exception as e:
-                    logger.warning(f"add_mask_prompt obj {obj_id_str} frame {frame_idx}: {e}")
+                    logger.warning(f"add_mask_prompt obj {obj_id_str} frame {seed_at_frame}: {e}")
         except Exception as e:
-            logger.warning(f"_seed_from_npz {npz_path}: {e}")
+            logger.warning(f"_seed_from_saved_previous prev={prev} seed_at={seed_at_frame}: {e}")
 
     def _extract_pass_results(item: dict) -> tuple[int, dict[int, np.ndarray], dict[int, list]]:
         """Extract real frame index, masks and bboxes from a propagation item.
@@ -2325,9 +2287,9 @@ async def _run_propagation_bg(
 
                 # Cross-batch / resume continuity: seed P1 from frame P1-1's saved mask.
                 if P1 > 0:
-                    prev_npz = masks_dir / f"{P1 - 1:06d}.npz"
-                    if prev_npz.exists():
-                        await loop.run_in_executor(None, _seed_from_npz, P1, prev_npz)
+                    ms_chk = VideoMaskStorage(video_dir)
+                    if ms_chk.has_masks(P1 - 1):
+                        await loop.run_in_executor(None, _seed_from_saved_previous, P1)
                         seeded_frames.append(P1)
 
                 # Seed every user-labeled frame that is in the current session.
@@ -2400,18 +2362,21 @@ async def _run_propagation_bg(
                 for real_frame, frame_masks, frame_bboxes in forward_results:
                     frame_results[real_frame] = (frame_masks, frame_bboxes)
 
+                def _persist_propagation_frame(rf: int, fm: dict, fb: dict):
+                    VideoMaskStorage(video_dir).save_frame(
+                        rf,
+                        {str(k): v for k, v in fm.items()},
+                        {str(k): v for k, v in fb.items()} if fb else None,
+                    )
+
                 for real_frame, (frame_masks, frame_bboxes) in sorted(frame_results.items()):
                     if frame_masks:
-                        npz_data = {str(k): v for k, v in frame_masks.items()}
                         await loop.run_in_executor(
-                            None, save_masks_npz,
-                            str(masks_dir / f"{real_frame:06d}.npz"), npz_data,
-                        )
-                    if frame_bboxes:
-                        bbox_data = {str(k): v for k, v in frame_bboxes.items()}
-                        await loop.run_in_executor(
-                            None, save_bboxes_json,
-                            str(bboxes_dir / f"{real_frame:06d}.json"), bbox_data,
+                            None,
+                            _persist_propagation_frame,
+                            real_frame,
+                            dict(frame_masks),
+                            dict(frame_bboxes),
                         )
                     total_propagated += 1
                     progress = (start_frame + total_propagated) / num_frames
@@ -2497,10 +2462,8 @@ async def propagate_video(pid: str, vid: str, start_frame: int = 0, resume_from:
 
         num_frames = video["num_frames"]
         source_path = video.get("source_path", "")
-        masks_dir = pm.masks_dir(pid, vid)
-        bboxes_dir = pm.bboxes_dir(pid, vid)
+        video_dir_path = pm.video_dir(pid, vid)
         objects = video["objects"]
-        all_prompts = pm.get_all_point_prompts(pid, vid)
 
         # Determine start: for fresh runs use earliest annotated frame,
         # for resumes use the frame after the paused point.
@@ -2529,7 +2492,7 @@ async def propagate_video(pid: str, vid: str, start_frame: int = 0, resume_from:
         state.task = asyncio.create_task(
             _run_propagation_bg(
                 pid, vid, actual_start, source_path, num_frames,
-                masks_dir, bboxes_dir, objects, all_prompts, state,
+                video_dir_path, objects, all_prompts, state,
                 end_frame=end_frame,
                 use_all_anchors=use_all_anchors,
                 ds_max_dim=ds_max_dim,
@@ -2640,22 +2603,11 @@ async def resume_from_frame(pid: str, vid: str, req: ResumeFromFrameRequest):
     if req.resume_frame < 0 or (total_frames > 0 and req.resume_frame >= total_frames):
         raise HTTPException(400, f"resume_frame must be between 0 and {total_frames - 1}")
 
-    masks_dir = pm.masks_dir(pid, vid)
-    bboxes_dir = pm.bboxes_dir(pid, vid)
+    ms_resume = VideoMaskStorage(pm.video_dir(pid, vid))
 
     deleted_count = 0
     if req.clear_from_frame:
-        # Delete all masks/bboxes from resume_frame onwards
-        for d in (masks_dir, bboxes_dir):
-            if d.exists():
-                for f in d.iterdir():
-                    try:
-                        frame_idx = int(f.stem)
-                        if frame_idx >= req.resume_frame:
-                            f.unlink()
-                            deleted_count += 1
-                    except ValueError:
-                        pass  # Skip non-numeric filenames
+        deleted_count = ms_resume.delete_masks_range(req.resume_frame, None)
 
     # Update propagated_frames to only include frames before resume_frame
     propagated = video.get("propagated_frames", [])
