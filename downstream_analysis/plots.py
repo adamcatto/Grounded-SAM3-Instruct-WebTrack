@@ -49,6 +49,40 @@ def plot_overlay_histogram(
     plt.close(fig)
 
 
+def plot_overlay_cdf(
+    series_by_label: Mapping[str, np.ndarray],
+    *,
+    title: str,
+    xlabel: str,
+    outfile: Path,
+    figsize: tuple[float, float] = (9, 5.5),
+    colors: Mapping[str, str] | None = None,
+    log_x: bool = False,
+) -> None:
+    """Empirical CDF (ECDF) overlay per label — step functions after sorted samples."""
+    outfile.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=figsize)
+    for label, vals in sorted(series_by_label.items(), key=lambda x: x[0].lower()):
+        v = np.sort(_finite(vals))
+        if v.size == 0:
+            continue
+        y = np.arange(1, v.size + 1, dtype=np.float64) / v.size
+        kw = dict(where="post", label=f"{label} (n={v.size})", linewidth=2.0, alpha=0.88)
+        if colors and label in colors:
+            kw["color"] = colors[label]
+        ax.step(v, y, **kw)
+    ax.set_title(title if title.endswith("(CDF)") else f"{title} (CDF)")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("cumulative probability")
+    ax.set_ylim(0, 1.05)
+    ax.axhline(1.0, color="#333333", linewidth=0.6, linestyle="--", alpha=0.6)
+    if log_x:
+        ax.set_xscale("log")
+    ax.legend(fontsize=8, loc="lower right")
+    fig.tight_layout()
+    fig.savefig(outfile, dpi=140)
+    plt.close(fig)
+
 def plot_bimodal_moving_fraction(
     names: list[str],
     fractions: list[float | None],

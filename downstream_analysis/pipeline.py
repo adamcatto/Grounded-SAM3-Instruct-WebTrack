@@ -17,7 +17,7 @@ from .bimodal import fit_bimodal_gmm, moving_fraction
 from .logging_setup import configure_logging
 from .locomotion import LocomotionConfig, locomotion_chunks_for_series, normalize_by_diagonal
 from .metrics import distribution_snapshot
-from .plots import plot_bimodal_moving_fraction, plot_overlay_histogram
+from .plots import plot_bimodal_moving_fraction, plot_overlay_cdf, plot_overlay_histogram
 from .pooling import NamedSampleBundle, append_video_quantiles
 from .tqdm_optional import try_tqdm
 from .tracking_io import (
@@ -197,13 +197,17 @@ class LocomotionAnalysisPipeline:
 
             pnorm_path = per_vid_dir / f"{ctx.video_id}_{vid_slug}_normalized.png"
             pabs_path = per_vid_dir / f"{ctx.video_id}_{vid_slug}_absolute_px.png"
+            pnorm_cdf = per_vid_dir / f"{ctx.video_id}_{vid_slug}_normalized_cdf.png"
+            pabs_cdf = per_vid_dir / f"{ctx.video_id}_{vid_slug}_absolute_px_cdf.png"
             logger.info(
-                '[%d/%d] Saving histograms for "%s": %s and %s',
+                '[%d/%d] Saving histograms + CDFs for "%s": %s, %s, %s, %s',
                 vi,
                 len(complete),
                 ctx.video_name,
                 pnorm_path.name,
+                pnorm_cdf.name,
                 pabs_path.name,
+                pabs_cdf.name,
             )
             plot_overlay_histogram(
                 pv_norm,
@@ -212,11 +216,26 @@ class LocomotionAnalysisPipeline:
                 outfile=pnorm_path,
                 colors=color_by_name,
             )
+            plot_overlay_cdf(
+                pv_norm,
+                title=f"Locomotion (diag-normalized) · {ctx.video_name}",
+                xlabel="chunk path length / √(w²+h²)",
+                outfile=pnorm_cdf,
+                colors=color_by_name,
+            )
             plot_overlay_histogram(
                 pv_abs,
                 title=f"Locomotion (pixels) · {ctx.video_name}",
                 xlabel="chunk path length (px)",
                 outfile=pabs_path,
+                colors=color_by_name,
+                log_x=True,
+            )
+            plot_overlay_cdf(
+                pv_abs,
+                title=f"Locomotion (pixels) · {ctx.video_name}",
+                xlabel="chunk path length (px)",
+                outfile=pabs_cdf,
                 colors=color_by_name,
                 log_x=True,
             )
@@ -262,12 +281,19 @@ class LocomotionAnalysisPipeline:
                 "quantile_pool": distribution_snapshot(quant_concat[name]),
             }
 
-        logger.info("Saving pooled histograms (normalized, absolute px, quantile ranks).")
+        logger.info("Saving pooled histograms + CDFs (normalized, absolute px, quantile ranks).")
         plot_overlay_histogram(
             norm_concat,
             title="Pooled locomotion by object name (diag-normalized)",
             xlabel="chunk path length / √(w²+h²)",
             outfile=agg_dir / "by_name_normalized.png",
+            colors=color_by_name,
+        )
+        plot_overlay_cdf(
+            norm_concat,
+            title="Pooled locomotion by object name (diag-normalized)",
+            xlabel="chunk path length / √(w²+h²)",
+            outfile=agg_dir / "by_name_normalized_cdf.png",
             colors=color_by_name,
         )
         plot_overlay_histogram(
@@ -278,6 +304,14 @@ class LocomotionAnalysisPipeline:
             colors=color_by_name,
             log_x=True,
         )
+        plot_overlay_cdf(
+            abs_concat,
+            title="Pooled locomotion by object name (raw pixels)",
+            xlabel="chunk path length (px)",
+            outfile=agg_dir / "by_name_absolute_px_cdf.png",
+            colors=color_by_name,
+            log_x=True,
+        )
         plot_overlay_histogram(
             quant_concat,
             title="Pooled within-video quantile ranks",
@@ -285,6 +319,13 @@ class LocomotionAnalysisPipeline:
             outfile=agg_dir / "by_name_quantile_pool.png",
             colors=color_by_name,
             bins=40,
+        )
+        plot_overlay_cdf(
+            quant_concat,
+            title="Pooled within-video quantile ranks",
+            xlabel="quantile rank ∈ [0,1]",
+            outfile=agg_dir / "by_name_quantile_pool_cdf.png",
+            colors=color_by_name,
         )
 
         names_sorted = sorted(norm_concat.keys(), key=lambda s: s.lower())
