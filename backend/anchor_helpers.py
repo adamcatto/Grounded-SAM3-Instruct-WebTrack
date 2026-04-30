@@ -4,6 +4,11 @@ from __future__ import annotations
 
 STREAM_BATCH_SIZE = 1000  # frames per propagation batch / anchor interval
 
+# After the first ANCHOR_MANUAL_PREFIX_COUNT anchors are committed in the UI,
+# the remainder of the anchor frames can be filled by sequential mask propagation
+# (see server anchor-remainder SSE endpoint).
+ANCHOR_MANUAL_PREFIX_COUNT = 5
+
 
 def compute_anchor_frames(start_frame: int, num_frames: int, batch_size: int = STREAM_BATCH_SIZE) -> list[int]:
     """Compute anchor frames for bidirectional batch propagation.

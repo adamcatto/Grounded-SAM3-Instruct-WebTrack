@@ -1,10 +1,14 @@
 import React, { useEffect, useRef, useState } from 'react'
-import { Plus, RotateCcw, ChevronRight, ChevronDown, Loader, Download, X, Pause, Play, SkipBack, SkipForward, Trash2 } from 'lucide-react'
+import { Plus, RotateCcw, ChevronRight, ChevronDown, Loader, Download, X, Pause, Play, SkipBack, SkipForward, Trash2, GripVertical, ArrowLeftRight } from 'lucide-react'
 import { useStore, currentVideo as selectCurrentVideo } from '../../store/useStore'
 import {
   addObject, initSession, startPropagationSSE, startExportSSE, getProject, resetVideo,
   clearFrameMasks, clearMasksBulk, getPropagationStatus, pausePropagation, updateVideoMeta,
   resumeFromFrame, getAnchorFrames, commitAnchorFrame, swapObjectMasks,
+  startAnchorRemainderPredictionSSE,
+  continueAnchorRemainderReview,
+  getSavedMask,
+  extractFrame,
   type ClearMasksMode,
 } from '../../api/client'
 import { getObjectColor } from '../../utils/colors'
@@ -25,6 +29,7 @@ export default function LeftPanel() {
     propagationStartFrame, setPropagationStartFrame, setCurrentFrame,
     resetVideoState, updateVideo,
     setProject, setSavedMask, savedMaskCache, clearSavedMaskCache,
+    setCurrentFrameMasks,
     addToast,
     config,
     // Anchor phase
@@ -33,6 +38,10 @@ export default function LeftPanel() {
     currentAnchorIndex, setCurrentAnchorIndex,
     annotatedAnchorIndices, addAnnotatedAnchor,
     resetAnchorState,
+    anchorRemainderInferencing,
+    setAnchorRemainderInferencing,
+    setAnnotatedAnchorIndices,
+    invalidateSavedMaskFrame,
   } = store
 
   const [addingObject, setAddingObject] = useState(false)
@@ -50,6 +59,24 @@ export default function LeftPanel() {
 
   /** Anchor index → wall ms when user landed on that anchor to label it (for duration analytics). */
   const anchorEnteredMsRef = useRef<Record<number, number>>({})
+  /** Backend constant: anchors [0,N) manual, anchors [N,end) inferred via sequential propagation. */
+  const manualAnchorPrefixRef = useRef(5)
+  const anchorRemainderEsRef = useRef<EventSource | null>(null)
+
+  /** Backend paused inferencer until Good / Done after Edit */
+  const [anchorReviewPrompt, setAnchorReviewPrompt] = useState<{
+    frameIdx: number
+    anchorIndex: number
+    anchorsDone: number
+    anchorsQueued: number
+  } | null>(null)
+  const [anchorRemainderAwaitingCommit, setAnchorRemainderAwaitingCommit] = useState(false)
+  /** Shown while remainder inference runs but review UI / mask fetch is not active yet */
+  const [anchorRemainderProgressText, setAnchorRemainderProgressText] = useState('')
+  const [anchorReviewBusy, setAnchorReviewBusy] = useState(false)
+  /** Fetching masks from API before showing the review chip */
+  const [anchorReviewLoading, setAnchorReviewLoading] = useState(false)
+  const [anchorReviewPanelOffsets, setAnchorReviewPanelOffsets] = useState({ right: 24, bottom: 24 })
 
   // Clear masks modal state
   const [showClearMasksModal, setShowClearMasksModal] = useState(false)
@@ -76,8 +103,8 @@ export default function LeftPanel() {
   const [showSwapModal, setShowSwapModal] = useState(false)
   const [swapObjA, setSwapObjA] = useState('')
   const [swapObjB, setSwapObjB] = useState('')
-  const [swapFromFrame, setSwapFromFrame] = useState('')
-  const [swapToFrame, setSwapToFrame] = useState('')
+  type SwapMaskScope = 'current' | 'from_current' | 'all'
+  const [swapMaskScope, setSwapMaskScope] = useState<SwapMaskScope>('current')
   const [swapping, setSwapping] = useState(false)
 
   type ExportStatus = 'idle' | 'running' | 'done' | 'error'
@@ -102,7 +129,9 @@ export default function LeftPanel() {
   const isPaused = propagationStatus === 'paused'
   const isDone = propagationStatus === 'done'
   const hasObjects = objects.length > 0
-  const allAnchorsLabeled = anchorFrames.length > 0 && annotatedAnchorIndices.length >= anchorFrames.length
+  const allAnchorsLabeled =
+    (anchorFrames.length > 0 && annotatedAnchorIndices.length >= anchorFrames.length)
+    || Boolean(video?.anchor_labeling_complete)
 
   // ── Restore progress on video load ──────────────────────────────────────────
 
@@ -138,6 +167,13 @@ export default function LeftPanel() {
 
   useEffect(() => {
     anchorEnteredMsRef.current = {}
+  }, [vid])
+
+  useEffect(() => {
+    return () => {
+      anchorRemainderEsRef.current?.close()
+      anchorRemainderEsRef.current = null
+    }
   }, [vid])
 
   // ── Add Object ──────────────────────────────────────────────────────────────
@@ -176,7 +212,8 @@ export default function LeftPanel() {
 
     // Fetch anchor frames
     try {
-      const { anchor_frames } = await getAnchorFrames(pid, vid)
+      const { anchor_frames, manual_anchor_prefix_before_infer: manualPre } = await getAnchorFrames(pid, vid)
+      manualAnchorPrefixRef.current = typeof manualPre === 'number' && manualPre >= 1 ? manualPre : 5
       setAnchorFrames(anchor_frames)
       setCurrentAnchorIndex(0)
       setAnchorPhase(true)
@@ -194,10 +231,258 @@ export default function LeftPanel() {
     }
   }
 
+  async function runAnchorRemainderPrediction(): Promise<void> {
+    setAnchorRemainderInferencing(true)
+    setTrackingError('')
+    setAnchorReviewPrompt(null)
+    setAnchorRemainderAwaitingCommit(false)
+    setAnchorReviewBusy(false)
+    setAnchorReviewLoading(false)
+    setAnchorReviewPanelOffsets({ right: 24, bottom: 24 })
+    setAnchorRemainderProgressText('Connecting…')
+    anchorRemainderEsRef.current?.close()
+    const es = startAnchorRemainderPredictionSSE(pid, vid, true)
+    anchorRemainderEsRef.current = es
+
+    const applyAnnotatedIndices = async () => {
+      const fresh = await getProject(pid)
+      setProject(fresh)
+      const annFr = fresh.videos[vid]?.annotated_anchors ?? []
+      const idxs: number[] = []
+      anchorFrames.forEach((fr, i) => {
+        if (annFr.includes(fr)) idxs.push(i)
+      })
+      setAnnotatedAnchorIndices(idxs.sort((a, b) => a - b))
+    }
+
+    const maskLoadTimeoutMs = 90_000
+    function withTimeoutMs<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+      return new Promise((resolve, reject) => {
+        const id = window.setTimeout(
+          () => reject(new Error(`${label} timed out after ${Math.round(ms / 1000)}s`)),
+          ms,
+        )
+        p.then(
+          v => {
+            window.clearTimeout(id)
+            resolve(v)
+          },
+          err => {
+            window.clearTimeout(id)
+            reject(err)
+          },
+        )
+      })
+    }
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        let finished = false
+        const finishOk = () => {
+          if (finished) return
+          finished = true
+          es.close()
+          if (anchorRemainderEsRef.current === es) anchorRemainderEsRef.current = null
+          resolve()
+        }
+        const finishErr = (msg: string) => {
+          if (finished) return
+          finished = true
+          es.close()
+          if (anchorRemainderEsRef.current === es) anchorRemainderEsRef.current = null
+          reject(new Error(msg))
+        }
+
+        es.addEventListener('anchor_predicted', () => {
+          void applyAnnotatedIndices()
+        })
+
+        es.addEventListener('init', (evt: MessageEvent) => {
+          try {
+            const d = JSON.parse(evt.data ?? '{}') as { anchors_queued?: number }
+            const q = typeof d.anchors_queued === 'number' ? d.anchors_queued : 0
+            setAnchorRemainderProgressText(
+              q > 0 ? `Predicting ${q} anchor frame${q === 1 ? '' : 's'}…` : 'Predicting anchors…',
+            )
+          } catch {
+            setAnchorRemainderProgressText('Predicting anchors…')
+          }
+        })
+
+        es.addEventListener('sam_propagate_start', (evt: MessageEvent) => {
+          try {
+            const d = JSON.parse(evt.data ?? '{}') as { frame_idx?: number; step?: number; steps?: number }
+            const step = typeof d.step === 'number' ? d.step : '?'
+            const steps = typeof d.steps === 'number' ? d.steps : '?'
+            const fi = typeof d.frame_idx === 'number' ? d.frame_idx : '?'
+            setAnchorRemainderProgressText(`Anchor ${step}/${steps} · SAM propagating · frame ${fi}`)
+          } catch {
+            setAnchorRemainderProgressText('SAM propagating…')
+          }
+        })
+
+        es.addEventListener('review_prompt', (evt: MessageEvent) => {
+          void (async () => {
+            let d: {
+              frame_idx: number
+              anchor_index?: number
+              anchors_done?: number
+              anchors_queued?: number
+            }
+            try {
+              d = JSON.parse(evt.data) as typeof d
+            } catch {
+              return
+            }
+            const ai = typeof d.anchor_index === 'number' ? d.anchor_index : 0
+            const fidx = d.frame_idx
+            setAnchorReviewPrompt(null)
+            setAnchorReviewLoading(true)
+            invalidateSavedMaskFrame(fidx)
+            setCurrentFrame(fidx)
+            setCurrentAnchorIndex(ai)
+            setCurrentFrameMasks({}, null)
+            try {
+              await applyAnnotatedIndices()
+              try {
+                await withTimeoutMs(extractFrame(pid, vid, fidx), maskLoadTimeoutMs, 'extractFrame')
+              } catch {
+                /* frame may already exist or extract failed */
+              }
+              const data = await withTimeoutMs(getSavedMask(pid, vid, fidx), maskLoadTimeoutMs, 'getSavedMask')
+              const masks = data.masks ?? {}
+              setSavedMask(fidx, masks)
+              setAnchorReviewPrompt({
+                frameIdx: fidx,
+                anchorIndex: ai,
+                anchorsDone: d.anchors_done ?? 0,
+                anchorsQueued: d.anchors_queued ?? 0,
+              })
+            } catch (err: unknown) {
+              const msg = err instanceof Error ? err.message : 'Could not load predicted masks'
+              addToast(msg, 'error')
+              setAnchorReviewPrompt({
+                frameIdx: fidx,
+                anchorIndex: ai,
+                anchorsDone: d.anchors_done ?? 0,
+                anchorsQueued: d.anchors_queued ?? 0,
+              })
+            } finally {
+              setAnchorReviewLoading(false)
+            }
+          })()
+        })
+
+        es.addEventListener('error', (evt: Event) => {
+          if (!(evt instanceof MessageEvent)) return
+          try {
+            const d = JSON.parse(evt.data ?? '{}') as { error?: string }
+            setAnchorReviewPrompt(null)
+            setAnchorRemainderAwaitingCommit(false)
+            setAnchorReviewLoading(false)
+            finishErr(d.error ?? 'anchor remainder inference failed')
+          } catch {
+            setAnchorReviewPrompt(null)
+            setAnchorRemainderAwaitingCommit(false)
+            setAnchorReviewLoading(false)
+            finishErr('anchor remainder inference failed')
+          }
+        })
+
+        es.addEventListener('done', () => {
+          setAnchorReviewPrompt(null)
+          setAnchorRemainderAwaitingCommit(false)
+          setAnchorReviewLoading(false)
+          finishOk()
+        })
+
+        es.onerror = () => {
+          if (finished) return
+          if (es.readyState === EventSource.CLOSED) {
+            setAnchorReviewPrompt(null)
+            setAnchorRemainderAwaitingCommit(false)
+            setAnchorReviewLoading(false)
+            finishErr('Anchor inference connection closed unexpectedly.')
+          }
+        }
+      })
+
+      await applyAnnotatedIndices()
+      setAnchorPhase(false)
+      setCurrentAnchorIndex(anchorFrames.length)
+      if (nextVideoId) setShowNextVideoModal(true)
+      addToast('All anchor frames are ready.', 'success')
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Anchor remainder inference failed'
+      setTrackingError(msg)
+      addToast(msg, 'error')
+    } finally {
+      setAnchorRemainderInferencing(false)
+      setAnchorReviewPrompt(null)
+      setAnchorRemainderAwaitingCommit(false)
+      setAnchorReviewBusy(false)
+      setAnchorReviewLoading(false)
+      setAnchorRemainderProgressText('')
+    }
+  }
+
+  async function handleAnchorReviewGood() {
+    if (!pid || !vid) return
+    setAnchorReviewBusy(true)
+    setTrackingError('')
+    try {
+      await continueAnchorRemainderReview(pid, vid)
+      setAnchorReviewPrompt(null)
+    } catch (e: unknown) {
+      const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+      const msg = detail ?? (e instanceof Error ? e.message : 'Could not continue anchor inference')
+      addToast(msg, 'error')
+    } finally {
+      setAnchorReviewBusy(false)
+    }
+  }
+
+  function handleAnchorReviewEdit() {
+    const ai = anchorReviewPrompt?.anchorIndex
+    setAnchorReviewPrompt(null)
+    setAnchorRemainderAwaitingCommit(true)
+    if (typeof ai === 'number' && anchorEnteredMsRef.current[ai] === undefined) {
+      anchorEnteredMsRef.current[ai] = Date.now()
+    }
+  }
+
+  function handleAnchorReviewDragStart(e: React.MouseEvent<HTMLDivElement>) {
+    e.preventDefault()
+    e.stopPropagation()
+    const startX = e.clientX
+    const startY = e.clientY
+    const startRight = anchorReviewPanelOffsets.right
+    const startBottom = anchorReviewPanelOffsets.bottom
+    const approxW = 288
+    const approxH = 220
+    const pad = 8
+    function move(ev: MouseEvent) {
+      const dx = ev.clientX - startX
+      const dy = ev.clientY - startY
+      let nr = startRight - dx
+      let nb = startBottom - dy
+      nr = Math.max(pad, Math.min(window.innerWidth - pad - approxW, nr))
+      nb = Math.max(pad, Math.min(window.innerHeight - pad - approxH, nb))
+      setAnchorReviewPanelOffsets({ right: nr, bottom: nb })
+    }
+    function up() {
+      window.removeEventListener('mousemove', move)
+      window.removeEventListener('mouseup', up)
+    }
+    window.addEventListener('mousemove', move)
+    window.addEventListener('mouseup', up)
+  }
+
   async function handleCommitAnchor() {
     if (!anchorPhase || anchorFrames.length === 0) return
     const frameIdx = anchorFrames[currentAnchorIndex]
     const ai = currentAnchorIndex
+    const awaitingRemainderCommit = anchorRemainderInferencing && anchorRemainderAwaitingCommit
     const finished_ms = Date.now()
     let entered_ms = anchorEnteredMsRef.current[ai]
     if (entered_ms === undefined) entered_ms = finished_ms
@@ -222,8 +507,22 @@ export default function LeftPanel() {
       return
     }
 
+    if (awaitingRemainderCommit) {
+      setAnchorRemainderAwaitingCommit(false)
+      addToast(`This anchor frame: ${frameSecStr}s`, 'success')
+      try {
+        await continueAnchorRemainderReview(pid, vid)
+      } catch (e: unknown) {
+        const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+        addToast(detail ?? (e instanceof Error ? e.message : 'Could not resume inference'), 'error')
+      }
+      return
+    }
+
     const nextIndex = ai + 1
     const isLastAnchor = nextIndex >= anchorFrames.length
+    const manualN = manualAnchorPrefixRef.current
+    const triggerRemainderInfer = anchorFrames.length > manualN && nextIndex === manualN
 
     if (isLastAnchor && wholeVideoWallMs != null) {
       const totalSecStr = (wholeVideoWallMs / 1000).toFixed(2)
@@ -233,6 +532,12 @@ export default function LeftPanel() {
       )
     } else {
       addToast(`This anchor frame: ${frameSecStr}s`, 'success')
+    }
+
+    if (triggerRemainderInfer && config.autoInferAnchorRemainder) {
+      addToast('Manual anchor prefix complete — inferring remaining anchors…', 'info')
+      await runAnchorRemainderPrediction()
+      return
     }
 
     if (isLastAnchor) {
@@ -300,8 +605,19 @@ export default function LeftPanel() {
     if (!swapObjA || !swapObjB || swapObjA === swapObjB) return
     setSwapping(true)
     try {
-      const fromF = swapFromFrame !== '' ? parseInt(swapFromFrame) : undefined
-      const toF = swapToFrame !== '' ? parseInt(swapToFrame) : undefined
+      const f = currentFrame
+      let fromF: number | undefined
+      let toF: number | undefined
+      if (swapMaskScope === 'current') {
+        fromF = f
+        toF = f
+      } else if (swapMaskScope === 'from_current') {
+        fromF = f
+        toF = undefined
+      } else {
+        fromF = undefined
+        toF = undefined
+      }
       const result = await swapObjectMasks(pid, vid, swapObjA, swapObjB, fromF, toF)
       setShowSwapModal(false)
       clearSavedMaskCache()
@@ -659,6 +975,14 @@ export default function LeftPanel() {
 
   if (!video) return null
 
+  const manualNAnchors = manualAnchorPrefixRef.current
+  const showInferRemainderButton =
+    anchorPhase &&
+    !anchorRemainderInferencing &&
+    anchorFrames.length > manualNAnchors &&
+    Array.from({ length: manualNAnchors }, (_, i) => i).every(i => annotatedAnchorIndices.includes(i)) &&
+    anchorFrames.some((_, idx) => idx >= manualNAnchors && !annotatedAnchorIndices.includes(idx))
+
   // ── Render ───────────────────────────────────────────────────────────────────
 
   return (
@@ -678,13 +1002,47 @@ export default function LeftPanel() {
       {/* Anchor annotation phase header */}
       {anchorPhase && (
         <div className="mx-3 mt-2 mb-1 rounded-lg border border-blue-700/40 bg-blue-500/10 px-3 py-2 flex-shrink-0">
-          <p className="text-xs text-blue-300 font-medium">
-            Anchor Frame {currentAnchorIndex + 1} / {anchorFrames.length}
-            <span className="text-blue-400/60 ml-1.5 font-normal">(frame #{anchorFrames[currentAnchorIndex]})</span>
-          </p>
-          <p className="text-xs text-[#666] mt-0.5">
-            Annotate objects on this frame, then click "Done, next frame".
-          </p>
+          {anchorRemainderInferencing ? (
+            <>
+              <p className="text-xs text-violet-300 font-medium">Automatic anchor inference</p>
+              <p className="text-xs text-[#666] mt-0.5">
+                Propagating masks from your manual prefix to each remaining anchor frame. You can keep this tab open.
+              </p>
+              {anchorRemainderAwaitingCommit && (
+                <p className="text-xs text-amber-200/90 mt-1">
+                  Editing this predicted anchor — adjust masks if needed, then click Done to continue.
+                </p>
+              )}
+            </>
+          ) : (
+            <>
+              <p className="text-xs text-blue-300 font-medium">
+                Anchor Frame {currentAnchorIndex + 1} / {anchorFrames.length}
+                <span className="text-blue-400/60 ml-1.5 font-normal">(frame #{anchorFrames[currentAnchorIndex]})</span>
+              </p>
+              <p className="text-xs text-[#666] mt-0.5">
+                Annotate objects on this frame, then click “Done, next frame”.
+                {anchorFrames.length > manualAnchorPrefixRef.current ? (
+                  <>
+                    {' '}
+                    After anchor {manualAnchorPrefixRef.current},{' '}
+                    {config.autoInferAnchorRemainder
+                      ? 'remaining anchors run automatically.'
+                      : 'label the rest manually or run inference below / enable auto in Settings → Tracking.'}
+                  </>
+                ) : null}
+              </p>
+              {showInferRemainderButton && (
+                <button
+                  type="button"
+                  onClick={() => void runAnchorRemainderPrediction()}
+                  className="mt-2 w-full text-xs py-1.5 px-2 rounded-md bg-violet-600/80 hover:bg-violet-600 text-white font-medium transition-colors"
+                >
+                  Infer remaining anchors (SAM)
+                </button>
+              )}
+            </>
+          )}
         </div>
       )}
 
@@ -758,6 +1116,13 @@ export default function LeftPanel() {
           )
         )}
       </div>
+
+      {anchorRemainderInferencing && (
+        <div className="mx-3 mb-2 flex items-center gap-2 text-xs text-violet-300">
+          <Loader size={12} className="animate-spin" />
+          Running automatic anchor inference (sequential SAM propagation)…
+        </div>
+      )}
 
       {/* SAM loading indicator */}
       {initializingSession && (
@@ -956,20 +1321,20 @@ export default function LeftPanel() {
           </button>
         )}
 
-        {objects.length >= 2 && (video.propagated_frames?.length ?? 0) > 0 && !isTracking && (
+        {objects.length >= 2 && !isTracking && (
           <button
             onClick={() => {
               setSwapObjA(objects[0]?.id ?? '')
               setSwapObjB(objects[1]?.id ?? '')
-              setSwapFromFrame('')
-              setSwapToFrame('')
+              setSwapMaskScope('current')
               setShowSwapModal(true)
             }}
-            className="btn btn-ghost flex-1 min-w-0 flex flex-col items-center justify-center gap-0.5 px-0.5 py-2"
+            disabled={anchorRemainderInferencing && !anchorRemainderAwaitingCommit}
+            className="btn btn-ghost flex-1 min-w-0 flex flex-col items-center justify-center gap-0.5 px-0.5 py-2 disabled:opacity-40"
             style={{ fontSize: 'clamp(7px, 4cqi, 11px)', lineHeight: 1.2 }}
-            title="Swap two objects' masks"
+            title="Swap two objects' masks (saved .npz on disk for selected frame range)"
           >
-            <RotateCcw size={10} />
+            <ArrowLeftRight size={10} />
             <span>Swap</span>
             <span>masks</span>
           </button>
@@ -988,7 +1353,7 @@ export default function LeftPanel() {
         ) : anchorPhase ? (
           <button
             onClick={handleCommitAnchor}
-            disabled={!hasObjects}
+            disabled={!hasObjects || (anchorRemainderInferencing && !anchorRemainderAwaitingCommit)}
             className="btn btn-primary flex-1 min-w-0 flex flex-col items-center justify-center gap-0.5 px-0.5 py-2 disabled:opacity-40"
             style={{ fontSize: 'clamp(7px, 4cqi, 11px)', lineHeight: 1.2 }}
           >
@@ -1039,6 +1404,59 @@ export default function LeftPanel() {
           </>
         )}
       </div>
+
+      {/* Anchor remainder: SAM work or fetching masks before review chip */}
+      {anchorRemainderInferencing && !anchorReviewPrompt && (
+        <div className="fixed z-[65] bottom-6 right-6 flex items-center gap-2 rounded-full bg-black/75 border border-[#444] px-3 py-2 text-xs text-[#ddd] shadow-lg pointer-events-none max-w-[min(92vw,320px)]">
+          <Loader size={14} className="animate-spin flex-shrink-0 text-violet-300" />
+          <span className="truncate">
+            {anchorReviewLoading ? 'Loading predicted masks…' : (anchorRemainderProgressText || 'Working…')}
+          </span>
+        </div>
+      )}
+
+      {/* Draggable Good / Edit chip (bottom-right by default) */}
+      {anchorReviewPrompt && (
+        <div
+          role="dialog"
+          aria-label="Predicted anchor review"
+          className="fixed z-[70] w-[min(92vw,288px)] rounded-xl border border-[#444] bg-[#141414]/95 shadow-2xl backdrop-blur-sm overflow-hidden"
+          style={{ right: anchorReviewPanelOffsets.right, bottom: anchorReviewPanelOffsets.bottom }}
+        >
+          <div
+            className="flex items-center gap-2 px-3 py-2 border-b border-[#333] bg-[#1a1a1a]/90 cursor-grab active:cursor-grabbing select-none"
+            onMouseDown={handleAnchorReviewDragStart}
+          >
+            <GripVertical size={14} className="text-[#666] flex-shrink-0" aria-hidden />
+            <span className="text-xs font-medium text-[#ccc] truncate">
+              Anchor {anchorReviewPrompt.anchorIndex + 1}/{anchorFrames.length} · frame {anchorReviewPrompt.frameIdx}
+            </span>
+          </div>
+          <div className="p-3 space-y-3">
+            <p className="text-[11px] text-[#888] leading-relaxed">
+              Step {anchorReviewPrompt.anchorsDone}/{anchorReviewPrompt.anchorsQueued}. Accept masks or tap Edit to adjust, then Done.
+            </p>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                disabled={anchorReviewBusy}
+                onClick={handleAnchorReviewEdit}
+                className="btn btn-secondary flex-1 py-2 text-xs font-medium"
+              >
+                Edit…
+              </button>
+              <button
+                type="button"
+                disabled={anchorReviewBusy}
+                onClick={() => void handleAnchorReviewGood()}
+                className="btn btn-primary flex-1 py-2 text-xs font-medium"
+              >
+                {anchorReviewBusy ? '…' : 'Good'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Resume from frame modal */}
       {showResumeModal && (
@@ -1120,10 +1538,10 @@ export default function LeftPanel() {
       {/* Swap Masks Modal */}
       {showSwapModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
-          <div className="bg-[#1a1a1a] rounded-xl border border-[#333] p-5 w-80 shadow-xl">
+          <div className="bg-[#1a1a1a] rounded-xl border border-[#333] p-5 w-[min(28rem,calc(100vw-1.5rem))] shadow-xl">
             <h3 className="text-sm font-semibold text-[#eee] mb-1">Swap object masks</h3>
             <p className="text-xs text-[#666] mb-4 leading-relaxed">
-              Swap the mask assignments between two objects across all (or a range of) frames.
+              Swap saved mask assignments between two objects for the scope you choose (only frames that already have mask files are updated).
             </p>
             <div className="space-y-3 mb-4">
               <div>
@@ -1147,27 +1565,47 @@ export default function LeftPanel() {
                 </select>
               </div>
               <div>
-                <label className="block text-[10px] text-[#666] mb-1">Frame range (optional — leave blank for all frames)</label>
-                <div className="flex items-center gap-2">
-                  <input
-                    type="number"
-                    min={0}
-                    max={video ? video.num_frames - 1 : 0}
-                    value={swapFromFrame}
-                    onChange={e => setSwapFromFrame(e.target.value)}
-                    placeholder="From"
-                    className="flex-1 text-xs py-1.5 px-2 rounded bg-[#111] border border-[#333] text-[#ccc]"
-                  />
-                  <span className="text-xs text-[#555]">–</span>
-                  <input
-                    type="number"
-                    min={0}
-                    max={video ? video.num_frames - 1 : 0}
-                    value={swapToFrame}
-                    onChange={e => setSwapToFrame(e.target.value)}
-                    placeholder="To"
-                    className="flex-1 text-xs py-1.5 px-2 rounded bg-[#111] border border-[#333] text-[#ccc]"
-                  />
+                <span className="block text-[10px] text-[#666] mb-2">Apply swap to</span>
+                <div className="flex flex-col gap-2">
+                  <label className="flex items-start gap-2 text-xs text-[#ccc] cursor-pointer">
+                    <input
+                      type="radio"
+                      name="swapMaskScope"
+                      checked={swapMaskScope === 'current'}
+                      onChange={() => setSwapMaskScope('current')}
+                      className="mt-0.5 accent-violet-500"
+                    />
+                    <span>
+                      Current frame only{' '}
+                      <span className="text-[#666]">(frame {currentFrame})</span>
+                    </span>
+                  </label>
+                  <label className="flex items-start gap-2 text-xs text-[#ccc] cursor-pointer">
+                    <input
+                      type="radio"
+                      name="swapMaskScope"
+                      checked={swapMaskScope === 'from_current'}
+                      onChange={() => setSwapMaskScope('from_current')}
+                      className="mt-0.5 accent-violet-500"
+                    />
+                    <span>
+                      This frame and all later frames{' '}
+                      <span className="text-[#666]">
+                        ({currentFrame}
+                        {video != null ? `–${video.num_frames - 1}` : ''})
+                      </span>
+                    </span>
+                  </label>
+                  <label className="flex items-start gap-2 text-xs text-[#ccc] cursor-pointer">
+                    <input
+                      type="radio"
+                      name="swapMaskScope"
+                      checked={swapMaskScope === 'all'}
+                      onChange={() => setSwapMaskScope('all')}
+                      className="mt-0.5 accent-violet-500"
+                    />
+                    <span>Entire video (all frames that have masks)</span>
+                  </label>
                 </div>
               </div>
             </div>

@@ -26,7 +26,11 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from anchor_helpers import STREAM_BATCH_SIZE, compute_anchor_frames
+from anchor_helpers import (
+    ANCHOR_MANUAL_PREFIX_COUNT,
+    STREAM_BATCH_SIZE,
+    compute_anchor_frames,
+)
 from project_manager import ProjectManager
 from sam_predictor import SAMPredictor, _get_predictor
 from video_processor import (
@@ -35,6 +39,7 @@ from video_processor import (
     ensure_faststart,
     export_video_with_masks,
     extract_frames,
+    extract_frame_indices,
     extract_frame_range,
     get_video_info,
     load_bboxes_json,
@@ -112,6 +117,404 @@ class PropagationState:
 
 
 _prop_registry: dict[str, PropagationState] = {}
+
+
+# ─── Anchor remainder inference (sequential propagate between anchor pairs) ─
+
+class AnchorRemainderState:
+    """One active anchor-remainder prediction stream per (project, video)."""
+
+    def __init__(self):
+        self.is_running: bool = False
+        self.task: asyncio.Task | None = None
+        self.subscribers: list[asyncio.Queue] = []
+        # Interactive review: background task awaits review_continue_event until POST …/continue.
+        self.waiting_review: bool = False
+        self.review_continue_event: asyncio.Event | None = None
+
+    async def publish(self, event: dict) -> None:
+        dead = []
+        for q in self.subscribers:
+            try:
+                q.put_nowait(event)
+            except asyncio.QueueFull:
+                dead.append(q)
+        for q in dead:
+            try:
+                self.subscribers.remove(q)
+            except ValueError:
+                pass
+
+    def subscribe(self) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue(maxsize=400)
+        self.subscribers.append(q)
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue) -> None:
+        try:
+            self.subscribers.remove(q)
+        except ValueError:
+            pass
+
+
+_anchor_remainder_registry: dict[str, AnchorRemainderState] = {}
+
+
+def _get_anchor_remainder_state(pid: str, vid: str) -> AnchorRemainderState:
+    key = f"{pid}/{vid}"
+    if key not in _anchor_remainder_registry:
+        _anchor_remainder_registry[key] = AnchorRemainderState()
+    return _anchor_remainder_registry[key]
+
+
+def _bbox_norm_xywh_score(mask: np.ndarray) -> tuple[list[float], float]:
+    m = np.squeeze(mask).astype(bool)
+    ys, xs = np.where(m)
+    if len(xs) == 0:
+        return [0.0, 0.0, 0.0, 0.0], 0.0
+    h, w = m.shape[:2]
+    y0, y1 = ys.min(), ys.max()
+    x0, x1 = xs.min(), xs.max()
+    nw = max(1, w)
+    nh = max(1, h)
+    return [
+        float(x0) / nw,
+        float(y0) / nh,
+        float(x1 - x0 + 1) / nw,
+        float(y1 - y0 + 1) / nh,
+    ], 1.0
+
+
+def _extract_frame_masks_bboxes(pid: str, vid: str, item: dict):
+    sam_idx = item.get("frame_index", 0)
+    real_frame = sam.to_real_idx(pid, vid, sam_idx)
+    outputs = item.get("outputs", {})
+    frame_masks: dict[int, np.ndarray] = {}
+    frame_bboxes: dict[int, list] = {}
+
+    if "out_obj_ids" in outputs:
+        obj_ids = outputs.get("out_obj_ids", [])
+        masks_list = outputs.get("out_binary_masks", [])
+        boxes_list = outputs.get("out_boxes_xywh", [])
+        probs_list = outputs.get("out_probs", [])
+    else:
+        obj_ids, masks_list, boxes_list, probs_list = [], [], [], []
+        for out_val in outputs.values():
+            if isinstance(out_val, dict):
+                obj_ids = out_val.get("out_obj_ids", [])
+                masks_list = out_val.get("out_binary_masks", [])
+                boxes_list = out_val.get("out_boxes_xywh", [])
+                probs_list = out_val.get("out_probs", [])
+                break
+
+    for k, oid in enumerate(obj_ids):
+        if k < len(masks_list):
+            msk = masks_list[k]
+            if hasattr(msk, "numpy"):
+                msk = msk.numpy()
+            frame_masks[int(oid)] = np.squeeze(msk).astype(np.uint8)
+        if k < len(boxes_list):
+            b = boxes_list[k]
+            if hasattr(b, "numpy"):
+                b = b.numpy()
+            if hasattr(b, "tolist"):
+                b = b.tolist()
+            score = float(probs_list[k]) if k < len(probs_list) else 1.0
+            frame_bboxes[int(oid)] = (b + [score]) if b else []
+
+    return real_frame, frame_masks, frame_bboxes
+
+
+def _ensure_jpg_for_indices(
+    pid: str,
+    vid: str,
+    tmp_dir: str,
+    frame_indices: list[int],
+    source_path: str,
+    ds_max_dim: Optional[int],
+    ds_scale_factor: Optional[float],
+) -> None:
+    """
+    SAM loads every JPG under frames_dir. Anchor remainder builds a sparse folder:
+    only the listed frame indices (e.g. all manually labeled anchors plus one predict target).
+    """
+    out_path = Path(tmp_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    ann_dir = pm.annotated_frames_dir(pid, vid)
+    preview_dir = pm.frames_dir(pid, vid)
+    uniq = sorted(set(frame_indices))
+    missing: list[int] = []
+    for idx in uniq:
+        dst = out_path / f"{idx:06d}.jpg"
+        if dst.is_file():
+            continue
+        copied = False
+        for folder in (ann_dir, preview_dir):
+            src = folder / f"{idx:06d}.jpg"
+            if src.is_file():
+                shutil.copy2(src, dst)
+                copied = True
+                break
+        if not copied:
+            missing.append(idx)
+    if missing:
+        extract_frame_indices(
+            source_path,
+            tmp_dir,
+            missing,
+            None,
+            ds_max_dim,
+            ds_scale_factor,
+        )
+    for idx in uniq:
+        if not (out_path / f"{idx:06d}.jpg").is_file():
+            raise RuntimeError(
+                f"Anchor remainder: failed to prepare JPEG for frame {idx} "
+                f"(checked annotated_frames, preview frames/, and video decode)."
+            )
+
+
+def _to_sam_obj_id_from_npz_key(obj_id_str: str) -> int:
+    if "_" in obj_id_str:
+        parts = obj_id_str.split("_")
+        return int(parts[0]) * 1000 + int(parts[1])
+    return int(obj_id_str)
+
+
+def _obj_config_key_from_sam_oid(objects_meta: dict, sam_oid: int) -> str:
+    for oid_str in objects_meta.keys():
+        if _to_sam_obj_id_from_npz_key(oid_str) == sam_oid:
+            return oid_str
+    return str(sam_oid)
+
+
+def _persist_predicted_anchor_frame(pid: str, vid: str, frame_idx: int,
+                                    masks_by_oid: dict[int, np.ndarray],
+                                    objects_meta: dict) -> None:
+    """Persist masks and bboxes for an auto-filled anchor (no synthetic point prompts)."""
+    if not masks_by_oid:
+        return
+    masks_dir = pm.masks_dir(pid, vid)
+    bbox_dir = pm.bboxes_dir(pid, vid)
+    masks_path = masks_dir / f"{frame_idx:06d}.npz"
+
+    merged_masks: dict[str, np.ndarray] = {}
+    if masks_path.exists():
+        try:
+            previous = load_masks_npz(str(masks_path))
+            for kk, bm in previous.items():
+                merged_masks[str(kk)] = bm.astype(np.uint8)
+        except Exception:
+            pass
+
+    bbox_json: dict[str, list] = {}
+    for oid_int, m in masks_by_oid.items():
+        cfg_key = _obj_config_key_from_sam_oid(objects_meta, oid_int)
+        merged_masks[cfg_key] = np.squeeze(m).astype(np.uint8)
+        bx, score = _bbox_norm_xywh_score(merged_masks[cfg_key] > 0)
+        bbox_json[cfg_key] = list(bx) + [score]
+
+    save_masks_npz(str(masks_path), merged_masks)
+    save_bboxes_json(str(bbox_dir / f"{frame_idx:06d}.json"), bbox_json)
+
+    _invalidate_mask_cache(pid, vid)
+
+
+async def _run_anchor_remainder_inference_bg(
+    pid: str,
+    vid: str,
+    state_rm: AnchorRemainderState,
+    interactive: bool,
+) -> None:
+    loop = asyncio.get_event_loop()
+    try:
+        video_f = pm.get_video(pid, vid)
+        if video_f is None:
+            await state_rm.publish({"event": "error", "data": json.dumps({"error": "video not found"})})
+            return
+
+        start_f = int(video_f.get("start_frame") or 0)
+        nframes = int(video_f["num_frames"])
+        anchors = compute_anchor_frames(start_f, nframes, STREAM_BATCH_SIZE)
+
+        annotated = sorted(set(video_f.get("annotated_anchors") or []))
+        annotated_set = set(annotated)
+
+        prefix_n = min(ANCHOR_MANUAL_PREFIX_COUNT, len(anchors))
+        required_manual = anchors[:prefix_n]
+        if not all(a in annotated_set for a in required_manual):
+            await state_rm.publish({
+                "event": "error",
+                "data": json.dumps({
+                    "error": f"Commit the first {len(required_manual)} anchor frame(s) manually before predicting the rest.",
+                    "required_manual": required_manual,
+                }),
+            })
+            return
+
+        queue = [
+            anchors[i] for i in range(len(anchors))
+            if i >= prefix_n and anchors[i] not in annotated_set
+        ]
+        if not queue:
+            vid_up = pm.get_video(pid, vid)
+            if vid_up is not None:
+                req_a = compute_anchor_frames(start_f, int(vid_up["num_frames"]), STREAM_BATCH_SIZE)
+                ann_now = sorted(set(vid_up.get("annotated_anchors") or []))
+                if bool(req_a) and all(a in ann_now for a in req_a):
+                    pm.update_video(pid, vid, {"anchor_labeling_complete": True})
+            await state_rm.publish({"event": "done", "data": json.dumps({"status": "nothing_to_infer"})})
+            return
+
+        source_path = video_f.get("source_path", "")
+        if not source_path or not Path(source_path).is_file():
+            await state_rm.publish({"event": "error", "data": json.dumps({"error": "missing source_path"})})
+            return
+
+        objects_meta = dict(video_f.get("objects") or {})
+        ds_max_dim, ds_scale_factor = _video_ds_params(video_f)
+
+        anchor_idx_set = set(anchors)
+        # Freeze manual anchors at job start — inferred anchors must not seed later steps.
+        manual_seed_frames = sorted(a for a in annotated if a in anchor_idx_set)
+        manual_seed_set = set(manual_seed_frames)
+        all_prompts = pm.get_all_point_prompts(pid, vid)
+
+        async def publish(ev: str, payload: dict):
+            await state_rm.publish({"event": ev, "data": json.dumps(payload)})
+
+        total_q = len(queue)
+        await publish("init", {
+            "anchors_total": len(anchors),
+            "manual_prefix": prefix_n,
+            "anchors_queued": total_q,
+            "manual_seed_anchors": manual_seed_frames,
+        })
+
+        try:
+            for qi, tgt in enumerate(queue):
+                idx_in_list = anchors.index(tgt)
+                await publish("predict_start", {"frame_idx": tgt, "anchor_index": idx_in_list, "step": qi + 1, "steps": total_q})
+
+                tmp_dir = tempfile.mkdtemp(prefix=f"sam3wt_anchor_remainder_{tgt}_")
+                try:
+                    frames_needed = sorted(manual_seed_set | {tgt})
+                    await loop.run_in_executor(
+                        None,
+                        functools.partial(
+                            _ensure_jpg_for_indices,
+                            pid,
+                            vid,
+                            tmp_dir,
+                            frames_needed,
+                            source_path,
+                            ds_max_dim,
+                            ds_scale_factor,
+                        ),
+                    )
+                    await loop.run_in_executor(None, sam.init_session, pid, vid, tmp_dir)
+                    await publish("sam_propagate_start", {"frame_idx": tgt, "step": qi + 1, "steps": total_q})
+
+                    def _seed_and_propagate():
+                        frame_map = sam._frame_maps.get((pid, vid), [])
+                        seed_items: list[tuple[int, int, dict]] = []
+                        for obj_id_str, frame_prompts in all_prompts.items():
+                            oid_for_sam = _to_sam_obj_id_from_npz_key(obj_id_str)
+                            for fidx_str, prompt in frame_prompts.items():
+                                fidx = int(fidx_str)
+                                if fidx in manual_seed_set and fidx in frame_map:
+                                    seed_items.append((fidx, oid_for_sam, prompt))
+                        seed_items.sort(key=lambda x: (x[0], x[1]))
+                        if not seed_items:
+                            raise RuntimeError(
+                                "No saved point prompts on manual anchor frames — "
+                                "cannot seed anchor remainder inference."
+                            )
+                        for fidx, oid_for_sam, prompt in seed_items:
+                            sam.add_points(
+                                pid,
+                                vid,
+                                frame_idx=fidx,
+                                obj_id=oid_for_sam,
+                                points=prompt["points"],
+                                labels=prompt["labels"],
+                            )
+                        forward_start_real = min(manual_seed_frames)
+                        try:
+                            sam_start_idx = frame_map.index(forward_start_real)
+                            tgt_sam_idx = frame_map.index(tgt)
+                        except ValueError as err:
+                            raise RuntimeError(
+                                f"Anchor remainder: frame map missing start={forward_start_real} "
+                                f"or target={tgt}"
+                            ) from err
+                        max_track = tgt_sam_idx - sam_start_idx
+                        if max_track <= 0:
+                            raise RuntimeError(
+                                f"Anchor remainder: target frame {tgt} is not after manual anchors "
+                                f"in sparse session ordering"
+                            )
+                        last_fm: dict[int, np.ndarray] = {}
+                        for item in sam.propagate_stream(
+                            pid,
+                            vid,
+                            start_frame_idx=forward_start_real,
+                            propagation_direction="forward",
+                            max_frame_num_to_track=max_track,
+                        ):
+                            real_frame, fm, _fb = _extract_frame_masks_bboxes(pid, vid, item)
+                            if real_frame == tgt:
+                                last_fm = dict(fm)
+                        return last_fm
+
+                    frame_masks_final = await loop.run_in_executor(None, _seed_and_propagate)
+                    if not frame_masks_final:
+                        raise RuntimeError(f"No masks produced at anchor frame {tgt}")
+
+                    await loop.run_in_executor(
+                        None,
+                        functools.partial(
+                            _persist_predicted_anchor_frame,
+                            pid, vid, tgt, frame_masks_final, objects_meta,
+                        ),
+                    )
+
+                    vf = pm.get_video(pid, vid)
+                    ann2 = sorted(set((vf.get("annotated_anchors") or []) + [tgt]))
+                    req_a = compute_anchor_frames(start_f, int(vf["num_frames"]), STREAM_BATCH_SIZE)
+                    pm.update_video(pid, vid, {
+                        "annotated_anchors": ann2,
+                        "anchor_labeling_complete": bool(req_a) and all(a in set(ann2) for a in req_a),
+                    })
+
+                    payload_review = {
+                        "frame_idx": tgt,
+                        "anchor_index": idx_in_list,
+                        "anchors_done": qi + 1,
+                        "anchors_queued": total_q,
+                    }
+                    await publish("anchor_predicted", payload_review)
+                    if interactive:
+                        await publish("review_prompt", payload_review)
+                        state_rm.review_continue_event = asyncio.Event()
+                        state_rm.waiting_review = True
+                        await state_rm.review_continue_event.wait()
+                        state_rm.waiting_review = False
+                        state_rm.review_continue_event = None
+                finally:
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                    await loop.run_in_executor(None, sam.close_session, pid, vid)
+
+            await publish("done", {"status": "ok", "anchors_inferred": total_q})
+
+        except Exception as ex:
+            logger.error(f"Anchor remainder inference error: {ex}", exc_info=True)
+            await publish("error", {"error": str(ex)})
+
+    finally:
+        state_rm.is_running = False
+        state_rm.waiting_review = False
+        state_rm.review_continue_event = None
 
 # ─── Instance color helpers ───────────────────────────────────────────────────
 # For multi-instance objects (e.g., "1", "1_1", "1_2"), we vary the color
@@ -1101,9 +1504,15 @@ def add_points(pid: str, vid: str, oid: str, req: AddPointsRequest):
         raise HTTPException(400, "No annotated frames extracted yet. Extract a frame first.")
 
     # Guard 1: block annotation while propagation is actively running
-    prop_state = _prop_registry.get(vid)
+    prop_state = _get_prop_state(pid, vid)
     if prop_state is not None and prop_state.is_running:
         raise HTTPException(409, "Propagation is running — pause first before adding points.")
+
+    # NOTE: Do not block add_points while anchor remainder inference runs. Remainder holds the same
+    # SAM (pid,vid) session during GPU work (waiting_review is False then); blocking here prevented
+    # all annotation clicks until review — bad UX and looked like “SAM stopped”. Users may safely
+    # annotate during paused review (waiting_review=True); initiating a new init_session during an
+    # active remainder step can invalidate that step — acceptable vs silent lock-out.
 
     # Guard 2: in anchor_mode, only designated anchor frames may be labeled
     if req.anchor_mode:
@@ -1152,10 +1561,7 @@ def add_points(pid: str, vid: str, oid: str, req: AddPointsRequest):
                     continue  # handled by main add_points call below
                 key = str(req.frame_idx)
                 if key in other_frame_prompts:
-                    other_obj_id_int = (
-                        int(other_oid_str.split("_")[0]) if "_" in other_oid_str
-                        else int(other_oid_str)
-                    )
+                    other_obj_id_int = _to_sam_obj_id_from_npz_key(other_oid_str)
                     try:
                         sam.add_points(
                             pid, vid,
@@ -1202,7 +1608,7 @@ def add_points(pid: str, vid: str, oid: str, req: AddPointsRequest):
                 for fidx_str, prompt in frame_map_prompts.items():
                     replay_fidx = int(fidx_str)
                     if replay_fidx in frame_map:
-                        replay_items.append((replay_fidx, int(obj_id_str), prompt))
+                        replay_items.append((replay_fidx, _to_sam_obj_id_from_npz_key(obj_id_str), prompt))
             replay_items.sort(key=lambda x: x[0])
             for replay_fidx, replay_obj_id, prompt in replay_items:
                 try:
@@ -1223,11 +1629,12 @@ def add_points(pid: str, vid: str, oid: str, req: AddPointsRequest):
 
     # Standard single-instance point prompt
     try:
-        logger.info(f"add_points: frame={req.frame_idx}, obj={oid}, points={req.points}, labels={req.labels}")
+        sam_oid = _to_sam_obj_id_from_npz_key(str(oid))
+        logger.info(f"add_points: frame={req.frame_idx}, obj={oid} (sam_oid={sam_oid}), points={req.points}, labels={req.labels}")
         outputs = sam.add_points(
             pid, vid,
             frame_idx=req.frame_idx,
-            obj_id=int(oid),
+            obj_id=sam_oid,
             points=req.points,
             labels=req.labels,
             text=None,  # SAM3 tracker mode doesn't support text with points
@@ -1591,7 +1998,11 @@ def get_anchor_frames(pid: str, vid: str):
     start = video.get("start_frame", 0)
     num_frames = video["num_frames"]
     anchors = compute_anchor_frames(start, num_frames, STREAM_BATCH_SIZE)
-    return {"anchor_frames": anchors, "count": len(anchors)}
+    return {
+        "anchor_frames": anchors,
+        "count": len(anchors),
+        "manual_anchor_prefix_before_infer": ANCHOR_MANUAL_PREFIX_COUNT,
+    }
 
 
 class AnchorLabelingTiming(BaseModel):
@@ -1649,6 +2060,72 @@ def commit_anchor_frame(pid: str, vid: str, frame_idx: int, req: CommitAnchorReq
 
     pm.update_video(pid, vid, updates)
     return {"status": "ok", "committed_frame": frame_idx, "anchor_index": req.anchor_index}
+
+
+@app.get("/api/projects/{pid}/videos/{vid}/anchors/predict_remainder_sse")
+async def anchor_predict_remainder_sse(
+    pid: str,
+    vid: str,
+    interactive: bool = Query(
+        True,
+        description="If true, pause after each predicted anchor until POST …/predict_remainder_continue.",
+    ),
+):
+    """Queue-style inference: sequentially propagate masks to unset anchor frames after manual prefix."""
+
+    video = pm.get_video(pid, vid)
+    if video is None:
+        raise HTTPException(404, "Video not found")
+
+    prop_s = _get_prop_state(pid, vid)
+    if prop_s.is_running:
+        raise HTTPException(
+            409,
+            "Whole-video propagation is running — pause or finish it before predicting anchor remainders.",
+        )
+
+    rm = _get_anchor_remainder_state(pid, vid)
+    q = rm.subscribe()
+
+    if not rm.is_running:
+        rm.is_running = True
+        rm.task = asyncio.create_task(_run_anchor_remainder_inference_bg(pid, vid, rm, interactive))
+    else:
+        await q.put({
+            "event": "catch_up",
+            "data": json.dumps({"message": "anchor remainder prediction already in progress"}),
+        })
+
+    async def event_gen():
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(q.get(), timeout=30)
+                except asyncio.TimeoutError:
+                    yield {"event": "heartbeat", "data": "{}"}
+                    continue
+                yield event
+                if event.get("event") in ("done", "error"):
+                    break
+        except asyncio.CancelledError:
+            pass
+        finally:
+            rm.unsubscribe(q)
+
+    return EventSourceResponse(event_gen())
+
+
+@app.post("/api/projects/{pid}/videos/{vid}/anchors/predict_remainder_continue")
+async def anchor_predict_remainder_continue(pid: str, vid: str):
+    """Acknowledge review of the latest predicted anchor and resume sequential inference."""
+    rm = _get_anchor_remainder_state(pid, vid)
+    if not rm.waiting_review or rm.review_continue_event is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Anchor remainder inference is not paused for review.",
+        )
+    rm.review_continue_event.set()
+    return {"status": "ok"}
 
 
 # ─── Propagation background task ─────────────────────────────────────────────
@@ -1995,6 +2472,13 @@ async def propagate_video(pid: str, vid: str, start_frame: int = 0, resume_from:
     video = pm.get_video(pid, vid)
     if video is None:
         raise HTTPException(404, "Video not found")
+
+    rm_anchor = _get_anchor_remainder_state(pid, vid)
+    if rm_anchor.is_running:
+        raise HTTPException(
+            409,
+            "Anchor remainder prediction is running — wait for it before whole-video propagation.",
+        )
 
     state = _get_prop_state(pid, vid)
     q = state.subscribe()

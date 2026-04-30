@@ -289,6 +289,55 @@ def extract_frame_range(
     return {"extracted_count": extracted, "start": start, "end": end}
 
 
+def extract_frame_indices(
+    video_path: str,
+    out_dir: str,
+    indices: list[int],
+    progress_callback=None,
+    max_dim: Optional[int] = None,
+    scale_factor: Optional[float] = None,
+) -> dict:
+    """
+    Extract only the listed frame indices into out_dir as %06d.jpg.
+    Skips indices whose files already exist. Indices may be non-contiguous.
+    """
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    uniq = sorted(set(indices))
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise ValueError(f"Cannot open video: {video_path}")
+
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    extracted = 0
+    todo = sum(
+        1
+        for idx in uniq
+        if idx < total and not (out_path / f"{idx:06d}.jpg").exists()
+    )
+    done_missing = 0
+    for idx in uniq:
+        if idx >= total:
+            continue
+        out_file = out_path / f"{idx:06d}.jpg"
+        if out_file.exists():
+            continue
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame = _ds_resize(frame, max_dim, scale_factor)
+        cv2.imwrite(str(out_file), frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        extracted += 1
+        done_missing += 1
+        if progress_callback and todo > 0 and done_missing % max(1, todo // 10) == 0:
+            progress_callback(done_missing, todo)
+
+    cap.release()
+    return {"extracted_count": extracted, "indices_requested": uniq}
+
+
 def get_frame_path(frames_dir: str, frame_idx: int) -> Path:
     return Path(frames_dir) / f"{frame_idx:06d}.jpg"
 

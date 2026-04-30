@@ -21,6 +21,8 @@ export interface AppConfig {
   maskOpacity: number   // 0–1
   pointSize: number     // scale factor relative to default (1.0)
   useAllAnchors: boolean  // default tracking method when anchor frames are labeled
+  /** After the manual anchor prefix, auto-run SAM to fill remaining anchors (SSE job). Default off. */
+  autoInferAnchorRemainder: boolean
 }
 
 const CONFIG_KEY = 'sam3wt_config'
@@ -31,6 +33,7 @@ const CONFIG_DEFAULTS: AppConfig = {
   maskOpacity: 0.85,
   pointSize: 1.0,
   useAllAnchors: false,
+  autoInferAnchorRemainder: false,
 }
 
 function loadConfig(): AppConfig {
@@ -89,6 +92,7 @@ interface AppState {
   anchorFrames: number[]                                 // [start, start+1000, ..., last]
   currentAnchorIndex: number                             // which anchor user is on (0-based)
   annotatedAnchorIndices: number[]                       // which anchor indices have been committed
+  anchorRemainderInferencing: boolean                   // SAM auto-filling remaining anchors
 
   // UI
   viewerTab: ViewerTab
@@ -140,6 +144,9 @@ interface AppState {
   setAnchorFrames: (frames: number[]) => void
   setCurrentAnchorIndex: (i: number) => void
   addAnnotatedAnchor: (index: number) => void
+  setAnnotatedAnchorIndices: (indices: number[]) => void
+  setAnchorRemainderInferencing: (v: boolean) => void
+  invalidateSavedMaskFrame: (fidx: number) => void
   resetAnchorState: () => void
 }
 
@@ -174,6 +181,7 @@ export const useStore = create<AppState>((set, get) => ({
   anchorFrames: [],
   currentAnchorIndex: 0,
   annotatedAnchorIndices: [],
+  anchorRemainderInferencing: false,
 
   config: _initialConfig,
   configDirty: false,
@@ -221,6 +229,7 @@ export const useStore = create<AppState>((set, get) => ({
         anchorFrames: [],
         currentAnchorIndex: 0,
         annotatedAnchorIndices: [],
+        anchorRemainderInferencing: false,
       })
     }
   },
@@ -367,6 +376,7 @@ export const useStore = create<AppState>((set, get) => ({
       anchorFrames: [],
       currentAnchorIndex: 0,
       annotatedAnchorIndices: [],
+      anchorRemainderInferencing: false,
     })
   },
 
@@ -380,11 +390,23 @@ export const useStore = create<AppState>((set, get) => ({
       set({ annotatedAnchorIndices: [...annotatedAnchorIndices, index] })
     }
   },
+  setAnnotatedAnchorIndices: indices =>
+    set({ annotatedAnchorIndices: [...new Set(indices)].sort((a, b) => a - b) }),
+  setAnchorRemainderInferencing: v => set({ anchorRemainderInferencing: v }),
+  invalidateSavedMaskFrame: fidx => {
+    const { savedMaskCache } = get()
+    if (savedMaskCache[fidx] === undefined) return
+    const next = { ...savedMaskCache }
+    delete next[fidx]
+    _savedMaskCacheOrder = _savedMaskCacheOrder.filter(f => f !== fidx)
+    set({ savedMaskCache: next })
+  },
   resetAnchorState: () => set({
     anchorPhase: false,
     anchorFrames: [],
     currentAnchorIndex: 0,
     annotatedAnchorIndices: [],
+    anchorRemainderInferencing: false,
   }),
 }))
 

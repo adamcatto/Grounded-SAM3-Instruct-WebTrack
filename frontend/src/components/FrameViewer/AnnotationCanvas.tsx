@@ -139,7 +139,7 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
     }, 0)
 
     return () => clearTimeout(timer)
-  }, [currentFrame, propagationStatus, pid, vid])
+  }, [currentFrame, propagationStatus, pid, vid, savedMaskCache])
 
   // ── Hover: show mask label tooltip ───────────────────────────────────────
 

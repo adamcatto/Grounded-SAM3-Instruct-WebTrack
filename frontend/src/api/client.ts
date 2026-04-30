@@ -280,6 +280,7 @@ export const startPropagationSSE = (pid: string, vid: string, startFrame = 0, re
 export interface AnchorFramesResponse {
   anchor_frames: number[]
   count: number
+  manual_anchor_prefix_before_infer?: number
 }
 
 export const getAnchorFrames = (pid: string, vid: string) =>
@@ -304,6 +305,16 @@ export const commitAnchorFrame = (
       labeling_timing: labelingTiming ?? undefined,
     },
   ).then(r => r.data)
+
+export const startAnchorRemainderPredictionSSE = (pid: string, vid: string, interactive = true) => {
+  const qs = interactive ? '?interactive=true' : '?interactive=false'
+  return new EventSource(`${BACKEND}/api/projects/${pid}/videos/${vid}/anchors/predict_remainder_sse${qs}`)
+}
+
+export const continueAnchorRemainderReview = (pid: string, vid: string) =>
+  api
+    .post<{ status: string }>(`/projects/${pid}/videos/${vid}/anchors/predict_remainder_continue`)
+    .then(r => r.data)
 
 // ─── Export SSE ───────────────────────────────────────────────────────────────
 

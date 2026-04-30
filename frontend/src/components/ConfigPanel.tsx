@@ -438,6 +438,16 @@ export default function ConfigPanel() {
             value={config.useAllAnchors}
             onChange={v => setConfig({ useAllAnchors: v })}
           />
+          <ToggleRow
+            label="Automatically infer remaining anchor frames"
+            description={
+              'After you finish the manual anchor prefix, run SAM in the background to fill ' +
+              'the rest of the anchor frames. When off, continue labeling anchors manually ' +
+              'or use “Infer remaining anchors” in the sidebar.'
+            }
+            value={config.autoInferAnchorRemainder}
+            onChange={v => setConfig({ autoInferAnchorRemainder: v })}
+          />
         </Section>
 
         {/* Single-frame prediction */}
