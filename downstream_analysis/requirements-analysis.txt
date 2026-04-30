@@ -1,0 +1,5 @@
+# Optional deps for downstream_analysis (matplotlib + scikit-learn).
+# Install with: pip install -r downstream_analysis/requirements-analysis.txt
+matplotlib>=3.8
+scikit-learn>=1.3
+tqdm>=4.66
