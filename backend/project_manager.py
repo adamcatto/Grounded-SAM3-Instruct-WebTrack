@@ -249,6 +249,33 @@ class ProjectManager:
             raise ValueError(f"Video {vid} not found")
         config["videos"][vid]["objects"].pop(obj_id, None)
         config["videos"][vid]["point_prompts"].pop(obj_id, None)
+        igs = config["videos"][vid].get("instance_groups") or {}
+        igs.pop(obj_id, None)
+        self._save_config(pid, config)
+
+    def restore_object_entry(
+        self,
+        pid: str,
+        vid: str,
+        obj_id: str,
+        object_entry: dict,
+        point_prompts_for_obj: Optional[dict],
+        instance_group: Optional[list],
+    ):
+        """Re-insert an object and its prompts after undo of removal."""
+        config = self.get_project(pid)
+        if config is None or vid not in config["videos"]:
+            raise ValueError(f"Video {vid} not found")
+        config["videos"][vid]["objects"][str(obj_id)] = dict(object_entry)
+        prompts = config["videos"][vid].setdefault("point_prompts", {})
+        if point_prompts_for_obj is None:
+            pass
+        elif not point_prompts_for_obj:
+            prompts.pop(str(obj_id), None)
+        else:
+            prompts[str(obj_id)] = dict(point_prompts_for_obj)
+        if instance_group is not None:
+            config["videos"][vid].setdefault("instance_groups", {})[str(obj_id)] = list(instance_group)
         self._save_config(pid, config)
 
     def rename_object(self, pid: str, vid: str, obj_id: str, new_name: str):

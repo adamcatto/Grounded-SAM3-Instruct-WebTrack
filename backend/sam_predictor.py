@@ -318,6 +318,27 @@ class SAMPredictor:
             outputs = resp.get("outputs", {})
             return {frame_idx: outputs}  # key by real frame_idx for callers
 
+    def export_cached_tracker_outputs_for_frame(self, pid: str, vid: str, frame_idx: int) -> dict:
+        """Best-effort SAM3 cached tracker output dict for one real frame (for diagnostics / fallback)."""
+        with self.lock:
+            session_id = self.get_session_id(pid, vid)
+            if session_id is None or _model_name == "sam2":
+                return {}
+            try:
+                predictor = _get_predictor()
+                state = predictor._ALL_INFERENCE_STATES.get(session_id, {}).get("state", {})
+                sam_frame_idx = self._to_sam_idx(pid, vid, frame_idx)
+                slot = state.get("cached_frame_outputs", {}).get(sam_frame_idx, {})
+                if isinstance(slot, dict) and "out_obj_ids" in slot:
+                    return slot
+                if isinstance(slot, dict):
+                    for v in slot.values():
+                        if isinstance(v, dict) and "out_obj_ids" in v:
+                            return v
+            except Exception as e:
+                logger.warning(f"export_cached_tracker_outputs_for_frame: {e}")
+            return {}
+
     def add_mask_prompt(
         self,
         pid: str,

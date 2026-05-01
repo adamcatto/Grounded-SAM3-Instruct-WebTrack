@@ -1,7 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useStore, currentVideo as selectCurrentVideo } from '../../store/useStore'
-import { extractFrame, addPoints, getSavedMask } from '../../api/client'
+import { extractFrame, addPoints, getSavedMask, rebuildFromConfig, replaceFramePromptsData, removeObject } from '../../api/client'
 import { drawMasks, drawPoints, loadMaskBitmap } from '../../utils/maskUtils'
+import { applyRebuildMasksToStore, localAnnotationsToPointPrompts } from '../../history/applyRebuild'
 
 interface Props {
   width: number
@@ -186,20 +187,30 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
     const ny = py / height
     const label: 0 | 1 = pointMode === 'add' ? 1 : 0
 
+    const oid = currentObjectId
+    const key = String(frameToUse)
+    const beforeSlot = useStore.getState().localAnnotations[oid]?.[key]
+    const beforePts: [number, number][] = beforeSlot ? beforeSlot.points.map(p => [p.x, p.y]) : []
+    const beforeLabs: number[] = beforeSlot ? beforeSlot.points.map(p => p.label as number) : []
+
     // Add to local state
-    addLocalPoint(currentObjectId, frameToUse, nx, ny, label)
+    addLocalPoint(oid, frameToUse, nx, ny, label)
 
     // Get all accumulated points for this object on this frame
-    const framePts = useStore.getState().localAnnotations[currentObjectId]?.[String(frameToUse)]
+    const framePts = useStore.getState().localAnnotations[oid]?.[key]
     const allPoints: [number, number][] = framePts ? framePts.points.map(p => [p.x, p.y]) : [[nx, ny]]
     const allLabels = framePts ? framePts.points.map(p => p.label as number) : [label]
+    const afterPts = [...allPoints]
+    const afterLabs = [...allLabels]
 
     try {
       // Extract this single frame on the backend (into annotated_frames/)
       // so the SAM session can be initialized with just this frame.
       await extractFrame(pid, vid, frameToUse)
 
-      const result = await addPoints(pid, vid, currentObjectId, frameToUse, allPoints, allLabels, anchorPhase)
+      const result = await addPoints(pid, vid, oid, frameToUse, allPoints, allLabels, anchorPhase)
+      const addedObjects = result.new_objects ?? []
+
       if (result.masks) {
         // Read latest state after async call — only merge masks from the same frame
         const state = useStore.getState()
@@ -210,18 +221,87 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
         // ones so that scrubbing away and back shows the updated result.
         const existingSaved = state.savedMaskCache[frameToUse] ?? {}
         setSavedMask(frameToUse, { ...existingSaved, ...result.masks })
-        
+
         // If new instance objects were created (multi-instance detection), merge them into state
-        if (result.new_objects && result.new_objects.length > 0) {
+        if (addedObjects.length > 0) {
           const currentObjs = state.project?.videos[vid]?.objects ?? {}
           const updatedObjs = { ...currentObjs }
-          for (const newObj of result.new_objects) {
+          for (const newObj of addedObjects) {
             updatedObjs[newObj.id] = newObj
           }
           useStore.getState().updateVideo({ objects: updatedObjs })
         }
-        
       }
+
+      useStore.getState().pushHistory({
+        labelUndo: 'Point prompt',
+        labelRedo: 'Point prompt',
+        undo: async () => {
+          if (useStore.getState().propagationStatus === 'running') return
+          await replaceFramePromptsData(pid, vid, oid, frameToUse, beforePts, beforeLabs)
+          for (const o of addedObjects) {
+            try {
+              await removeObject(pid, vid, o.id)
+            } catch { /* ignore */ }
+          }
+          const la = JSON.parse(JSON.stringify(useStore.getState().localAnnotations)) as Record<string, Record<string, { points: { x: number; y: number; label: 0 | 1 }[] }>>
+          if (beforePts.length === 0) {
+            const of = la[oid]
+            if (of) {
+              delete of[key]
+              if (Object.keys(of).length === 0) delete la[oid]
+            }
+          } else {
+            la[oid] = { ...la[oid], [key]: { points: beforePts.map(([x, y], i) => ({ x, y, label: beforeLabs[i] as 0 | 1 })) } }
+          }
+          useStore.setState({ localAnnotations: la })
+          const vidDatUndo = useStore.getState().project?.videos[vid]
+          if (vidDatUndo) {
+            const objs = { ...vidDatUndo.objects }
+            for (const o of addedObjects) delete objs[o.id]
+            useStore.getState().updateVideo({
+              objects: objs,
+              point_prompts: localAnnotationsToPointPrompts(la),
+            })
+          }
+          const anchorNow = useStore.getState().anchorPhase
+          const rb = await rebuildFromConfig(pid, vid, [frameToUse], anchorNow, anchorNow ? frameToUse : null)
+          applyRebuildMasksToStore(rb.masks_by_frame)
+        },
+        redo: async () => {
+          const st = useStore.getState()
+          if (st.propagationStatus === 'running') return
+          const la = JSON.parse(JSON.stringify(st.localAnnotations)) as typeof st.localAnnotations
+          la[oid] = { ...(la[oid] ?? {}), [key]: { points: afterPts.map(([x, y], i) => ({ x, y, label: afterLabs[i] as 0 | 1 })) } }
+          useStore.setState({ localAnnotations: la })
+          const vidDat = st.project?.videos[vid]
+          if (vidDat) {
+            const objs = { ...vidDat.objects }
+            for (const o of addedObjects) objs[o.id] = o
+            useStore.getState().updateVideo({
+              objects: objs,
+              point_prompts: localAnnotationsToPointPrompts(la),
+            })
+          }
+          await extractFrame(pid, vid, frameToUse)
+          const anchorNow = useStore.getState().anchorPhase
+          const res = await addPoints(pid, vid, oid, frameToUse, afterPts, afterLabs, anchorNow)
+          if (res.masks) {
+            const s2 = useStore.getState()
+            const prevLive = s2.currentFrameMasksFrame === frameToUse ? s2.currentFrameMasks : {}
+            s2.setCurrentFrameMasks({ ...prevLive, ...res.masks }, frameToUse)
+            const existingSaved = s2.savedMaskCache[frameToUse] ?? {}
+            s2.setSavedMask(frameToUse, { ...existingSaved, ...res.masks })
+          }
+          if (res.new_objects?.length) {
+            const s2 = useStore.getState()
+            const curObjs = s2.project?.videos[vid]?.objects ?? {}
+            const uo = { ...curObjs }
+            for (const n of res.new_objects) uo[n.id] = n
+            s2.updateVideo({ objects: uo })
+          }
+        },
+      })
     } catch (err: unknown) {
       console.error('Failed to add point:', err)
       // Extract the backend's detail message if available (e.g. 409 anchor-frame guard)
@@ -229,7 +309,7 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
         (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
       addToast(detail ?? 'Failed to add point', 'error')
     }
-  }, [pointMode, currentObjectId, video, currentFrame, width, height, pid, vid, addLocalPoint, setCurrentFrameMasks, propagationStartFrame])
+  }, [pointMode, currentObjectId, video, currentFrame, width, height, pid, vid, addLocalPoint, setCurrentFrameMasks, setSavedMask, anchorPhase, addToast])
 
   const cursor = pointMode ? 'crosshair' : 'default'
 

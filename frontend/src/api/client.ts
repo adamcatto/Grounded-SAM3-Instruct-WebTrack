@@ -240,6 +240,64 @@ export const getSavedMask = (pid: string, vid: string, fidx: number) =>
     headers: { 'Cache-Control': 'no-cache' }
   }).then(r => r.data)
 
+export interface RebuildSessionResponse {
+  status: string
+  masks_by_frame: Record<string, MaskData>
+}
+
+export const rebuildFromConfig = (
+  pid: string,
+  vid: string,
+  returnMasksForFrames: number[],
+  anchorMode = false,
+  anchorFrame: number | null = null,
+) =>
+  api
+    .post<RebuildSessionResponse>(`/projects/${pid}/videos/${vid}/session/rebuild_from_config`, {
+      return_masks_for_frames: returnMasksForFrames,
+      anchor_mode: anchorMode,
+      ...(anchorMode && anchorFrame != null ? { anchor_frame: anchorFrame } : {}),
+    })
+    .then(r => r.data)
+
+export const replaceFramePromptsData = (
+  pid: string,
+  vid: string,
+  oid: string,
+  frameIdx: number,
+  points: [number, number][],
+  labels: number[],
+) =>
+  api
+    .put<{ status: string }>(
+      `/projects/${pid}/videos/${vid}/objects/${oid}/frames/${frameIdx}/prompts`,
+      { points, labels },
+    )
+    .then(r => r.data)
+
+export const restoreMaskFrames = (pid: string, vid: string, frames: Record<string, MaskData>) =>
+  api
+    .post<{ status: string; restored: number }>(
+      `/projects/${pid}/videos/${vid}/masks/restore_frames`,
+      { frames },
+    )
+    .then(r => r.data)
+
+export const restoreObjectSnapshot = (
+  pid: string,
+  vid: string,
+  object: { id: string; name: string; color: string; description?: string; min_instances?: number; max_instances?: number },
+  point_prompts: Record<string, { points: [number, number][]; labels: number[] }>,
+  instance_group?: number[] | null,
+) =>
+  api
+    .post<{ status: string }>(`/projects/${pid}/videos/${vid}/objects/restore`, {
+      object,
+      point_prompts,
+      instance_group: instance_group ?? undefined,
+    })
+    .then(r => r.data)
+
 // ─── Propagation SSE ─────────────────────────────────────────────────────────
 
 export interface PropagationStatusResponse {

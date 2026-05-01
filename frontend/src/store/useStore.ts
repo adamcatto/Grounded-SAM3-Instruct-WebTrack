@@ -1,6 +1,8 @@
 import { create } from 'zustand'
 import type { Project, VideoMeta, MaskData } from '../types'
 import { evictMaskImages } from '../utils/maskUtils'
+import type { HistoryCommand } from '../history/undoHistory'
+import { MAX_UNDO_STACK } from '../history/undoHistory'
 
 // Max number of frames to keep in the in-memory mask cache.
 const MAX_SAVED_MASK_FRAMES = 200
@@ -151,6 +153,15 @@ interface AppState {
   setAnchorRemainderAwaitingCommit: (v: boolean) => void
   invalidateSavedMaskFrame: (fidx: number) => void
   resetAnchorState: () => void
+
+  // Undo / redo (annotation actions)
+  undoStack: HistoryCommand[]
+  redoStack: HistoryCommand[]
+  historyBusy: boolean
+  pushHistory: (cmd: HistoryCommand) => void
+  undoLast: () => Promise<void>
+  redoLast: () => Promise<void>
+  clearHistory: () => void
 }
 
 const _initialConfig = loadConfig()
@@ -190,8 +201,67 @@ export const useStore = create<AppState>((set, get) => ({
   config: _initialConfig,
   configDirty: false,
   toasts: [],
+  undoStack: [],
+  redoStack: [],
+  historyBusy: false,
 
-  setProject: p => set({ project: p }),
+  clearHistory: () => set({ undoStack: [], redoStack: [] }),
+
+  pushHistory: cmd => {
+    const { undoStack } = get()
+    const next = [...undoStack, cmd].slice(-MAX_UNDO_STACK)
+    set({ undoStack: next, redoStack: [] })
+  },
+
+  undoLast: async () => {
+    const { undoStack, historyBusy } = get()
+    if (historyBusy || undoStack.length === 0) return
+    const cmd = undoStack[undoStack.length - 1]
+    set({ historyBusy: true })
+    try {
+      await cmd.undo()
+      set(s => ({
+        undoStack: s.undoStack.slice(0, -1),
+        redoStack: [...s.redoStack, cmd],
+      }))
+      get().addToast(`Undid: ${cmd.labelUndo}`, 'info')
+    } catch (e) {
+      console.error('undo failed', e)
+      get().addToast('Undo failed', 'error')
+    } finally {
+      set({ historyBusy: false })
+    }
+  },
+
+  redoLast: async () => {
+    const { redoStack, historyBusy } = get()
+    if (historyBusy || redoStack.length === 0) return
+    const cmd = redoStack[redoStack.length - 1]
+    set({ historyBusy: true })
+    try {
+      await cmd.redo()
+      set(s => ({
+        redoStack: s.redoStack.slice(0, -1),
+        undoStack: [...s.undoStack, cmd],
+      }))
+      get().addToast(`Redid: ${cmd.labelRedo}`, 'info')
+    } catch (e) {
+      console.error('redo failed', e)
+      get().addToast('Redo failed', 'error')
+    } finally {
+      set({ historyBusy: false })
+    }
+  },
+
+  setProject: p => {
+    const prevId = get().project?.id
+    const nextId = p?.id
+    if (prevId !== nextId) {
+      set({ project: p, undoStack: [], redoStack: [] })
+    } else {
+      set({ project: p })
+    }
+  },
 
   setCurrentVideo: vid => {
     const prev = get().currentVideoId
@@ -235,6 +305,8 @@ export const useStore = create<AppState>((set, get) => ({
         annotatedAnchorIndices: [],
         anchorRemainderInferencing: false,
         anchorRemainderAwaitingCommit: false,
+        undoStack: [],
+        redoStack: [],
       })
     }
   },

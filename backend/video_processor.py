@@ -410,6 +410,23 @@ def encode_mask_as_png(
     return base64.b64encode(buf.getvalue()).decode()
 
 
+def decode_masks_png_base64_to_binary(
+    masks_b64: dict[str, str],
+) -> dict[str, np.ndarray]:
+    """Decode GET /masks/{fidx} style base64 RGBA PNGs to {obj_id: uint8 H×W binary}."""
+    out: dict[str, np.ndarray] = {}
+    for oid, b64 in masks_b64.items():
+        try:
+            raw = base64.b64decode(b64)
+            im = Image.open(io.BytesIO(raw)).convert("RGBA")
+            arr = np.array(im)
+            alpha = arr[:, :, 3]
+            out[str(oid)] = (alpha > 127).astype(np.uint8)
+        except Exception as e:
+            logger.warning(f"decode_masks_png: obj {oid}: {e}")
+    return out
+
+
 def composite_masks_as_png(
     masks: dict,  # {obj_id: binary_mask_HW}
     colors: dict,  # {obj_id: hex_color}

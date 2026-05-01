@@ -1,8 +1,9 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { RefreshCw, AlertCircle, CheckCircle2, XCircle, ChevronRight, Trash2, Loader } from 'lucide-react'
 import { useStore, currentVideo as selectCurrentVideo } from '../store/useStore'
-import { getSessionState, getSavedMask, frameUrl, clearFramePrompts } from '../api/client'
+import { getSessionState, getSavedMask, frameUrl, clearFramePrompts, rebuildFromConfig, replaceFramePromptsData } from '../api/client'
 import type { SessionState } from '../api/client'
+import { applyRebuildMasksToStore, localAnnotationsToPointPrompts } from '../history/applyRebuild'
 
 // ─── Collapsible section ──────────────────────────────────────────────────────
 
@@ -312,7 +313,7 @@ function LabeledFrameCard({
   fps: number
   pid: string
   vid: string
-  onRemove: (frameIdx: number) => void
+  onRemove: () => void
 }) {
   const canvasH = videoWidth > 0 ? Math.round(CANVAS_W * videoHeight / videoWidth) : 360
 
@@ -327,9 +328,58 @@ function LabeledFrameCard({
     if (!confirm(`Remove frame ${frameIdx} from inference state? This clears its point prompts.`)) return
     setRemoving(true)
     try {
+      const st = useStore.getState()
+      const perObj: Record<string, { points: [number, number][]; labels: number[] }> = {}
+      for (const [objId, prompt] of Object.entries(objPrompts)) {
+        perObj[objId] = { points: [...prompt.points], labels: [...prompt.labels] }
+      }
+      const laSnap = JSON.parse(JSON.stringify(st.localAnnotations)) as typeof st.localAnnotations
+      const fKey = String(frameIdx)
+
       await clearFramePrompts(pid, vid, frameIdx)
-      onRemove(frameIdx)
+
+      const la = JSON.parse(JSON.stringify(st.localAnnotations)) as typeof st.localAnnotations
+      for (const objId of Object.keys(la)) {
+        if (la[objId]?.[fKey]) {
+          delete la[objId][fKey]
+          if (Object.keys(la[objId]).length === 0) delete la[objId]
+        }
+      }
+      useStore.setState({ localAnnotations: la })
+      useStore.getState().updateVideo({ point_prompts: localAnnotationsToPointPrompts(la) })
+
+      useStore.getState().pushHistory({
+        labelUndo: 'Clear frame prompts',
+        labelRedo: 'Clear frame prompts',
+        undo: async () => {
+          for (const [objId, pr] of Object.entries(perObj)) {
+            await replaceFramePromptsData(pid, vid, objId, frameIdx, pr.points, pr.labels)
+          }
+          const restored = JSON.parse(JSON.stringify(laSnap)) as typeof laSnap
+          useStore.setState({ localAnnotations: restored })
+          useStore.getState().updateVideo({ point_prompts: localAnnotationsToPointPrompts(restored) })
+          const anchorNow = useStore.getState().anchorPhase
+          const rb = await rebuildFromConfig(pid, vid, [frameIdx], anchorNow, anchorNow ? frameIdx : null)
+          applyRebuildMasksToStore(rb.masks_by_frame)
+        },
+        redo: async () => {
+          await clearFramePrompts(pid, vid, frameIdx)
+          const la2 = JSON.parse(JSON.stringify(useStore.getState().localAnnotations)) as typeof st.localAnnotations
+          for (const oid of Object.keys(la2)) {
+            if (la2[oid]?.[fKey]) {
+              delete la2[oid][fKey]
+              if (Object.keys(la2[oid]).length === 0) delete la2[oid]
+            }
+          }
+          useStore.setState({ localAnnotations: la2 })
+          useStore.getState().updateVideo({ point_prompts: localAnnotationsToPointPrompts(la2) })
+        },
+      })
+
+      onRemove()
     } catch {
+      setRemoving(false)
+    } finally {
       setRemoving(false)
     }
   }

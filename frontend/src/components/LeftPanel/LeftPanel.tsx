@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react'
-import { Plus, RotateCcw, ChevronRight, ChevronDown, Loader, Download, X, Pause, Play, SkipBack, SkipForward, Trash2, GripVertical, ArrowLeftRight } from 'lucide-react'
+import { Plus, RotateCcw, ChevronRight, ChevronDown, Loader, Download, X, Pause, Play, SkipBack, SkipForward, Trash2, GripVertical, ArrowLeftRight, Undo2, Redo2 } from 'lucide-react'
 import { useStore, currentVideo as selectCurrentVideo } from '../../store/useStore'
 import {
   addObject, initSession, startPropagationSSE, startExportSSE, getProject, resetVideo,
@@ -9,6 +9,7 @@ import {
   continueAnchorRemainderReview,
   getSavedMask,
   extractFrame,
+  restoreMaskFrames,
   type ClearMasksMode,
 } from '../../api/client'
 import { getObjectColor } from '../../utils/colors'
@@ -44,6 +45,7 @@ export default function LeftPanel() {
     setAnchorRemainderAwaitingCommit,
     setAnnotatedAnchorIndices,
     invalidateSavedMaskFrame,
+    undoStack, redoStack, historyBusy, undoLast, redoLast,
   } = store
 
   const [addingObject, setAddingObject] = useState(false)
@@ -624,6 +626,28 @@ export default function LeftPanel() {
       clearSavedMaskCache()
       clearMaskCache()
       addToast(`Swapped masks for ${result.frames_swapped} frame(s)`, 'success')
+      const a = swapObjA
+      const b = swapObjB
+      const sf = fromF
+      const st = toF
+      useStore.getState().pushHistory({
+        labelUndo: 'Swap masks',
+        labelRedo: 'Swap masks',
+        undo: async () => {
+          try {
+            await swapObjectMasks(pid, vid, a, b, sf, st)
+            clearSavedMaskCache()
+            clearMaskCache()
+          } catch { /* ignore */ }
+        },
+        redo: async () => {
+          try {
+            await swapObjectMasks(pid, vid, a, b, sf, st)
+            clearSavedMaskCache()
+            clearMaskCache()
+          } catch { /* ignore */ }
+        },
+      })
     } catch (e: unknown) {
       const msg = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail ?? 'Swap failed'
       addToast(msg, 'error')
@@ -891,6 +915,36 @@ export default function LeftPanel() {
     _saveStartFrame(clamped)
   }
 
+  async function _snapshotMasksForFrames(frames: number[]) {
+    type MaskData = Record<string, string>
+    const out: Record<string, MaskData> = {}
+    for (const f of frames) {
+      try {
+        const d = await getSavedMask(pid, vid, f)
+        if (d.masks && Object.keys(d.masks).length > 0) out[String(f)] = d.masks
+      } catch { /* empty frame */ }
+    }
+    return out
+  }
+
+  function _framesToSnapshotForClear(mode: ClearMasksMode | 'this_frame'): number[] {
+    const cap = (video?.num_frames ?? 1) - 1
+    const f0 = currentFrame
+    if (mode === 'this_frame') return [f0]
+    const pool = new Set<number>([...(video?.propagated_frames ?? [])])
+    for (const k of Object.keys(savedMaskCache)) pool.add(Number(k))
+    const sorted = [...pool].filter(f => f >= 0 && f <= cap).sort((a, b) => a - b)
+    if (mode === 'from_frame') return sorted.filter(f => f >= f0)
+    if (mode === 'all') return sorted
+    if (mode === 'range') {
+      const from = parseInt(clearRangeFrom)
+      const to = parseInt(clearRangeTo)
+      if (isNaN(from) || isNaN(to)) return []
+      return sorted.filter(f => f >= from && f <= to)
+    }
+    return []
+  }
+
   // ── Clear Masks ──────────────────────────────────────────────────────────────
 
   function handleClearFrameMasks() {
@@ -899,6 +953,11 @@ export default function LeftPanel() {
 
   async function handleConfirmClearMasks(mode: ClearMasksMode | 'this_frame') {
     setShowClearMasksModal(false)
+    const frames = _framesToSnapshotForClear(mode)
+    const snapshots = await _snapshotMasksForFrames(frames)
+    const f0 = currentFrame
+    const rangeFrom = parseInt(clearRangeFrom)
+    const rangeTo = parseInt(clearRangeTo)
     try {
       if (mode === 'this_frame') {
         await clearFrameMasks(pid, vid, currentFrame)
@@ -918,6 +977,32 @@ export default function LeftPanel() {
       const fresh = await getProject(pid)
       setProject(fresh)
       addToast('Masks cleared', 'success')
+      useStore.getState().pushHistory({
+        labelUndo: 'Clear masks',
+        labelRedo: 'Clear masks',
+        undo: async () => {
+          if (Object.keys(snapshots).length === 0) return
+          await restoreMaskFrames(pid, vid, snapshots)
+          clearMaskCache()
+          setProject(await getProject(pid))
+        },
+        redo: async () => {
+          try {
+            if (mode === 'this_frame') {
+              await clearFrameMasks(pid, vid, f0)
+              setSavedMask(f0, {})
+            } else if (mode === 'from_frame') {
+              await clearMasksBulk(pid, vid, 'from_frame', f0)
+            } else if (mode === 'range' && !isNaN(rangeFrom) && !isNaN(rangeTo)) {
+              await clearMasksBulk(pid, vid, 'range', rangeFrom, rangeTo)
+            } else if (mode === 'all') {
+              await clearMasksBulk(pid, vid, 'all')
+            }
+          } catch { /* ignore */ }
+          clearMaskCache()
+          setProject(await getProject(pid))
+        },
+      })
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : 'Failed to clear masks'
       addToast(msg, 'error')
@@ -1276,134 +1361,163 @@ export default function LeftPanel() {
         </div>
       )}
 
-      {/* Bottom buttons */}
-      <div
-        className="flex items-stretch gap-1 px-1.5 py-1 border-t border-[#2a2a2a] flex-shrink-0 overflow-hidden"
-        style={{ containerType: 'inline-size' } as React.CSSProperties}
-      >
-        <button
-          onClick={handleStartOver}
-          disabled={isTracking}
-          className="btn btn-ghost flex-1 min-w-0 flex flex-col items-center justify-center gap-0.5 px-0.5 py-2"
-          style={{ fontSize: 'clamp(7px, 4cqi, 11px)', lineHeight: 1.2 }}
+      {/* Bottom buttons — two rows so controls are not squeezed in one line */}
+      <div className="flex flex-col gap-1 px-1.5 py-1 border-t border-[#2a2a2a] flex-shrink-0 min-w-0">
+        <div
+          className="flex items-stretch gap-1 w-full min-w-0"
+          style={{ containerType: 'inline-size' } as React.CSSProperties}
         >
-          <RotateCcw size={10} />
-          <span>Start</span>
-          <span>over</span>
-        </button>
-
-        {(video.propagated_frames?.length ?? 0) > 0 && (
           <button
-            onClick={handleExport}
-            disabled={exportStatus === 'running' || isTracking}
-            className="btn btn-ghost flex-1 min-w-0 flex flex-col items-center justify-center gap-0.5 px-0.5 py-2 disabled:opacity-40"
-            style={{ fontSize: 'clamp(7px, 4cqi, 11px)', lineHeight: 1.2 }}
-            title="Export annotated MP4"
+            type="button"
+            onClick={() => void undoLast()}
+            disabled={!video || undoStack.length === 0 || isTracking || historyBusy}
+            className="btn btn-ghost flex-1 min-w-0 flex flex-col items-center justify-center gap-0.5 px-1 py-2 disabled:opacity-40"
+            style={{ fontSize: 'clamp(8px, 5cqi, 12px)', lineHeight: 1.2 }}
+            title="Undo"
           >
-            {exportStatus === 'running'
-              ? <Loader size={10} className="animate-spin" />
-              : <Download size={10} />
-            }
-            <span>Export</span>
+            <Undo2 size={10} />
+            <span>Undo</span>
           </button>
-        )}
-
-        {savedMaskCache[currentFrame] && Object.keys(savedMaskCache[currentFrame]).length > 0 && (
           <button
-            onClick={handleClearFrameMasks}
+            type="button"
+            onClick={() => void redoLast()}
+            disabled={!video || redoStack.length === 0 || isTracking || historyBusy}
+            className="btn btn-ghost flex-1 min-w-0 flex flex-col items-center justify-center gap-0.5 px-1 py-2 disabled:opacity-40"
+            style={{ fontSize: 'clamp(8px, 5cqi, 12px)', lineHeight: 1.2 }}
+            title="Redo"
+          >
+            <Redo2 size={10} />
+            <span>Redo</span>
+          </button>
+
+          <button
+            onClick={handleStartOver}
             disabled={isTracking}
-            className="btn btn-ghost flex-1 min-w-0 flex flex-col items-center justify-center gap-0.5 px-0.5 py-2 disabled:opacity-40 text-red-400 hover:text-red-300"
-            style={{ fontSize: 'clamp(7px, 4cqi, 11px)', lineHeight: 1.2 }}
-            title={`Clear saved masks for frame ${currentFrame}`}
+            className="btn btn-ghost flex-1 min-w-0 flex flex-col items-center justify-center gap-0.5 px-1 py-2"
+            style={{ fontSize: 'clamp(8px, 5cqi, 12px)', lineHeight: 1.2 }}
           >
-            <Trash2 size={10} />
-            <span>Clear</span>
-            <span>masks</span>
-          </button>
-        )}
-
-        {objects.length >= 2 && !isTracking && (
-          <button
-            onClick={() => {
-              setSwapObjA(objects[0]?.id ?? '')
-              setSwapObjB(objects[1]?.id ?? '')
-              setSwapMaskScope('current')
-              setShowSwapModal(true)
-            }}
-            disabled={anchorRemainderInferencing && !anchorRemainderAwaitingCommit}
-            className="btn btn-ghost flex-1 min-w-0 flex flex-col items-center justify-center gap-0.5 px-0.5 py-2 disabled:opacity-40"
-            style={{ fontSize: 'clamp(7px, 4cqi, 11px)', lineHeight: 1.2 }}
-            title="Swap two objects' masks (saved .npz on disk for selected frame range)"
-          >
-            <ArrowLeftRight size={10} />
-            <span>Swap</span>
-            <span>masks</span>
-          </button>
-        )}
-
-        {/* Anchor annotation / track button */}
-        {isTracking ? (
-          <button
-            onClick={handlePause}
-            className="btn btn-ghost flex-1 min-w-0 flex flex-col items-center justify-center gap-0.5 px-0.5 py-2 text-amber-400 hover:text-amber-300"
-            style={{ fontSize: 'clamp(7px, 4cqi, 11px)', lineHeight: 1.2 }}
-          >
-            <Pause size={10} />
-            <span>Pause</span>
-          </button>
-        ) : anchorPhase ? (
-          <button
-            onClick={handleCommitAnchor}
-            disabled={!hasObjects || (anchorRemainderInferencing && !anchorRemainderAwaitingCommit)}
-            className="btn btn-primary flex-1 min-w-0 flex flex-col items-center justify-center gap-0.5 px-0.5 py-2 disabled:opacity-40"
-            style={{ fontSize: 'clamp(7px, 4cqi, 11px)', lineHeight: 1.2 }}
-          >
-            <ChevronDown size={10} />
-            <span>Done,</span>
-            <span>next</span>
-          </button>
-        ) : allAnchorsLabeled ? (
-          <button
-            onClick={handleStartTracking}
-            disabled={!hasObjects}
-            className="btn btn-primary flex-1 min-w-0 flex flex-col items-center justify-center gap-0.5 px-0.5 py-2 disabled:opacity-40"
-            style={{ fontSize: 'clamp(7px, 4cqi, 11px)', lineHeight: 1.2 }}
-          >
-            <ChevronRight size={10} />
+            <RotateCcw size={10} />
             <span>Start</span>
-            <span>tracking</span>
+            <span>over</span>
           </button>
-        ) : (
-          <>
+
+          {(video.propagated_frames?.length ?? 0) > 0 && (
             <button
-              onClick={handleStartAnchorAnnotation}
-              disabled={!hasObjects || initializingSession || isPaused}
-              className="btn btn-secondary flex-1 min-w-0 flex flex-col items-center justify-center gap-0.5 px-0.5 py-2 disabled:opacity-40"
-              style={{ fontSize: 'clamp(7px, 4cqi, 11px)', lineHeight: 1.2 }}
+              onClick={handleExport}
+              disabled={exportStatus === 'running' || isTracking}
+              className="btn btn-ghost flex-1 min-w-0 flex flex-col items-center justify-center gap-0.5 px-1 py-2 disabled:opacity-40"
+              style={{ fontSize: 'clamp(8px, 5cqi, 12px)', lineHeight: 1.2 }}
+              title="Export annotated MP4"
             >
-              {initializingSession
+              {exportStatus === 'running'
                 ? <Loader size={10} className="animate-spin" />
-                : <ChevronRight size={10} />
+                : <Download size={10} />
               }
-              <span>Annotate</span>
-              <span>anchors</span>
+              <span>Export</span>
             </button>
+          )}
+
+          {savedMaskCache[currentFrame] && Object.keys(savedMaskCache[currentFrame]).length > 0 && (
+            <button
+              onClick={handleClearFrameMasks}
+              disabled={isTracking}
+              className="btn btn-ghost flex-1 min-w-0 flex flex-col items-center justify-center gap-0.5 px-1 py-2 disabled:opacity-40 text-red-400 hover:text-red-300"
+              style={{ fontSize: 'clamp(8px, 5cqi, 12px)', lineHeight: 1.2 }}
+              title={`Clear saved masks for frame ${currentFrame}`}
+            >
+              <Trash2 size={10} />
+              <span>Clear</span>
+              <span>masks</span>
+            </button>
+          )}
+
+          {objects.length >= 2 && !isTracking && (
             <button
               onClick={() => {
-                setTrackRangeStart(String(propagationStartFrame))
-                setTrackRangeEnd(String((video?.num_frames ?? 1) - 1))
-                setShowTrackRangeModal(true)
+                setSwapObjA(objects[0]?.id ?? '')
+                setSwapObjB(objects[1]?.id ?? '')
+                setSwapMaskScope('current')
+                setShowSwapModal(true)
               }}
-              disabled={!hasObjects || initializingSession || isPaused}
-              className="btn btn-primary flex-1 min-w-0 flex flex-col items-center justify-center gap-0.5 px-0.5 py-2 disabled:opacity-40"
-              style={{ fontSize: 'clamp(7px, 4cqi, 11px)', lineHeight: 1.2 }}
+              disabled={anchorRemainderInferencing && !anchorRemainderAwaitingCommit}
+              className="btn btn-ghost flex-1 min-w-0 flex flex-col items-center justify-center gap-0.5 px-1 py-2 disabled:opacity-40"
+              style={{ fontSize: 'clamp(8px, 5cqi, 12px)', lineHeight: 1.2 }}
+              title="Swap two objects' masks (saved .npz on disk for selected frame range)"
+            >
+              <ArrowLeftRight size={10} />
+              <span>Swap</span>
+              <span>masks</span>
+            </button>
+          )}
+        </div>
+
+        <div
+          className="flex items-stretch gap-1 w-full min-w-0"
+          style={{ containerType: 'inline-size' } as React.CSSProperties}
+        >
+          {isTracking ? (
+            <button
+              onClick={handlePause}
+              className="btn btn-ghost flex-1 min-w-0 flex flex-col items-center justify-center gap-0.5 px-1 py-2 text-amber-400 hover:text-amber-300"
+              style={{ fontSize: 'clamp(8px, 5cqi, 12px)', lineHeight: 1.2 }}
+            >
+              <Pause size={10} />
+              <span>Pause</span>
+            </button>
+          ) : anchorPhase ? (
+            <button
+              onClick={handleCommitAnchor}
+              disabled={!hasObjects || (anchorRemainderInferencing && !anchorRemainderAwaitingCommit)}
+              className="btn btn-primary flex-1 min-w-0 flex flex-col items-center justify-center gap-0.5 px-1 py-2 disabled:opacity-40"
+              style={{ fontSize: 'clamp(8px, 5cqi, 12px)', lineHeight: 1.2 }}
+            >
+              <ChevronDown size={10} />
+              <span>Done,</span>
+              <span>next</span>
+            </button>
+          ) : allAnchorsLabeled ? (
+            <button
+              onClick={handleStartTracking}
+              disabled={!hasObjects}
+              className="btn btn-primary flex-1 min-w-0 flex flex-col items-center justify-center gap-0.5 px-1 py-2 disabled:opacity-40"
+              style={{ fontSize: 'clamp(8px, 5cqi, 12px)', lineHeight: 1.2 }}
             >
               <ChevronRight size={10} />
-              <span>Track</span>
-              <span>frames</span>
+              <span>Start</span>
+              <span>tracking</span>
             </button>
-          </>
-        )}
+          ) : (
+            <>
+              <button
+                onClick={handleStartAnchorAnnotation}
+                disabled={!hasObjects || initializingSession || isPaused}
+                className="btn btn-secondary flex-1 min-w-0 flex flex-col items-center justify-center gap-0.5 px-1 py-2 disabled:opacity-40"
+                style={{ fontSize: 'clamp(8px, 5cqi, 12px)', lineHeight: 1.2 }}
+              >
+                {initializingSession
+                  ? <Loader size={10} className="animate-spin" />
+                  : <ChevronRight size={10} />
+                }
+                <span>Annotate</span>
+                <span>anchors</span>
+              </button>
+              <button
+                onClick={() => {
+                  setTrackRangeStart(String(propagationStartFrame))
+                  setTrackRangeEnd(String((video?.num_frames ?? 1) - 1))
+                  setShowTrackRangeModal(true)
+                }}
+                disabled={!hasObjects || initializingSession || isPaused}
+                className="btn btn-primary flex-1 min-w-0 flex flex-col items-center justify-center gap-0.5 px-1 py-2 disabled:opacity-40"
+                style={{ fontSize: 'clamp(8px, 5cqi, 12px)', lineHeight: 1.2 }}
+              >
+                <ChevronRight size={10} />
+                <span>Track</span>
+                <span>frames</span>
+              </button>
+            </>
+          )}
+        </div>
       </div>
 
       {/* Anchor remainder: SAM work or fetching masks before review chip */}

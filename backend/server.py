@@ -37,6 +37,7 @@ from mask_store import VideoMaskStorage
 from video_processor import (
     compute_ds_dims,
     composite_masks_as_png,
+    decode_masks_png_base64_to_binary,
     encode_mask_as_png,
     ensure_faststart,
     export_video_with_masks,
@@ -1361,6 +1362,69 @@ def get_session_state(pid: str, vid: str):
     }
 
 
+class RebuildSessionRequest(BaseModel):
+    return_masks_for_frames: list[int] = []
+    anchor_mode: bool = False
+    anchor_frame: Optional[int] = None
+
+
+@app.post("/api/projects/{pid}/videos/{vid}/session/rebuild_from_config")
+def rebuild_session_from_config(pid: str, vid: str, req: RebuildSessionRequest):
+    """
+    Re-initialize SAM from annotated_frames and replay all point prompts from config.
+    Optionally re-encode and persist masks for requested frames (for undo/redo).
+    """
+    video = pm.get_video(pid, vid)
+    if video is None:
+        raise HTTPException(404, "Video not found")
+
+    prop_state = _get_prop_state(pid, vid)
+    if prop_state is not None and prop_state.is_running:
+        raise HTTPException(409, "Propagation is running — pause first before rebuilding session.")
+
+    ann_dir_path = pm.annotated_frames_dir(pid, vid)
+    ann_dir = str(ann_dir_path)
+    if not ann_dir_path.exists() or not list(ann_dir_path.glob("*.jpg")):
+        raise HTTPException(400, "No annotated frames extracted yet. Extract a frame first.")
+
+    try:
+        if req.anchor_mode and req.anchor_frame is not None:
+            af = req.anchor_frame
+            start_f = video.get("start_frame", 0)
+            num_frames_v = video["num_frames"]
+            anchor_frames = compute_anchor_frames(start_f, num_frames_v, STREAM_BATCH_SIZE)
+            if af not in anchor_frames:
+                raise HTTPException(
+                    409,
+                    f"Anchor mode: frame {af} is not an anchor frame (anchors: {anchor_frames}).",
+                )
+            last_out = _anchor_session_reinit_and_replay_frame(pid, vid, af, ann_dir_path)
+        else:
+            last_out = _full_ann_session_reinit_and_replay(
+                pid, vid, ann_dir, collect_last_outputs=True
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"rebuild_from_config failed: {e}", exc_info=True)
+        raise HTTPException(500, f"Session rebuild failed: {e}")
+
+    video = pm.get_video(pid, vid) or video
+    objects = video["objects"]
+    masks_by_frame: dict[str, dict[str, str]] = {}
+    for fidx in req.return_masks_for_frames:
+        fo = last_out.get(fidx)
+        if not fo:
+            continue
+        mask_b64, raw_masks = _encode_masks_from_sam_frame_output(fo, objects)
+        if raw_masks:
+            _persist_merged_masks_for_frame(pid, vid, fidx, raw_masks)
+        if mask_b64:
+            masks_by_frame[str(fidx)] = mask_b64
+
+    return {"status": "ok", "masks_by_frame": masks_by_frame}
+
+
 # ─── Objects ──────────────────────────────────────────────────────────────────
 
 class AddObjectRequest(BaseModel):
@@ -1411,6 +1475,93 @@ def remove_object(pid: str, vid: str, oid: str):
     pm.remove_object(pid, vid, oid)
 
 
+class RestoreObjectRequest(BaseModel):
+    object: dict
+    point_prompts: dict = {}
+    instance_group: Optional[list] = None
+
+
+@app.post("/api/projects/{pid}/videos/{vid}/objects/restore")
+def restore_object_snapshot(pid: str, vid: str, req: RestoreObjectRequest):
+    """Restore object metadata + point prompts + instance_groups (undo of delete)."""
+    video = pm.get_video(pid, vid)
+    if video is None:
+        raise HTTPException(404, "Video not found")
+    oid_raw = req.object.get("id")
+    oid = str(oid_raw) if oid_raw is not None else ""
+    if not oid:
+        raise HTTPException(422, "object.id is required")
+    try:
+        pm.restore_object_entry(
+            pid, vid, oid,
+            req.object,
+            req.point_prompts if req.point_prompts else None,
+            req.instance_group,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"status": "ok"}
+
+
+class RestoreMasksRequest(BaseModel):
+    """frame index (string) -> obj_id -> base64 PNG (same as GET masks)."""
+    frames: dict[str, dict[str, str]]
+
+
+@app.post("/api/projects/{pid}/videos/{vid}/masks/restore_frames")
+def restore_mask_frames(pid: str, vid: str, req: RestoreMasksRequest):
+    if not req.frames:
+        return {"status": "ok", "restored": 0}
+    video = pm.get_video(pid, vid)
+    if video is None:
+        raise HTTPException(404, "Video not found")
+    ms = VideoMaskStorage(pm.video_dir(pid, vid))
+    n = 0
+    for fidx_str, masks_b64 in req.frames.items():
+        try:
+            fidx = int(fidx_str)
+        except ValueError:
+            continue
+        dense = decode_masks_png_base64_to_binary(masks_b64)
+        if dense:
+            ms.save_frame(fidx, dense, None)
+        else:
+            ms.delete_frame(fidx)
+        n += 1
+    _invalidate_mask_cache(pid, vid)
+    return {"status": "ok", "restored": n}
+
+
+class ReplaceFramePromptsRequest(BaseModel):
+    points: list
+    labels: list
+
+
+@app.put("/api/projects/{pid}/videos/{vid}/objects/{oid}/frames/{frame_idx}/prompts")
+def replace_object_frame_prompts(pid: str, vid: str, oid: str, frame_idx: int, req: ReplaceFramePromptsRequest):
+    """
+    Set or clear point prompts for one object on one frame (config only).
+    Use session/rebuild_from_config afterward to refresh SAM + masks.
+    """
+    video = pm.get_video(pid, vid)
+    if video is None:
+        raise HTTPException(404, "Video not found")
+    prop_state = _get_prop_state(pid, vid)
+    if prop_state is not None and prop_state.is_running:
+        raise HTTPException(409, "Propagation is running — pause first.")
+    if not req.points:
+        pm.clear_object_frame_prompt(pid, vid, oid, frame_idx)
+        ms = VideoMaskStorage(pm.video_dir(pid, vid))
+        if ms.has_masks(frame_idx):
+            existing = ms.load_masks_dense(frame_idx)
+            remaining = {k: v for k, v in existing.items() if k != oid}
+            ms.save_frame(frame_idx, remaining, None)
+            _invalidate_mask_cache(pid, vid)
+    else:
+        pm.save_point_prompts(pid, vid, oid, frame_idx, req.points, req.labels)
+    return {"status": "ok"}
+
+
 # ─── Points / Masks ──────────────────────────────────────────────────────────
 
 class AddPointsRequest(BaseModel):
@@ -1421,11 +1572,13 @@ class AddPointsRequest(BaseModel):
     anchor_mode: bool = False   # when True: fresh single-frame session, no cross-frame replay
 
 
-def _replay_prompts(pid: str, vid: str, all_prompts: dict) -> tuple[list, set]:
+def _replay_prompts(
+    pid: str, vid: str, all_prompts: dict, *, collect_last_outputs: bool = False
+) -> tuple[list, set, dict[int, dict]]:
     """Replay saved point prompts into the current SAM session (sorted by frame index).
 
-    Returns (items, replayed_obj_ids) where replayed_obj_ids is the set of obj ID strings
-    that had at least one point prompt replayed.
+    Returns (items, replayed_obj_ids, last_outputs_by_frame) where last_outputs_by_frame maps
+    real frame index -> latest SAM output dict for that frame from the replay loop.
 
     Object IDs can be integers (e.g., "1") or instance keys (e.g., "1_1", "1_2").
     For SAM's obj_id parameter, we use a unique integer derived from the key.
@@ -1434,12 +1587,6 @@ def _replay_prompts(pid: str, vid: str, all_prompts: dict) -> tuple[list, set]:
     items: list[tuple[int, str, int, dict]] = []  # (frame_idx, obj_id_str, sam_obj_id, prompt)
 
     def _to_sam_obj_id(obj_id_str: str) -> int:
-        """Convert object ID string to SAM integer obj_id.
-
-        "1" -> 1
-        "1_1" -> 1001 (base * 1000 + instance)
-        "1_2" -> 1002
-        """
         if "_" in obj_id_str:
             parts = obj_id_str.split("_")
             base = int(parts[0])
@@ -1459,21 +1606,127 @@ def _replay_prompts(pid: str, vid: str, all_prompts: dict) -> tuple[list, set]:
     logger.info(f"=== VISUAL PROMPTS (points) replay: {len(items)} prompts ===")
 
     replayed_obj_ids: set[str] = set()
+    last_outputs_by_frame: dict[int, dict] = {}
     for rf, obj_id_str, sam_oid, prompt in items:
         try:
             points = prompt["points"]
             labels = prompt["labels"]
             logger.info(f"  obj {obj_id_str} (sam_id={sam_oid}), frame {rf}: points={points}, labels={labels}")
-            # SAM3 tracker mode doesn't support text with points
-            sam.add_points(pid, vid, frame_idx=rf, obj_id=sam_oid,
-                           points=points, labels=labels,
-                           text=None)
+            out = sam.add_points(
+                pid, vid, frame_idx=rf, obj_id=sam_oid, points=points, labels=labels, text=None
+            )
             replayed_obj_ids.add(obj_id_str)
+            if collect_last_outputs and out:
+                for fk, fo in out.items():
+                    if isinstance(fk, int):
+                        last_outputs_by_frame[fk] = fo
+                    else:
+                        try:
+                            last_outputs_by_frame[int(fk)] = fo
+                        except (TypeError, ValueError):
+                            pass
         except Exception as e:
             logger.warning(f"Predict replay: obj {obj_id_str} frame {rf}: {e}")
 
     logger.info(f"  -> Replayed obj IDs with visual prompts: {replayed_obj_ids}")
-    return items, replayed_obj_ids
+    return items, replayed_obj_ids, last_outputs_by_frame
+
+
+def _encode_masks_from_sam_frame_output(
+    frame_outputs: dict, objects: dict
+) -> tuple[dict[str, str], dict[str, np.ndarray]]:
+    """Turn SAM add_points output for one frame into base64 PNGs and raw uint8 masks."""
+    mask_b64: dict[str, str] = {}
+    raw_masks: dict[str, np.ndarray] = {}
+    obj_ids = frame_outputs.get("out_obj_ids", [])
+    masks = frame_outputs.get("out_binary_masks", [])
+    for i, obj_id in enumerate(obj_ids):
+        mask = masks[i] if i < len(masks) else None
+        if mask is None:
+            continue
+        if hasattr(mask, "numpy"):
+            mask = mask.numpy()
+        mask = np.squeeze(mask)
+        oid_str = str(obj_id)
+        raw_masks[oid_str] = mask
+        obj_color = _get_instance_color(oid_str, objects)
+        mask_b64[oid_str] = encode_mask_as_png(mask, obj_color)
+    return mask_b64, raw_masks
+
+
+def _persist_merged_masks_for_frame(
+    pid: str, vid: str, frame_idx: int, raw_masks: dict[str, np.ndarray]
+) -> None:
+    if not raw_masks:
+        return
+    ms = VideoMaskStorage(pm.video_dir(pid, vid))
+    existing = ms.load_masks_dense(frame_idx)
+    merged = {**existing, **{str(k): np.asarray(v) for k, v in raw_masks.items()}}
+    ms.save_frame(frame_idx, merged, None)
+    _invalidate_mask_cache(pid, vid)
+
+
+def _full_ann_session_reinit_and_replay(
+    pid: str, vid: str, ann_dir: str, *, collect_last_outputs: bool
+) -> dict[int, dict]:
+    """init_session(annotated_frames dir) + replay all point prompts from config."""
+    session_id = sam.init_session(pid, vid, ann_dir)
+    pm.update_video(pid, vid, {"sam3_session_id": session_id})
+    all_prompts = pm.get_all_point_prompts(pid, vid)
+    _, _, last_out = _replay_prompts(pid, vid, all_prompts, collect_last_outputs=collect_last_outputs)
+    return last_out
+
+
+def _anchor_session_reinit_and_replay_frame(
+    pid: str, vid: str, frame_idx: int, ann_dir_path: Path
+) -> dict[int, dict]:
+    """Single-frame anchor session: tmp dir with one jpg, replay all prompts on frame_idx."""
+    frame_jpg = ann_dir_path / f"{frame_idx:06d}.jpg"
+    if not frame_jpg.exists():
+        raise HTTPException(400, f"Frame {frame_idx} not yet extracted.")
+    tmp_ann = tempfile.mkdtemp(prefix="sam3wt_anchor_ann_")
+    try:
+        shutil.copy2(str(frame_jpg), str(Path(tmp_ann) / frame_jpg.name))
+        session_id = sam.init_session(pid, vid, tmp_ann)
+        pm.update_video(pid, vid, {"sam3_session_id": session_id})
+    except Exception as e:
+        shutil.rmtree(tmp_ann, ignore_errors=True)
+        raise HTTPException(500, f"SAM session init failed: {e}")
+    finally:
+        shutil.rmtree(tmp_ann, ignore_errors=True)
+
+    all_prompts = pm.get_all_point_prompts(pid, vid)
+    key = str(frame_idx)
+    replay_items: list[tuple[str, dict]] = []
+    for obj_id_str, frame_map_prompts in all_prompts.items():
+        if key in frame_map_prompts:
+            replay_items.append((obj_id_str, frame_map_prompts[key]))
+    replay_items.sort(key=lambda x: x[0])
+
+    last_outputs_by_frame: dict[int, dict] = {}
+    for obj_id_str, prompt in replay_items:
+        sam_oid = _to_sam_obj_id_from_npz_key(obj_id_str)
+        try:
+            out = sam.add_points(
+                pid, vid,
+                frame_idx=frame_idx,
+                obj_id=sam_oid,
+                points=prompt["points"],
+                labels=prompt["labels"],
+                text=None,
+            )
+            if out:
+                for fk, fo in out.items():
+                    if isinstance(fk, int):
+                        last_outputs_by_frame[fk] = fo
+                    else:
+                        try:
+                            last_outputs_by_frame[int(fk)] = fo
+                        except (TypeError, ValueError):
+                            pass
+        except Exception as e:
+            logger.warning(f"anchor replay obj {obj_id_str} frame {frame_idx}: {e}")
+    return last_outputs_by_frame
 
 
 @app.post("/api/projects/{pid}/videos/{vid}/objects/{oid}/points")
@@ -1580,37 +1833,13 @@ def add_points(pid: str, vid: str, oid: str, req: AddPointsRequest):
 
         if need_reinit:
             try:
-                session_id = sam.init_session(pid, vid, ann_dir)
-                pm.update_video(pid, vid, {"sam3_session_id": session_id})
+                _full_ann_session_reinit_and_replay(
+                    pid, vid, ann_dir, collect_last_outputs=False
+                )
+            except HTTPException:
+                raise
             except Exception as e:
                 raise HTTPException(500, f"SAM session init failed: {e}")
-
-            # Replay all previously saved point prompts so SAM knows about every
-            # object annotated on earlier frames.  Sort by frame index — SAM3
-            # requires sequential order or raises "Image features for frame N are
-            # not cached" errors.
-            all_prompts = pm.get_all_point_prompts(pid, vid)
-            frame_map = sam._frame_maps.get((pid, vid), [])
-            replay_items: list[tuple[int, int, dict]] = []
-            for obj_id_str, frame_map_prompts in all_prompts.items():
-                for fidx_str, prompt in frame_map_prompts.items():
-                    replay_fidx = int(fidx_str)
-                    if replay_fidx in frame_map:
-                        replay_items.append((replay_fidx, _to_sam_obj_id_from_npz_key(obj_id_str), prompt))
-            replay_items.sort(key=lambda x: x[0])
-            for replay_fidx, replay_obj_id, prompt in replay_items:
-                try:
-                    sam.add_points(
-                        pid, vid,
-                        frame_idx=replay_fidx,
-                        obj_id=replay_obj_id,
-                        points=prompt["points"],
-                        labels=prompt["labels"],
-                        text=None,
-                    )
-                    logger.debug(f"Replayed prompts for obj {replay_obj_id} on frame {replay_fidx}")
-                except Exception as e:
-                    logger.warning(f"Failed to replay prompts for obj {replay_obj_id} frame {replay_fidx}: {e}")
 
     # Save prompts to config
     pm.save_point_prompts(pid, vid, oid, req.frame_idx, req.points, req.labels)
@@ -1632,41 +1861,14 @@ def add_points(pid: str, vid: str, oid: str, req: AddPointsRequest):
         logger.error(f"SAM add_points error: {e}\n{traceback.format_exc()}")
         raise HTTPException(500, f"SAM inference error: {e}")
 
-    # Encode masks as base64 PNGs and collect raw binary masks for persistence
     objects = video["objects"]
-    mask_b64: dict[str, str] = {}
-    raw_masks: dict[str, np.ndarray] = {}
-
     frame_outputs = outputs.get(req.frame_idx, outputs.get(str(req.frame_idx), {}))
     if not frame_outputs and outputs:
-        # SAM3 might key by int or string
         first_key = next(iter(outputs))
         frame_outputs = outputs[first_key]
 
-    obj_ids = frame_outputs.get("out_obj_ids", [])
-    masks = frame_outputs.get("out_binary_masks", [])
-
-    for i, obj_id in enumerate(obj_ids):
-        mask = masks[i] if i < len(masks) else None
-        if mask is None:
-            continue
-        # Squeeze to (H, W)
-        if hasattr(mask, "numpy"):
-            mask = mask.numpy()
-        mask = np.squeeze(mask)
-        raw_masks[str(obj_id)] = mask
-        obj_color = _get_instance_color(str(obj_id), objects)
-        mask_b64[str(obj_id)] = encode_mask_as_png(mask, obj_color)
-
-    # Persist updated masks to disk so they replace any previously propagated
-    # masks for this frame.  Merge with existing npz so objects not yet in the
-    # current session still retain their saved masks.
-    if raw_masks:
-        ms = VideoMaskStorage(pm.video_dir(pid, vid))
-        existing = ms.load_masks_dense(req.frame_idx)
-        merged = {**existing, **{str(k): np.asarray(v) for k, v in raw_masks.items()}}
-        ms.save_frame(req.frame_idx, merged, None)
-        _invalidate_mask_cache(pid, vid)
+    mask_b64, raw_masks = _encode_masks_from_sam_frame_output(frame_outputs, objects)
+    _persist_merged_masks_for_frame(pid, vid, req.frame_idx, raw_masks)
 
     return {"frame_idx": req.frame_idx, "masks": mask_b64}
 

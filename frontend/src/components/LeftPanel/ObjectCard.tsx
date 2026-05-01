@@ -1,7 +1,8 @@
 import React, { useState, useEffect } from 'react'
 import { Pencil, Trash2, MousePointer, MinusCircle, Check, ChevronDown, ChevronUp, Save, Loader } from 'lucide-react'
 import { useStore } from '../../store/useStore'
-import { renameObject, removeObject, clearObjectPoints, clearObjectFramePoints, updateObject } from '../../api/client'
+import { renameObject, removeObject, clearObjectFramePoints, updateObject, rebuildFromConfig, replaceFramePromptsData, restoreObjectSnapshot, getSavedMask } from '../../api/client'
+import { applyRebuildMasksToStore, localAnnotationsToPointPrompts } from '../../history/applyRebuild'
 
 interface Props {
   objId: string
@@ -40,12 +41,39 @@ export default function ObjectCard({ objId, name, color, isActive, onSelect, des
 
   async function handleRename() {
     if (!editName.trim() || editName === name) { setEditing(false); return }
-    await renameObject(pid, vid, objId, editName.trim())
+    const prevName = name
+    const nextName = editName.trim()
+    await renameObject(pid, vid, objId, nextName)
     setEditing(false)
+    const o = useStore.getState().project?.videos[vid]?.objects
     useStore.getState().updateVideo({
       objects: {
-        ...useStore.getState().project?.videos[vid]?.objects,
-        [objId]: { id: objId, name: editName.trim(), color, description },
+        ...o,
+        [objId]: { id: objId, name: nextName, color, description },
+      },
+    })
+    useStore.getState().pushHistory({
+      labelUndo: 'Rename object',
+      labelRedo: 'Rename object',
+      undo: async () => {
+        await renameObject(pid, vid, objId, prevName)
+        const cur = useStore.getState().project?.videos[vid]?.objects
+        const base = cur?.[objId]
+        if (base) {
+          useStore.getState().updateVideo({
+            objects: { ...cur, [objId]: { ...base, name: prevName } },
+          })
+        }
+      },
+      redo: async () => {
+        await renameObject(pid, vid, objId, nextName)
+        const cur = useStore.getState().project?.videos[vid]?.objects
+        const base = cur?.[objId]
+        if (base) {
+          useStore.getState().updateVideo({
+            objects: { ...cur, [objId]: { ...base, name: nextName } },
+          })
+        }
       },
     })
   }
@@ -57,6 +85,8 @@ export default function ObjectCard({ objId, name, color, isActive, onSelect, des
       setDetailsDirty(false)
       return
     }
+    const prevDesc = description ?? ''
+    const nextDesc = editDesc
     setSavingDetails(true)
     try {
       await updateObject(pid, vid, objId, updates)
@@ -69,6 +99,30 @@ export default function ObjectCard({ objId, name, color, isActive, onSelect, des
       })
       setDetailsDirty(false)
       addToast('Object details saved', 'success')
+      useStore.getState().pushHistory({
+        labelUndo: 'Object description',
+        labelRedo: 'Object description',
+        undo: async () => {
+          await updateObject(pid, vid, objId, { description: prevDesc })
+          const cur = useStore.getState().project?.videos[vid]?.objects ?? {}
+          const base = cur[objId]
+          if (base) {
+            useStore.getState().updateVideo({
+              objects: { ...cur, [objId]: { ...base, description: prevDesc } },
+            })
+          }
+        },
+        redo: async () => {
+          await updateObject(pid, vid, objId, { description: nextDesc })
+          const cur = useStore.getState().project?.videos[vid]?.objects ?? {}
+          const base = cur[objId]
+          if (base) {
+            useStore.getState().updateVideo({
+              objects: { ...cur, [objId]: { ...base, description: nextDesc } },
+            })
+          }
+        },
+      })
     } catch (e) {
       console.error('Failed to save object details:', e)
       addToast('Failed to save object details', 'error')
@@ -79,34 +133,111 @@ export default function ObjectCard({ objId, name, color, isActive, onSelect, des
 
   async function handleRemove() {
     if (!confirm(`Remove object "${name}"?`)) return
+    const v = useStore.getState().project?.videos[vid]
+    const objSnap = v?.objects[objId]
+    if (!objSnap) return
+    const pointSnap: Record<string, { points: [number, number][]; labels: number[] }> = v?.point_prompts?.[objId]
+      ? JSON.parse(JSON.stringify(v.point_prompts[objId]))
+      : {}
+    const ig = (v as { instance_groups?: Record<string, number[]> }).instance_groups?.[objId]
+
     setRemoving(true)
     try {
       await removeObject(pid, vid, objId)
       clearLocalPoints(objId)
-      const newMasks = { ...currentFrameMasks }
+      const newMasks = { ...useStore.getState().currentFrameMasks }
       delete newMasks[objId]
-      setCurrentFrameMasks(newMasks)
+      useStore.getState().setCurrentFrameMasks(newMasks, useStore.getState().currentFrameMasksFrame ?? useStore.getState().currentFrame)
       useStore.getState().updateVideo({
         objects: Object.fromEntries(
           Object.entries(useStore.getState().project?.videos[vid]?.objects ?? {}).filter(([k]) => k !== objId)
         ),
+        point_prompts: (() => {
+          const pp = { ...useStore.getState().project?.videos[vid]?.point_prompts }
+          delete pp[objId]
+          return pp
+        })(),
       })
       if (useStore.getState().currentObjectId === objId) {
         setCurrentObject(null)
       }
+
+      const promptFrames = Object.keys(pointSnap).map(Number)
+      useStore.getState().pushHistory({
+        labelUndo: 'Remove object',
+        labelRedo: 'Remove object',
+        undo: async () => {
+          await restoreObjectSnapshot(pid, vid, {
+            id: objSnap.id,
+            name: objSnap.name,
+            color: objSnap.color,
+            description: objSnap.description,
+            min_instances: (objSnap as { min_instances?: number }).min_instances,
+            max_instances: (objSnap as { max_instances?: number }).max_instances,
+          }, pointSnap, ig ?? null)
+          const la = JSON.parse(JSON.stringify(useStore.getState().localAnnotations))
+          for (const [fk, pr] of Object.entries(pointSnap)) {
+            la[objId] = la[objId] ?? {}
+            la[objId][fk] = {
+              points: pr.points.map(([x, y], i) => ({ x, y, label: pr.labels[i] as 0 | 1 })),
+            }
+          }
+          useStore.setState({ localAnnotations: la })
+          const st = useStore.getState()
+          const fm = st.project?.videos[vid]
+          if (fm) {
+            st.updateVideo({
+              objects: { ...fm.objects, [objId]: objSnap },
+              point_prompts: { ...fm.point_prompts, [objId]: pointSnap },
+            })
+          }
+          const frames = promptFrames.length > 0 ? promptFrames : [st.currentFrame]
+          const anchorNow = st.anchorPhase
+          const uniq = [...new Set(frames)]
+          const rb = await rebuildFromConfig(pid, vid, uniq, anchorNow, anchorNow && uniq.length === 1 ? uniq[0] : null)
+          applyRebuildMasksToStore(rb.masks_by_frame)
+        },
+        redo: async () => {
+          await removeObject(pid, vid, objId)
+          clearLocalPoints(objId)
+          const nm = { ...useStore.getState().currentFrameMasks }
+          delete nm[objId]
+          useStore.getState().setCurrentFrameMasks(nm, useStore.getState().currentFrameMasksFrame ?? useStore.getState().currentFrame)
+          const pp = { ...useStore.getState().project?.videos[vid]?.point_prompts ?? {} }
+          delete pp[objId]
+          useStore.getState().updateVideo({
+            objects: Object.fromEntries(
+              Object.entries(useStore.getState().project?.videos[vid]?.objects ?? {}).filter(([k]) => k !== objId)
+            ),
+            point_prompts: pp,
+          })
+          if (useStore.getState().currentObjectId === objId) setCurrentObject(null)
+        },
+      })
     } finally {
       setRemoving(false)
     }
   }
 
   async function handleClear() {
-    // Clear only the current frame — leave all other labeled frames untouched
+    const st0 = useStore.getState()
+    const key = String(currentFrame)
+    const prevAnn = st0.localAnnotations[objId]?.[key]
+    const prevLiveMask = st0.currentFrameMasks[objId]
+    let prevSavedMaskB64: string | undefined = st0.savedMaskCache[currentFrame]?.[objId]
+    if (prevSavedMaskB64 === undefined && prevAnn) {
+      try {
+        const gm = await getSavedMask(pid, vid, currentFrame)
+        prevSavedMaskB64 = gm.masks?.[objId]
+      } catch { /* ignore */ }
+    }
+
     clearLocalPointsForFrame(objId, currentFrame)
-    const newLive = { ...currentFrameMasks }
+    const newLive = { ...useStore.getState().currentFrameMasks }
     delete newLive[objId]
-    setCurrentFrameMasks(newLive)
-    // Remove this object from the saved mask cache for the current frame only
-    const frameSaved = savedMaskCache[currentFrame]
+    const cf = useStore.getState().currentFrameMasksFrame
+    setCurrentFrameMasks(newLive, cf ?? currentFrame)
+    const frameSaved = useStore.getState().savedMaskCache[currentFrame]
     if (frameSaved && frameSaved[objId]) {
       const updated = { ...frameSaved }
       delete updated[objId]
@@ -115,6 +246,56 @@ export default function ObjectCard({ objId, name, color, isActive, onSelect, des
     try {
       await clearObjectFramePoints(pid, vid, objId, currentFrame)
     } catch { /* ignore */ }
+
+    const fIdx = currentFrame
+    useStore.getState().pushHistory({
+      labelUndo: 'Clear selection',
+      labelRedo: 'Clear selection',
+      undo: async () => {
+        const pts = prevAnn ? prevAnn.points.map(p => [p.x, p.y] as [number, number]) : []
+        const labs = prevAnn ? prevAnn.points.map(p => p.label as number) : []
+        await replaceFramePromptsData(pid, vid, objId, fIdx, pts, labs)
+        const la = JSON.parse(JSON.stringify(useStore.getState().localAnnotations)) as typeof st0.localAnnotations
+        if (prevAnn) {
+          la[objId] = { ...la[objId], [key]: prevAnn }
+        } else {
+          const of = la[objId]
+          if (of) {
+            delete of[key]
+            if (Object.keys(of).length === 0) delete la[objId]
+          }
+        }
+        useStore.setState({ localAnnotations: la })
+        useStore.getState().updateVideo({ point_prompts: localAnnotationsToPointPrompts(la) })
+        const anchorNow = useStore.getState().anchorPhase
+        const rb = await rebuildFromConfig(pid, vid, [fIdx], anchorNow, anchorNow ? fIdx : null)
+        applyRebuildMasksToStore(rb.masks_by_frame)
+        if (prevSavedMaskB64 !== undefined) {
+          const merged = { ...(useStore.getState().savedMaskCache[fIdx] ?? {}) }
+          merged[objId] = prevSavedMaskB64
+          useStore.getState().setSavedMask(fIdx, merged)
+        }
+        if (prevLiveMask !== undefined && useStore.getState().currentFrame === fIdx) {
+          const lm = { ...useStore.getState().currentFrameMasks, [objId]: prevLiveMask }
+          useStore.getState().setCurrentFrameMasks(lm, fIdx)
+        }
+      },
+      redo: async () => {
+        useStore.getState().clearLocalPointsForFrame(objId, fIdx)
+        const nl = { ...useStore.getState().currentFrameMasks }
+        delete nl[objId]
+        useStore.getState().setCurrentFrameMasks(nl, useStore.getState().currentFrameMasksFrame ?? fIdx)
+        const fs = useStore.getState().savedMaskCache[fIdx]
+        if (fs && fs[objId]) {
+          const u = { ...fs }
+          delete u[objId]
+          useStore.getState().setSavedMask(fIdx, u)
+        }
+        try {
+          await clearObjectFramePoints(pid, vid, objId, fIdx)
+        } catch { /* ignore */ }
+      },
+    })
   }
 
   return (
