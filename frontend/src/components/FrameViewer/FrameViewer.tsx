@@ -4,6 +4,15 @@ import { useStore, currentVideo as selectCurrentVideo } from '../../store/useSto
 import { videoSourceUrl, frameUrl } from '../../api/client'
 import AnnotationCanvas from './AnnotationCanvas'
 
+function targetIsTypingContext(target: EventTarget | null): boolean {
+  const el = target instanceof HTMLElement ? target : null
+  if (!el) return false
+  if (el.isContentEditable) return true
+  const tag = el.tagName
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true
+  return false
+}
+
 /**
  * FrameViewer — video-based annotation viewer.
  *
@@ -31,12 +40,20 @@ export default function FrameViewer() {
     currentAnchorIndex,
     anchorRemainderInferencing,
     anchorRemainderAwaitingCommit,
+    currentObjectId,
   } = store
+
+  const redoModGlyph = /^Mac|^iPod|^iPhone/i.test(
+    typeof navigator !== 'undefined' ? navigator.platform : '',
+  )
+    ? '⌘'
+    : 'Ctrl'
 
   const containerRef = useRef<HTMLDivElement>(null)
   const frameStackRef = useRef<HTMLDivElement>(null)
   const anchorReturnPanelRef = useRef<HTMLDivElement>(null)
   const videoRef = useRef<HTMLVideoElement>(null)
+  const pendingShiftToggleRef = useRef(false)
   const [dimensions, setDimensions] = useState({ width: 0, height: 0 })
   const [anchorReturnOffsets, setAnchorReturnOffsets] = useState({ right: 12, bottom: 12 })
   const [showTip, setShowTip] = useState(true)
@@ -147,19 +164,110 @@ export default function FrameViewer() {
   // ── Arrow key frame navigation ────────────────────────────────────────────
 
   useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
-      e.preventDefault()
-      const delta = e.key === 'ArrowRight' ? store.frameJump : -store.frameJump
-      const minFrame = store.propagationStartFrame
-      const maxFrame = (video?.num_frames ?? 1) - 1
-      const next = Math.max(minFrame, Math.min(maxFrame, currentFrame + delta))
-      setCurrentFrame(next)
+    const cancelShiftToggleArm = () => {
+      pendingShiftToggleRef.current = false
     }
+
+    const handleMouseDown = (e: MouseEvent) => {
+      if (e.shiftKey) cancelShiftToggleArm()
+    }
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (targetIsTypingContext(e.target)) return
+
+      const s = useStore.getState()
+      const vidMeta = video
+      const framesMax = Math.max((vidMeta?.num_frames ?? 1) - 1, 0)
+
+      const mod = e.metaKey || e.ctrlKey
+
+      if (mod && !e.repeat && e.key.toLowerCase() === 'z') {
+        const hasVideo =
+          !!(s.project && s.currentVideoId && s.project.videos[s.currentVideoId])
+        const tracking = s.propagationStatus === 'running'
+        if (
+          !hasVideo
+          || tracking
+          || s.historyBusy
+        ) {
+          cancelShiftToggleArm()
+          return
+        }
+        cancelShiftToggleArm()
+        const wantsRedo = e.shiftKey
+        if (wantsRedo) {
+          if (s.redoStack.length > 0) {
+            e.preventDefault()
+            void s.redoLast()
+          }
+        } else if (s.undoStack.length > 0) {
+          e.preventDefault()
+          void s.undoLast()
+        }
+        return
+      }
+
+      const objectsMap = vidMeta?.objects ?? {}
+      const objectIds = Object.keys(objectsMap).sort((a, b) => Number(a) - Number(b))
+
+      if (e.key === 'Tab' && objectIds.length > 0) {
+        cancelShiftToggleArm()
+        e.preventDefault()
+        const curId = s.currentObjectId
+        const idx = curId ? objectIds.indexOf(curId) : -1
+        const delta = e.shiftKey ? -1 : 1
+        const nextIdx = idx < 0
+          ? 0
+          : (idx + delta + objectIds.length) % objectIds.length
+        const nextId = objectIds[nextIdx]!
+        const pm = s.pointMode
+        s.setCurrentObject(nextId)
+        if (pm === 'remove') s.setPointMode('remove')
+        return
+      }
+
+      if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+        if (e.shiftKey) cancelShiftToggleArm()
+        e.preventDefault()
+        const delta = e.key === 'ArrowRight' ? s.frameJump : -s.frameJump
+        const minFrame = s.propagationStartFrame
+        const next = Math.max(minFrame, Math.min(framesMax, currentFrame + delta))
+        setCurrentFrame(next)
+        return
+      }
+
+      if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') {
+        if (!mod && !e.altKey && !e.repeat) pendingShiftToggleRef.current = true
+        return
+      }
+
+      if (e.shiftKey) cancelShiftToggleArm()
+    }
+
+    const handleKeyUp = (e: KeyboardEvent) => {
+      if (targetIsTypingContext(e.target)) return
+      if (!(e.code === 'ShiftLeft' || e.code === 'ShiftRight')) return
+      if (!pendingShiftToggleRef.current) return
+
+      pendingShiftToggleRef.current = false
+      const s = useStore.getState()
+      if (!s.currentObjectId) return
+
+      const m = s.pointMode
+      const next = m === 'add' ? 'remove' : 'add'
+      s.setPointMode(next)
+    }
+
     window.addEventListener('keydown', handleKeyDown)
-    return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [currentFrame, video, setCurrentFrame, store.propagationStartFrame])
+    window.addEventListener('keyup', handleKeyUp)
+    window.addEventListener('mousedown', handleMouseDown)
+
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown)
+      window.removeEventListener('keyup', handleKeyUp)
+      window.removeEventListener('mousedown', handleMouseDown)
+    }
+  }, [currentFrame, video, setCurrentFrame])
 
   const targetAnchorFrame =
     anchorFrames.length > 0 && currentAnchorIndex >= 0 && currentAnchorIndex < anchorFrames.length
@@ -355,9 +463,18 @@ export default function FrameViewer() {
       )}
 
       {/* Cursor hint */}
-      {pointMode && (
-        <div className="absolute bottom-3 left-1/2 -translate-x-1/2 bg-black/70 rounded-full px-4 py-1.5 text-xs text-[#ccc] pointer-events-none">
-          {pointMode === 'add' ? 'Click to add (+) point' : 'Click to add (−) exclusion point'}
+      {Object.keys(video.objects).length > 0 && (pointMode || currentObjectId) && (
+        <div className="absolute bottom-3 left-1/2 -translate-x-1/2 bg-black/70 rounded-xl px-4 py-2 text-xs text-[#ccc] pointer-events-none text-center max-w-[min(560px,calc(100%-2rem))]">
+          {pointMode !== null ? (
+            <div>
+              {pointMode === 'add' ? 'Click to add (+) point' : 'Click to add (−) exclusion point'}
+            </div>
+          ) : (
+            <div className="text-[#bbb]">Tap Shift once to toggle add (+) vs remove (−) mode</div>
+          )}
+          <div className="text-[10px] text-[#888] mt-1.5 leading-snug">
+            Tab · next object · Shift+Tab · previous · tap Shift toggles +/- · {redoModGlyph}+Z undo · {redoModGlyph}+Shift+Z redo
+          </div>
         </div>
       )}
     </div>

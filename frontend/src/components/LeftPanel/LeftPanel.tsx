@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react'
+import React, { useEffect, useRef, useState, useCallback } from 'react'
 import { Plus, RotateCcw, ChevronRight, ChevronDown, Loader, Download, X, Pause, Play, SkipBack, SkipForward, Trash2, GripVertical, ArrowLeftRight, Undo2, Redo2 } from 'lucide-react'
 import { useStore, currentVideo as selectCurrentVideo } from '../../store/useStore'
 import {
@@ -17,6 +17,15 @@ import { clearMaskCache } from '../../utils/maskUtils'
 import ObjectCard from './ObjectCard'
 import StepIndicator from './StepIndicator'
 import type { PropagationEvent } from '../../types'
+
+function targetIsTypingContext(target: EventTarget | null): boolean {
+  const el = target instanceof HTMLElement ? target : null
+  if (!el) return false
+  if (el.isContentEditable) return true
+  const tag = el.tagName
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true
+  return false
+}
 
 export default function LeftPanel() {
   const store = useStore()
@@ -46,7 +55,10 @@ export default function LeftPanel() {
     setAnnotatedAnchorIndices,
     invalidateSavedMaskFrame,
     undoStack, redoStack, historyBusy, undoLast, redoLast,
+    viewerTab,
   } = store
+
+  const handleCommitAnchorRef = useRef<() => Promise<void>>(async () => {})
 
   const [addingObject, setAddingObject] = useState(false)
   const [newObjName, setNewObjName] = useState('')
@@ -556,6 +568,67 @@ export default function LeftPanel() {
     setCurrentAnchorIndex(nextIndex)
     setCurrentFrame(anchorFrames[nextIndex])
   }
+
+  handleCommitAnchorRef.current = handleCommitAnchor
+
+  const handleGoToPreviousAnchor = useCallback(() => {
+    if (!anchorPhase || anchorFrames.length === 0) return
+    if (anchorRemainderInferencing && !anchorRemainderAwaitingCommit) return
+    if (currentAnchorIndex <= 0) return
+    const prev = currentAnchorIndex - 1
+    anchorEnteredMsRef.current[prev] = Date.now()
+    setCurrentAnchorIndex(prev)
+    setCurrentFrame(anchorFrames[prev]!)
+  }, [
+    anchorPhase,
+    anchorFrames,
+    currentAnchorIndex,
+    anchorRemainderInferencing,
+    anchorRemainderAwaitingCommit,
+    setCurrentAnchorIndex,
+    setCurrentFrame,
+  ])
+
+  const handleGoToPreviousAnchorRef = useRef(handleGoToPreviousAnchor)
+  handleGoToPreviousAnchorRef.current = handleGoToPreviousAnchor
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (viewerTab !== 'annotate') return
+      if (targetIsTypingContext(e.target)) return
+      if (e.key !== 'Enter' || e.repeat) return
+      if (e.metaKey || e.ctrlKey || e.altKey) return
+
+      const sNow = anchorReviewPrompt
+      if (sNow != null) return
+
+      if (!anchorPhase || anchorFrames.length === 0) return
+      const blockedInfer = anchorRemainderInferencing && !anchorRemainderAwaitingCommit
+      if (blockedInfer) return
+
+      if (e.shiftKey) {
+        if (currentAnchorIndex <= 0) return
+        e.preventDefault()
+        handleGoToPreviousAnchorRef.current()
+        return
+      }
+
+      if (!hasObjects) return
+      e.preventDefault()
+      void handleCommitAnchorRef.current()
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [
+    viewerTab,
+    anchorPhase,
+    anchorFrames.length,
+    anchorRemainderInferencing,
+    anchorRemainderAwaitingCommit,
+    hasObjects,
+    currentAnchorIndex,
+    anchorReviewPrompt,
+  ])
 
   function handleStartTracking() {
     // When all anchors are labeled, prompt the user to choose the tracking method.
@@ -1107,7 +1180,7 @@ export default function LeftPanel() {
                 <span className="text-blue-400/60 ml-1.5 font-normal">(frame #{anchorFrames[currentAnchorIndex]})</span>
               </p>
               <p className="text-xs text-[#666] mt-0.5">
-                Annotate objects on this frame, then click “Done, next frame”.
+                Annotate objects on this frame, then click “Done, next”, or press Enter (Shift+Enter = previous anchor).
                 {anchorFrames.length > manualAnchorPrefixRef.current ? (
                   <>
                     {' '}
@@ -1466,8 +1539,10 @@ export default function LeftPanel() {
             </button>
           ) : anchorPhase ? (
             <button
+              type="button"
               onClick={handleCommitAnchor}
               disabled={!hasObjects || (anchorRemainderInferencing && !anchorRemainderAwaitingCommit)}
+              title="Keyboard: Enter (when objects exist)"
               className="btn btn-primary flex-1 min-w-0 flex flex-col items-center justify-center gap-0.5 px-1 py-2 disabled:opacity-40"
               style={{ fontSize: 'clamp(8px, 5cqi, 12px)', lineHeight: 1.2 }}
             >
