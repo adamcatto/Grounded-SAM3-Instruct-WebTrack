@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useStore, currentVideo as selectCurrentVideo } from '../../store/useStore'
 import { extractFrame, addPoints, getSavedMask, rebuildFromConfig, replaceFramePromptsData, removeObject } from '../../api/client'
 import { drawMasks, drawPoints, loadMaskBitmap } from '../../utils/maskUtils'
-import { applyRebuildMasksToStore, localAnnotationsToPointPrompts } from '../../history/applyRebuild'
+import { applyRebuildMasksToStore, localAnnotationsToPointPrompts, stripObjectMaskFromFrameCaches } from '../../history/applyRebuild'
 
 interface Props {
   width: number
@@ -267,6 +267,9 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
           const anchorNow = useStore.getState().anchorPhase
           const rb = await rebuildFromConfig(pid, vid, [frameToUse], anchorNow, anchorNow ? frameToUse : null)
           applyRebuildMasksToStore(rb.masks_by_frame)
+          if (!la[oid]?.[key]) {
+            stripObjectMaskFromFrameCaches(oid, frameToUse)
+          }
         },
         redo: async () => {
           const st = useStore.getState()

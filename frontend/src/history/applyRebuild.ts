@@ -18,6 +18,23 @@ export function applyRebuildMasksToStore(masksByFrame: Record<string, MaskData>)
   clearMaskCache()
 }
 
+/** When an object has no point prompts on a frame, drop its mask from caches so the overlay disappears. */
+export function stripObjectMaskFromFrameCaches(objId: string, frameIdx: number) {
+  const s = useStore.getState()
+  const prevSaved = s.savedMaskCache[frameIdx]
+  if (prevSaved && prevSaved[objId] !== undefined) {
+    const saved = { ...prevSaved }
+    delete saved[objId]
+    s.setSavedMask(frameIdx, saved)
+  }
+  if (s.currentFrame === frameIdx && s.currentFrameMasksFrame === frameIdx && s.currentFrameMasks[objId] !== undefined) {
+    const live = { ...s.currentFrameMasks }
+    delete live[objId]
+    s.setCurrentFrameMasks(live, frameIdx)
+  }
+  clearMaskCache()
+}
+
 export function localAnnotationsToPointPrompts(
   local: Record<string, Record<string, { points: { x: number; y: number; label: 0 | 1 }[] }>>,
 ): Record<string, Record<string, { points: [number, number][]; labels: number[] }>> {
