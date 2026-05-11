@@ -10,8 +10,8 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-SAM3_CHECKPOINT = Path("/opt/software/Grounded-SAM3-Instruct-WebTrack/pretrained_models/sam3.pt")
-SAM2_CHECKPOINT = Path("/opt/software/Grounded-SAM3-Instruct-WebTrack/pretrained_models/sam2.1_hiera_large.pt")
+SAM3_CHECKPOINT = Path("../pretrained_models/sam3.pt")
+SAM2_CHECKPOINT = Path("../pretrained_models/sam2.1_hiera_large.pt")
 SAM2_CONFIG = "sam2.1_hiera_l"  # sam2 config name for the large model
 
 # Lazy-loaded predictor singleton

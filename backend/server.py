@@ -655,6 +655,25 @@ def list_projects():
     return pm.list_projects()
 
 
+@app.get("/api/projects/root")
+def get_projects_root():
+    """Active projects directory and env-configured default (SAM3_TRACKING_PROJECTS_DIR → SAM3_PROJECTS_DIR → ~/.sam3_zero_projects)."""
+    return pm.get_projects_root_info()
+
+
+class SetProjectsRootRequest(BaseModel):
+    path: str
+
+
+@app.post("/api/projects/root")
+def set_projects_root(req: SetProjectsRootRequest):
+    try:
+        pm.set_projects_root(req.path)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return pm.get_projects_root_info()
+
+
 class CreateProjectRequest(BaseModel):
     name: str
 
@@ -893,6 +912,59 @@ def browse_directory(path: str = Query(...), depth: int = Query(1)):
     return {"directory": str(root), "files": files}
 
 
+@app.get("/api/fs/list_dir")
+def fs_list_dir(path: str = Query("")):
+    """
+    One-level directory listing for workspace / folder pickers.
+    Empty path lists the current user's home directory.
+    """
+    raw = path.strip()
+    try:
+        if not raw:
+            target = Path.home().resolve()
+        else:
+            target = Path(raw).expanduser().resolve()
+    except (OSError, RuntimeError) as e:
+        raise HTTPException(400, f"Invalid path: {e}")
+    if not target.exists():
+        raise HTTPException(404, f"Path not found: {raw or path}")
+    if not target.is_dir():
+        raise HTTPException(400, f"Not a directory: {target}")
+    parent = None if target.parent == target else str(target.parent)
+    entries: list[dict] = []
+    try:
+        subs = sorted(target.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower()))
+    except PermissionError:
+        raise HTTPException(403, "Permission denied")
+    for entry in subs:
+        if entry.name.startswith("."):
+            continue
+        try:
+            is_dir = entry.is_dir()
+        except OSError:
+            continue
+        is_project = False
+        if is_dir:
+            cfg = entry / "config.json"
+            if cfg.is_file():
+                try:
+                    meta = json.loads(cfg.read_text(encoding="utf-8"))
+                    is_project = isinstance(meta.get("id"), str) and len(meta.get("id", "")) > 0
+                except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                    is_project = False
+        try:
+            rpath = str(entry.resolve())
+        except OSError:
+            rpath = str(entry)
+        entries.append({
+            "name": entry.name,
+            "path": rpath,
+            "is_dir": is_dir,
+            "is_project": is_project,
+        })
+    return {"path": str(target), "parent": parent, "entries": entries}
+
+
 # ─── Downsample existing video ───────────────────────────────────────────────
 
 class DownsampleRequest(BaseModel):
@@ -1075,12 +1147,12 @@ def reset_video(pid: str, vid: str):
         d.mkdir(parents=True, exist_ok=True)
 
     # Reset config: clear objects, prompts, propagation state
+    pm.clear_propagated_frames(pid, vid)
     pm.update_video(pid, vid, {
         "objects": {},
         "point_prompts": {},
         "instance_groups": {},
         "sam3_session_id": None,
-        "propagated_frames": [],
         "propagation_complete": False,
         "frames_extracted": False,
         "all_frames_extracted": False,
@@ -2811,15 +2883,9 @@ async def resume_from_frame(pid: str, vid: str, req: ResumeFromFrameRequest):
     if req.clear_from_frame:
         deleted_count = ms_resume.delete_masks_range(req.resume_frame, None)
 
-    # Update propagated_frames to only include frames before resume_frame
-    propagated = video.get("propagated_frames", [])
-    new_propagated = [f for f in propagated if f < req.resume_frame]
-
-    # Update video config
-    pm.update_video(pid, vid, {
-        "propagated_frames": new_propagated,
-        "propagation_complete": False,
-    })
+    # Trim progress file and update config
+    kept_count = pm.trim_propagated_frames(pid, vid, req.resume_frame)
+    pm.update_video(pid, vid, {"propagation_complete": False})
 
     # Set paused state so next propagation resumes from here
     state.paused_at_frame = req.resume_frame - 1 if req.resume_frame > 0 else -1
@@ -2830,12 +2896,12 @@ async def resume_from_frame(pid: str, vid: str, req: ResumeFromFrameRequest):
 
     logger.info(
         f"Resume from frame {req.resume_frame}: deleted {deleted_count} files, "
-        f"kept {len(new_propagated)} propagated frames"
+        f"kept {kept_count} propagated frames"
     )
 
     return {
         "status": "ready_to_resume",
         "resume_frame": req.resume_frame,
         "deleted_files": deleted_count,
-        "kept_propagated_frames": len(new_propagated),
+        "kept_propagated_frames": kept_count,
     }

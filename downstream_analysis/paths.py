@@ -12,8 +12,11 @@ def repo_root() -> Path:
 
 
 def projects_base_dir() -> Path:
-    raw = (os.environ.get("SAM3_PROJECTS_DIR") or "").strip()
-    return Path(raw).expanduser() if raw else Path.home() / ".sam3_zero_projects"
+    for key in ("SAM3_TRACKING_PROJECTS_DIR", "SAM3_PROJECTS_DIR"):
+        raw = (os.environ.get(key) or "").strip()
+        if raw:
+            return Path(raw).expanduser()
+    return Path.home() / ".sam3_zero_projects"
 
 
 def find_project_dir(project_id: str) -> Path | None:

@@ -1,0 +1,109 @@
+# Copy this file to configs/env.yaml and customize it (configs/env.yaml is gitignored).
+
+# Applied by scripts/parallel_tracking_worker.py (CLI flags override YAML when provided).
+parallel_tracking:
+  backend_url: "http://127.0.0.1:8000"
+  claims_file: "tracked_videos_in_progress.txt"
+
+  use_all_anchors: true # pass --use-all-anchors / --no-use-all-anchors to override tri-state default
+  clear_stuck: false # or CLI --clear-stuck/--no-clear-stuck; resets stale inference status=running at start
+  sse_timeout_seconds: null # null / omit = infinite
+  quiet_sse_stream: false
+
+  idle_sleep_min_seconds: 15
+  idle_sleep_max_seconds: 1800
+  idle_loops_before_exit: 288
+
+  # ── Single node, multiple GPUs (worker spawns one OS process per GPU) ───────────────────
+  # Each process uses backend http://local_backend_bind_host:(backend_port_base + gpu_index).
+  # Set auto_start_local_backends: true to launch one uvicorn per GPU with CUDA_VISIBLE_DEVICES.
+  local_gpu_workers: 0 # 0 = off (use backend_url only); else e.g. 4 for four GPUs
+
+  backend_port_base: 8810
+  local_backend_bind_host: "127.0.0.1"
+  auto_start_local_backends: false
+  backend_startup_timeout_seconds: 180
+
+  # Parallel propagations hitting the same backend (experimental — keep at 1 for safety).
+  max_concurrent_propagations_per_gpu: 1
+  oom_reduce_concurrency: true
+
+# Used only by scripts/parallel_tracking_launcher.py when submitting IBM Spectrum LSF jobs.
+lsf_parallel_tracking:
+  submit_count: 1 # identical bsub submits (embarrassingly parallel workers)
+
+  job_name: sam3-partrack
+  job_array_spec: null # example: "1-40" -> bsub -J "sam3-partrack[1-40]"; null = single job name only
+
+  num_process_slots: 1 # -n
+  queue_project: "" # -P (e.g. acc_YourProject); omit or "" to skip
+  queue: "" # -q (e.g. gpu); omit or "" to skip — was extra_bsub_args only before
+  run_limit: "48:00" # -W wall clock (site-specific syntax)
+
+  resources: []
+  # Each entry becomes one -R string. Example Minerva / academic LSF:
+  #  - 'rusage[mem=16000]'
+  #  - 'span[hosts=1]'
+  #  - 'h100nvl'
+
+  # Becomes: bsub ... -gpu num=4 ... (Spectrum LSF). Omit or "" to skip.
+  gpu_allocation: ""
+
+  # If true: use -oo / -eo for stdout/stderr (overwrite). If false: -o / -e.
+  log_overwrite: false
+
+  stdout: logs/sam3-partrack_%J.out # repo-relative to clone; mkdir -p logs; use %J for job id
+  stderr: logs/sam3-partrack_%J.err
+
+  working_directory: "" # optional: -cwd for bsub (empty = omit)
+
+  # How the job command is executed on the compute node.
+  # The launcher submits: <job_shell> -lc "<cd repo> && <mkdir logs> && <shell_preamble...> && <python worker...>"
+  job_shell: "bash"
+  shell_login: true # bash -lc (true) vs bash -c (false)
+  run_in_repo: true # ensures the job runs from the repo root
+
+  # Put site-specific environment activation here (module load, conda activate, etc.).
+  # Example:
+  # shell_preamble:
+  #   - "source ~/.bashrc"
+  #   - "module load cuda/12.1"
+  #   - "source $(conda info --base)/etc/profile.d/conda.sh && conda activate sam3"
+  shell_preamble: []
+
+  # Fallback / escape hatch (parsed last): odd flags or site-specific tokens not covered above.
+  extra_bsub_args: []
+
+  # --- Example (commented): align with a #BSUB script like ----------
+  # #BSUB -J tracking
+  # #BSUB -P acc_YourProject
+  # #BSUB -q gpu
+  # #BSUB -n 64
+  # #BSUB -R "rusage[mem=16000]"
+  # #BSUB -R "span[hosts=1]"
+  # #BSUB -R h100nvl
+  # #BSUB -gpu num=4
+  # #BSUB -W 144:00
+  # #BSUB -oo /path/logs/%J.out
+  # #BSUB -eo /path/logs/%J.err
+  #
+  # job_name: tracking
+  # queue_project: acc_YourProject
+  # queue: gpu
+  # num_process_slots: 64
+  # run_limit: "144:00"
+  # resources:
+  #   - 'rusage[mem=16000]'
+  #   - 'span[hosts=1]'
+  #   - 'h100nvl'
+  # gpu_allocation: "num=4"
+  # log_overwrite: true
+  # stdout: "/sc/arion/projects/YourProject/logs/%J.out"
+  # stderr: "/sc/arion/projects/YourProject/logs/%J.err"
+
+  # Python used inside the batch job (conda env); empty = "python3" on PATH
+  worker_python: ""
+
+  # Additional environment variables for the submitted job (merged into os.environ)
+  environment: {}
+  # SAM3_BACKEND_URL: "http://inference-host:8000"

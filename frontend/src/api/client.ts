@@ -22,6 +22,38 @@ export const checkHealth = () =>
 export const listProjects = () =>
   api.get<Project[]>('/projects').then(r => r.data)
 
+export interface ProjectsRootInfo {
+  active_root: string
+  env_default_root: string
+  env_var: string | null
+  app_root: string
+  home: string
+}
+
+export const getProjectsRoot = () =>
+  api.get<ProjectsRootInfo>('/projects/root').then(r => r.data)
+
+export const setProjectsRoot = (path: string) =>
+  api.post<ProjectsRootInfo>('/projects/root', { path }).then(r => r.data)
+
+export interface FsListEntry {
+  name: string
+  path: string
+  is_dir: boolean
+  is_project: boolean
+}
+
+export interface FsListDirResponse {
+  path: string
+  parent: string | null
+  entries: FsListEntry[]
+}
+
+export const listDir = (path?: string) =>
+  api
+    .get<FsListDirResponse>('/fs/list_dir', { params: { path: path ?? '' } })
+    .then(r => r.data)
+
 export const createProject = (name: string) =>
   api.post<Project>('/projects', { name }).then(r => r.data)
 

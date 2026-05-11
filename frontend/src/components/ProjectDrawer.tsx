@@ -2,7 +2,9 @@ import React, { useEffect, useMemo, useState } from 'react'
 import { X, Plus, Film, FolderOpen, Trash2 } from 'lucide-react'
 import { useStore } from '../store/useStore'
 import { useResizable } from '../hooks/useResizable'
-import { listProjects, createProject, deleteProject, getProject } from '../api/client'
+import ProjectsFolderBrowserModal from './ProjectsFolderBrowserModal'
+import { listProjects, createProject, deleteProject, getProject, getProjectsRoot } from '../api/client'
+import type { ProjectsRootInfo } from '../api/client'
 import type { Project } from '../types'
 import VideoProgressRings from './VideoProgressRings'
 
@@ -12,9 +14,13 @@ export default function ProjectDrawer() {
     project, setProject, setCurrentVideo,
     currentVideoId,
     setUploadModalOpen,
+    addToast,
   } = useStore()
 
   const [projects, setProjects] = useState<Project[]>([])
+  const [projectsRoot, setProjectsRootState] = useState<ProjectsRootInfo | null>(null)
+  const [rootInfoError, setRootInfoError] = useState<string>('')
+  const [folderBrowserOpen, setFolderBrowserOpen] = useState(false)
   const [newName, setNewName] = useState('')
   const [creating, setCreating] = useState(false)
   const [drawerWidthPx, onDrawerResizeMouseDown] = useResizable(320, {
@@ -24,7 +30,27 @@ export default function ProjectDrawer() {
   })
 
   useEffect(() => {
-    if (drawerOpen) loadProjects()
+    if (!drawerOpen) return
+    loadProjects()
+    setRootInfoError('')
+    getProjectsRoot()
+      .then(info => {
+        setProjectsRootState(info)
+        setRootInfoError('')
+      })
+      .catch((e: unknown) => {
+        setProjectsRootState(null)
+        const ax = e as { response?: { status?: number; data?: { detail?: string } } }
+        const status = ax?.response?.status
+        const detail = ax?.response?.data?.detail
+        if (status === 404) {
+          setRootInfoError('Backend is out of date — restart it to use the projects folder browser.')
+        } else if (typeof detail === 'string') {
+          setRootInfoError(detail)
+        } else {
+          setRootInfoError('Could not reach backend')
+        }
+      })
   }, [drawerOpen])
 
   useEffect(() => {
@@ -44,7 +70,13 @@ export default function ProjectDrawer() {
 
   async function loadProjects() {
     try {
-      setProjects(await listProjects())
+      const plist = await listProjects()
+      setProjects(plist)
+      const pid = useStore.getState().project?.id
+      if (pid && !plist.some(p => p.id === pid)) {
+        setProject(null)
+        setCurrentVideo(null)
+      }
     } catch { /* ignore */ }
   }
 
@@ -118,6 +150,45 @@ export default function ProjectDrawer() {
         </div>
 
         <div className="flex-1 overflow-y-auto overflow-x-hidden p-3 space-y-4 min-h-0">
+          <div className="rounded-lg border border-[#2a2a2a] bg-[#161616] p-3 space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <label className="text-xs text-[#666] uppercase tracking-wider">Projects folder</label>
+              <button
+                type="button"
+                disabled={!projectsRoot}
+                onClick={() => setFolderBrowserOpen(true)}
+                className="text-xs text-blue-400 hover:text-blue-300 font-medium disabled:text-[#444] disabled:cursor-not-allowed"
+                title={projectsRoot ? 'Browse for a projects folder' : 'Waiting for backend…'}
+              >
+                Browse…
+              </button>
+            </div>
+            <p
+              className="text-[10px] text-[#a3a3a3] font-mono break-all leading-relaxed"
+              title={projectsRoot?.active_root}
+            >
+              {projectsRoot?.active_root ?? (rootInfoError ? '—' : 'Loading…')}
+            </p>
+            {rootInfoError && (
+              <p className="text-[10px] text-red-400 leading-snug">{rootInfoError}</p>
+            )}
+            {projectsRoot?.env_var ? (
+              <p className="text-[10px] text-[#555] leading-snug">
+                Env default via{' '}
+                <span className="text-[#777] font-mono">{projectsRoot.env_var}</span>
+                {projectsRoot.env_default_root !== projectsRoot.active_root ? (
+                  <>
+                    {' '}
+                    <span className="text-[#444]">·</span>{' '}
+                    <span className="text-[#666] font-mono truncate block mt-0.5" title={projectsRoot.env_default_root}>
+                      {projectsRoot.env_default_root}
+                    </span>
+                  </>
+                ) : null}
+              </p>
+            ) : null}
+          </div>
+
           {/* New project */}
           <div className="space-y-2">
             <label className="text-xs text-[#666] uppercase tracking-wider">New Project</label>
@@ -232,6 +303,17 @@ export default function ProjectDrawer() {
           title="Drag sideways to widen or narrow the menu"
           onMouseDown={onDrawerResizeMouseDown}
           className="absolute top-0 right-0 z-[60] h-full w-2 cursor-col-resize select-none hover:bg-[#3b82f641] active:bg-[#3b82f666]"
+        />
+
+        <ProjectsFolderBrowserModal
+          open={folderBrowserOpen}
+          rootInfo={projectsRoot}
+          onClose={() => setFolderBrowserOpen(false)}
+          onApplied={() => {
+            void getProjectsRoot().then(setProjectsRootState)
+            void loadProjects()
+          }}
+          addToast={addToast}
         />
       </div>
     </>

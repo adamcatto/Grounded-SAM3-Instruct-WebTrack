@@ -20,6 +20,9 @@ __pycache__/
 .env
 *.env
 
+# Repo-local YAML (copy from configs/env_template.yaml)
+configs/env.yaml
+
 # OS
 .DS_Store
 Thumbs.db
@@ -36,3 +39,6 @@ sandbox/
 
 # local notebooks
 sam3_agent.ipynb
+
+# logs
+logs/

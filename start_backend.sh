@@ -1,12 +1,45 @@
 #!/bin/bash
-source /home/adam/miniconda3/etc/profile.d/conda.sh
-conda activate sam3
-# Use libstdc++ from sam2_app env which has CXXABI_1.3.15 (needed by Python 3.12 libicui18n)
-export LD_LIBRARY_PATH="/home/adam/miniconda3/envs/sam2_app/lib:${LD_LIBRARY_PATH}"
+set -euo pipefail
 
-# Kill any stale process on port 8000
-fuser -k 8000/tcp >/dev/null 2>&1; sleep 0.3
+# --------------------------------------------------
+# Reuse currently active conda env if present
+# --------------------------------------------------
 
-cd /opt/software/Grounded-SAM3-Instruct-WebTrack/backend
-uvicorn server:app --host 0.0.0.0 --port 8000 --reload
-    
+if [ -n "${CONDA_PREFIX:-}" ]; then
+    echo "Using existing conda env:"
+    echo "  $CONDA_PREFIX"
+
+else
+    echo "No active conda env detected"
+
+    # ONLY do discovery if absolutely necessary
+
+    if [ -f "/sc/arion/work/$USER/miniconda3/etc/profile.d/conda.sh" ]; then
+        source "/sc/arion/work/$USER/miniconda3/etc/profile.d/conda.sh"
+
+    elif [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+        source "$HOME/miniconda3/etc/profile.d/conda.sh"
+
+    else
+        echo "ERROR: Could not locate user conda install"
+        exit 1
+    fi
+
+    conda activate sam3
+fi
+
+echo "Python: $(which python)"
+echo "Conda prefix: $CONDA_PREFIX"
+
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
+
+fuser -k 8000/tcp >/dev/null 2>&1 || true
+sleep 0.3
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR/backend"
+
+exec python -m uvicorn server:app \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --reload

@@ -1,17 +1,56 @@
 #!/bin/bash
-# Find the nvm node 22 bin directory and put it first in PATH
-NODE_BIN="$(ls -d /home/adam/.nvm/versions/node/v22*/bin 2>/dev/null | sort -V | tail -1)"
-if [ -z "$NODE_BIN" ]; then
-    echo "ERROR: Node v22 not found in ~/.nvm/versions/node/"
-    exit 1
+set -euo pipefail
+
+# --------------------------------------------------
+# Resolve node executable robustly
+# --------------------------------------------------
+
+if command -v node >/dev/null 2>&1; then
+    NODE_BIN_DIR="$(dirname "$(command -v node)")"
+
+else
+    NODE_BIN_DIR="$(ls -d ~/.nvm/versions/node/v22*/bin 2>/dev/null | sort -V | tail -1 || true)"
+
+    if [ -z "${NODE_BIN_DIR:-}" ]; then
+        echo "ERROR: Could not find Node.js"
+        echo "Load a module with:"
+        echo "  ml nodejs/22.11.0"
+        echo "or install Node via nvm."
+        exit 1
+    fi
+
+    export PATH="$NODE_BIN_DIR:$PATH"
 fi
-export PATH="$NODE_BIN:$PATH"
-echo "Using $(node --version)"
 
-# Kill any stale process on port 5173
-fuser -k 5173/tcp >/dev/null 2>&1; sleep 0.3
+echo "Using node: $(which node)"
+echo "Node version: $(node --version)"
 
-cd /opt/software/Grounded-SAM3-Instruct-WebTrack/frontend
+# --------------------------------------------------
+# Kill stale Vite server
+# --------------------------------------------------
+
+fuser -k 5173/tcp >/dev/null 2>&1 || true
+sleep 0.3
+
+# --------------------------------------------------
+# Resolve repo location robustly
+# --------------------------------------------------
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR" && pwd)"
+
+cd "$REPO_ROOT/frontend"
+
+echo "Frontend dir: $(pwd)"
+
+# --------------------------------------------------
+# Install deps
+# --------------------------------------------------
+
 npm install
-# Run vite directly with the explicit node binary
-node node_modules/.bin/vite --host 0.0.0.0
+
+# --------------------------------------------------
+# Run vite directly (avoid broken .bin wrappers)
+# --------------------------------------------------
+
+node node_modules/vite/bin/vite.js --host 0.0.0.0
