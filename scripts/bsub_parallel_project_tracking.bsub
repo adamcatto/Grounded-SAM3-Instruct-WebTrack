@@ -14,19 +14,86 @@
 
 set -euo pipefail
 
+if [[ -z "${PROJECT_DIR:-}" ]]; then
+    echo
+    echo "ERROR: PROJECT_DIR environment variable is not set."
+    echo
+    echo "Set it before submitting the job, for example:"
+    echo
+    echo "  export PROJECT_DIR=/path/to/project"
+    echo "  bsub < bsub_parallel_project_tracking.bsub"
+    echo
+    echo "Or in one line:"
+    echo
+    echo "  PROJECT_DIR=/path/to/project bsub < bsub_parallel_project_tracking.bsub"
+    echo
+    exit 1
+fi
+
 echo "PROJECT_DIR=${PROJECT_DIR}"
-echo "EXTRA_ARGS=${EXTRA_ARGS:-}"
+echo "EXTRA_ARGS=$*"
 
 REPO_ROOT="/sc/arion/projects/KennyComputational/Behavior/Grounded-SAM3-Instruct-WebTrack"
+BACKEND_PORT=8810
 
 cd "${REPO_ROOT}"
 
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate sam3
+source /sc/arion/work/cattoa01/miniconda3/etc/profile.d/conda.sh
+conda activate /sc/arion/work/cattoa01/miniconda3/envs/sam3
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
+export SAM3_PROJECTS_DIR="$(dirname "${PROJECT_DIR}")"
+export CUDA_VISIBLE_DEVICES=0
+# Ensure localhost/127.0.0.1 bypasses the HPC HTTP proxy (which returns 503 for local backends)
+export no_proxy="127.0.0.1,localhost,${no_proxy:-}"
 
-/sc/arion/work/cattoa01/miniconda3/envs/sam3/bin/python \
-    scripts/parallel_tracking_worker.py \
-    --retry-failed \
+# ── Kill any stale process on the target port ──────────────────────────────
+fuser -k "${BACKEND_PORT}/tcp" >/dev/null 2>&1 || true
+sleep 0.3
+
+# ── Start backend inline (same approach as start_backend.sh) ───────────────
+echo "Starting uvicorn on port ${BACKEND_PORT} …"
+cd backend
+python -m uvicorn server:app \
+    --host 127.0.0.1 \
+    --port "${BACKEND_PORT}" \
+    --log-level info &
+UVICORN_PID=$!
+cd "${REPO_ROOT}"
+
+cleanup() { kill "$UVICORN_PID" 2>/dev/null || true; wait "$UVICORN_PID" 2>/dev/null || true; }
+trap cleanup EXIT
+
+# ── Wait for backend health (up to 20 minutes for cold NFS imports) ────────
+HEALTH_URL="http://127.0.0.1:${BACKEND_PORT}/api/health"
+echo "Waiting for backend health at ${HEALTH_URL} …"
+WAITED=0
+MAX_WAIT=1200
+while true; do
+    if ! kill -0 "$UVICORN_PID" 2>/dev/null; then
+        echo "ERROR: uvicorn (PID $UVICORN_PID) exited before becoming healthy"
+        exit 1
+    fi
+    HTTP_CODE=$(curl --noproxy '*' -s -o /dev/null -w '%{http_code}' --max-time 5 "$HEALTH_URL" 2>/dev/null || echo "000")
+    if [[ "$HTTP_CODE" == "200" ]]; then
+        echo "Backend healthy after ${WAITED}s"
+        break
+    fi
+    if (( WAITED >= MAX_WAIT )); then
+        echo "ERROR: backend health check timed out after ${MAX_WAIT}s (last HTTP ${HTTP_CODE})"
+        exit 1
+    fi
+    if (( WAITED % 60 == 0 && WAITED > 0 )); then
+        echo "  still waiting … ${WAITED}s elapsed, HTTP ${HTTP_CODE}"
+    fi
+    sleep 5
+    WAITED=$((WAITED + 5))
+done
+
+# ── Run tracking worker (backend already running, single-process mode) ─────
+python scripts/parallel_tracking_worker.py \
+    --local-gpu-workers 0 \
+    --backend "http://127.0.0.1:${BACKEND_PORT}" \
+    --use-all-anchors \
     --clear-stuck \
     "${PROJECT_DIR}" \
-    ${EXTRA_ARGS:-}
+    "$@"

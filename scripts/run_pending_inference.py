@@ -170,8 +170,11 @@ def propagation_sse(
         if stream_log and isinstance(d, dict):
             _log_sse_to_terminal(cur_ev, d, stream_active=stream_active_carry)
 
+    # Bypass HTTP proxy for local backend connections (HPC http_proxy breaks localhost)
+    no_proxy_handler = urllib.request.ProxyHandler({})
+    opener = urllib.request.build_opener(no_proxy_handler)
     try:
-        with urllib.request.urlopen(req, timeout=to) as resp:
+        with opener.open(req, timeout=to) as resp:
             decoder = io.TextIOWrapper(resp, encoding="utf-8", newline="")
             for line in decoder:
                 if line.endswith("\r\n"):
@@ -482,10 +485,25 @@ def main() -> int:
     pending: list[Tuple[str, dict[str, Any], bool, str]] = []
     filtered_out: list[str] = []
 
+    # Read claims file to skip videos already being tracked by another worker
+    claimed_vids: set[str] = set()
+    if project_dir is not None:
+        for cname in ("tracked_videos_in_progress.txt",):
+            cpath = project_dir / cname
+            try:
+                if cpath.exists():
+                    from parallel_tracking_worker import _parse_claim_ids
+                    claimed_vids = _parse_claim_ids(cpath.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
     stale_cleared: set[str] = set()
     for vid, vm in (project["videos"] or {}).items():
         if vid_filter is not None and vid not in vid_filter:
             filtered_out.append(vid)
+            continue
+        if vid in claimed_vids:
+            pending.append((vid, vm, False, "already claimed (in tracked_videos_in_progress.txt)"))
             continue
         ok, msg = video_eligibility(vid, vm, project_dir=project_dir, stale_timeout_s=args.stale_timeout)
         if ok and "killed/stale" in msg:

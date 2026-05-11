@@ -110,24 +110,80 @@ def _looks_like_cuda_oom(msg: str) -> bool:
     return any(x in m for x in needles)
 
 
-def _wait_for_health(origin: str, timeout_s: float) -> None:
+def _wait_for_health(
+    origin: str,
+    timeout_s: float,
+    proc: subprocess.Popen | None = None,
+    err_log: Path | None = None,
+) -> None:
     """Wait until GET {origin}/api/health returns HTTP 200."""
 
     health = urljoin(origin.rstrip("/") + "/", "api/health")
     deadline = time.monotonic() + timeout_s
+    first_err = ""
     last_err = ""
+    attempts = 0
+    last_progress = time.monotonic()
+    # Bypass HTTP proxy for local health checks (HPC nodes often have
+    # http_proxy set, which routes 127.0.0.1 through a proxy returning 503).
+    no_proxy_handler = urllib.request.ProxyHandler({})
+    opener = urllib.request.build_opener(no_proxy_handler)
     while time.monotonic() < deadline:
+        # Bail early if the child process has already exited
+        if proc is not None and proc.poll() is not None:
+            _print_err_log_tail(err_log)
+            raise RuntimeError(
+                f"backend process exited (rc={proc.returncode}) before becoming healthy ({health}): {last_err}"
+            )
         try:
-            with urllib.request.urlopen(health, timeout=5) as resp:
+            with opener.open(health, timeout=5) as resp:
                 code = getattr(resp, "status", None)
                 if code is None and hasattr(resp, "getcode"):
                     code = resp.getcode()
                 if code == 200:
                     return
+                last_err = f"HTTP {code}"
         except (urllib.error.URLError, OSError, ValueError) as e:
             last_err = str(e)
+        if not first_err:
+            first_err = last_err
+        attempts += 1
+        # Print progress every 30 seconds so users/logs can see what's happening
+        now = time.monotonic()
+        if now - last_progress >= 30:
+            elapsed = int(now - (deadline - timeout_s))
+            remaining = int(deadline - now)
+            print(
+                f"  health check {health}: {last_err} "
+                f"({elapsed}s elapsed, {remaining}s remaining, {attempts} attempts)",
+                flush=True,
+            )
+            last_progress = now
         time.sleep(0.5)
-    raise RuntimeError(f"backend health check timeout ({health}): {last_err}")
+    _print_err_log_tail(err_log)
+    raise RuntimeError(
+        f"backend health check timeout ({health}): {last_err}"
+        f" (first_err={first_err!r}, attempts={attempts},"
+        f" proc_alive={proc.poll() is None if proc else 'N/A'})"
+    )
+
+
+def _print_err_log_tail(err_log: Path | None, n: int = 30) -> None:
+    """Print the last *n* lines of a uvicorn error log for diagnostics."""
+    if err_log is None:
+        return
+    try:
+        if not err_log.exists():
+            return
+        lines = err_log.read_text(errors="replace").splitlines()
+        tail = lines[-n:] if len(lines) > n else lines
+        if tail:
+            print(f"--- last {len(tail)} lines of {err_log.name} ---", flush=True)
+            for ln in tail:
+                print(f"  {ln}", flush=True)
+            print("--- end ---", flush=True)
+    except OSError:
+        pass
 
 
 def _start_uvicorn_per_gpu(
@@ -158,6 +214,12 @@ def _start_uvicorn_per_gpu(
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(i)
         env.setdefault("SAM3_PROJECTS_DIR", env.get("SAM3_PROJECTS_DIR", ""))
+        # Mirror start_backend.sh: ensure CONDA_PREFIX/lib is on LD_LIBRARY_PATH
+        # so the dynamic linker can find torch/CUDA .so files without slow NFS searches.
+        conda_prefix = env.get("CONDA_PREFIX", "")
+        if conda_prefix:
+            ld = env.get("LD_LIBRARY_PATH", "")
+            env["LD_LIBRARY_PATH"] = f"{conda_prefix}/lib:{ld}" if ld else f"{conda_prefix}/lib"
         out_path = log_dir / f"uvicorn_gpu{i}_{port}.out"
         err_path = log_dir / f"uvicorn_gpu{i}_{port}.err"
         fout = open(out_path, "ab", buffering=0)
@@ -226,7 +288,7 @@ def _apply_parallel_tracking_yaml(
 
     if getattr(args, "backend_startup_timeout_seconds", None) is None:
         bt = pt.get("backend_startup_timeout_seconds")
-        args.backend_startup_timeout_seconds = float(bt) if bt is not None else 180.0
+        args.backend_startup_timeout_seconds = float(bt) if bt is not None else 600.0
 
     if getattr(args, "max_concurrent_propagations_per_gpu", None) is None:
         mc = pt.get("max_concurrent_propagations_per_gpu")
@@ -352,8 +414,14 @@ def run_gpu_worker_process(payload: dict[str, Any]) -> int:
         return _load_project_from_disk(cfg_path)[0]
 
     def any_eligible_work(project: dict[str, Any]) -> bool:
+        try:
+            claimed = _parse_claim_ids(claims_path.read_text(encoding="utf-8")) if claims_path.exists() else set()
+        except OSError:
+            claimed = set()
         for vid, vm in sorted((project.get("videos") or {}).items()):
             if vid_allow is not None and vid not in vid_allow:
+                continue
+            if vid in claimed:
                 continue
             ok, _ = video_eligibility(vid, vm)
             if ok:
@@ -623,12 +691,40 @@ def _supervise_local_gpu_workers(
     uvicorn_procs: list[subprocess.Popen] = []
     if args.auto_start_local_backends:
         backend_dir = repo / "backend"
+        # Kill any stale process on target ports before starting
+        for i in range(n):
+            port = base + i
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(1)
+                result = s.connect_ex((bind, port))
+                s.close()
+                if result == 0:
+                    print(f"WARNING: port {port} already in use — attempting to free it", flush=True)
+                    subprocess.run(["fuser", "-k", f"{port}/tcp"], capture_output=True, timeout=5)
+                    time.sleep(1)
+            except Exception:
+                pass
+        # Truncate large log files to prevent NFS I/O stalls
+        log_dir = repo / "logs"
+        for i in range(n):
+            port = base + i
+            for suffix in ("out", "err"):
+                lf = log_dir / f"uvicorn_gpu{i}_{port}.{suffix}"
+                try:
+                    if lf.exists() and lf.stat().st_size > 10_000_000:
+                        print(f"Truncating large log {lf.name} ({lf.stat().st_size // 1_000_000}MB)", flush=True)
+                        lf.write_bytes(b"")
+                except OSError:
+                    pass
         print(f"Starting {n} uvicorn processes (ports {base}..{base + n - 1}) …", flush=True)
         uvicorn_procs = _start_uvicorn_per_gpu(n, base, bind, backend_dir)
         for i in range(n):
             port = base + i
             origin = f"http://{bind}:{port}"
-            _wait_for_health(origin, timeout)
+            proc = uvicorn_procs[i] if i < len(uvicorn_procs) else None
+            err_log = log_dir / f"uvicorn_gpu{i}_{port}.err"
+            _wait_for_health(origin, timeout, proc=proc, err_log=err_log)
         print("All local backends healthy.", flush=True)
 
     project, pid = _load_project_from_disk(cfg_path)
@@ -904,8 +1000,14 @@ def main() -> int:
         return _load_project_from_disk(cfg_path)[0]
 
     def any_eligible_work(project: dict[str, Any]) -> bool:
+        try:
+            claimed = _parse_claim_ids(claims_path.read_text(encoding="utf-8")) if claims_path.exists() else set()
+        except OSError:
+            claimed = set()
         for vid, vm in sorted((project.get("videos") or {}).items()):
             if vid_allow is not None and vid not in vid_allow:
+                continue
+            if vid in claimed:
                 continue
             ok, _ = video_eligibility(vid, vm)
             if ok:
