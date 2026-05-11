@@ -27,6 +27,7 @@ import json
 import os
 import socket
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -37,7 +38,7 @@ REPO_BACKEND = Path(__file__).resolve().parents[1] / "backend"
 if str(REPO_BACKEND) not in sys.path:
     sys.path.insert(0, str(REPO_BACKEND))
 
-from anchor_helpers import is_anchor_labeling_complete  # noqa: E402
+from anchor_helpers import STREAM_BATCH_SIZE, is_anchor_labeling_complete  # noqa: E402
 from project_manager import ProjectManager  # noqa: E402
 
 
@@ -210,9 +211,111 @@ def propagation_sse(
     return True, last_payload, ""
 
 
-def video_eligibility(vid: str, vm: dict) -> Tuple[bool, str]:
+def _find_video_dir_in_project(project_dir: Path, vid: str) -> Path | None:
+    """Locate a video subdirectory by vid prefix under <project>/videos/."""
+    vids_root = project_dir / "videos"
+    if not vids_root.is_dir():
+        return None
+    for d in vids_root.iterdir():
+        if d.is_dir() and (d.name == vid or d.name.startswith(vid + "_")):
+            return d
+    return None
+
+
+def _latest_mtime(directory: Path, glob_pattern: str) -> float | None:
+    """Return the most recent mtime among files matching *glob_pattern* in *directory*, or None."""
+    newest: float | None = None
+    try:
+        for f in directory.glob(glob_pattern):
+            mt = f.stat().st_mtime
+            if newest is None or mt > newest:
+                newest = mt
+    except OSError:
+        pass
+    return newest
+
+
+def _is_inference_stale(video_dir: Path, stale_timeout_s: float) -> Tuple[bool, str]:
+    """Check whether a supposedly-running inference has gone silent.
+
+    Checks: propagation_progress.txt mtime, masks/*.npz mtime.
+    Returns (is_stale, human_detail).
+    """
+    now = time.time()
+    progress_path = video_dir / "propagation_progress.txt"
+
+    last_activity: float | None = None
+    activity_source = ""
+
+    # Check propagation progress file
+    if progress_path.exists():
+        mt = progress_path.stat().st_mtime
+        if last_activity is None or mt > last_activity:
+            last_activity = mt
+            activity_source = "progress file"
+
+    # Check newest mask file
+    masks_mt = _latest_mtime(video_dir / "masks", "*.npz")
+    if masks_mt is not None and (last_activity is None or masks_mt > last_activity):
+        last_activity = masks_mt
+        activity_source = "mask file"
+
+    if last_activity is None:
+        return True, "no progress file or masks found"
+
+    age_s = now - last_activity
+    if age_s > stale_timeout_s:
+        age_min = age_s / 60
+        return True, f"last {activity_source} update {age_min:.0f}m ago (threshold {stale_timeout_s / 60:.0f}m)"
+
+    return False, f"active — last {activity_source} update {age_s:.0f}s ago"
+
+
+def _anchor_labeling_complete_with_masks(
+    vm: dict, video_dir: Path, batch_size: int = STREAM_BATCH_SIZE,
+) -> bool:
+    """Like is_anchor_labeling_complete but also counts mask .npz files on disk."""
+    from anchor_helpers import compute_anchor_frames  # already at module level via STREAM_BATCH_SIZE
+
+    start = int(vm.get("start_frame") or 0)
+    num_frames = int(vm["num_frames"])
+    required = compute_anchor_frames(start, num_frames, batch_size)
+
+    annotated = set(vm.get("annotated_anchors") or [])
+    for obj_prompts in (vm.get("point_prompts") or {}).values():
+        if isinstance(obj_prompts, dict):
+            for fk in obj_prompts:
+                try:
+                    annotated.add(int(fk))
+                except (ValueError, TypeError):
+                    pass
+
+    masks_dir = video_dir / "masks"
+    if masks_dir.is_dir():
+        for f in masks_dir.iterdir():
+            if f.suffix == ".npz":
+                try:
+                    annotated.add(int(f.stem))
+                except (ValueError, TypeError):
+                    pass
+
+    return bool(required) and all(a in annotated for a in required)
+
+
+def video_eligibility(
+    vid: str,
+    vm: dict,
+    *,
+    project_dir: Path | None = None,
+    stale_timeout_s: float = 300,
+) -> Tuple[bool, str]:
     inferred = is_anchor_labeling_complete(vm)
     anchored = bool(vm.get("anchor_labeling_complete")) or inferred
+    if not anchored and project_dir is not None:
+        # Fallback: check mask files on disk for missing anchor frames
+        vdir = _find_video_dir_in_project(project_dir, vid)
+        if vdir is not None:
+            anchored = _anchor_labeling_complete_with_masks(vm, vdir)
     if not anchored:
         return False, "anchor labeling incomplete"
 
@@ -222,6 +325,19 @@ def video_eligibility(vid: str, vm: dict) -> Tuple[bool, str]:
     winf = vm.get("whole_video_inference") or {}
     st = (winf.get("status") or "none").strip() or "none"
     if st == "running":
+        # Check if inference is truly running or was killed
+        if project_dir is not None:
+            vdir = _find_video_dir_in_project(project_dir, vid)
+            if vdir is not None:
+                stale, detail = _is_inference_stale(vdir, stale_timeout_s)
+                if stale:
+                    return (
+                        True,
+                        f"ready for propagation (prior inference killed/stale — {detail})",
+                    )
+                else:
+                    return False, f"inference_running ({detail})"
+        # No project_dir or couldn't find video dir — fall back to old behavior
         return False, "inference_running (another job or stale — use --clear-stuck)"
     if st == "complete" and not vm.get("propagation_complete"):
         return False, "status complete but propagation_complete false (repair config)"
@@ -294,12 +410,19 @@ def main() -> int:
         action="store_true",
         help="Suppress per-event SSE progress on stdout (eligibility still on stderr first; done/error lines may still print).",
     )
+    ap.add_argument(
+        "--stale-timeout",
+        type=float,
+        default=300,
+        help="Seconds without progress before a 'running' inference is considered killed/stale (default %(default)s).",
+    )
 
     args = ap.parse_args()
 
     pm = ProjectManager()
 
     cfg_path_explicit: Path | None = None
+    project_dir: Path | None = None
     if args.project_dir:
         pd = Path(args.project_dir).expanduser().resolve()
         cfg_path = pd / "config.json"
@@ -307,6 +430,12 @@ def main() -> int:
             print(f"No config.json under {pd}", file=sys.stderr, flush=True)
             return 2
         cfg_path_explicit = cfg_path
+        project_dir = pd
+        # Point ProjectManager at the parent so saves (--clear-stuck, status updates) work
+        try:
+            pm.set_projects_root(str(pd.parent))
+        except Exception:
+            pass  # non-fatal; direct config reads still work
         project = pm._normalize_project_config(json.loads(cfg_path.read_text()))
         pid = project["id"]
     elif args.pid:
@@ -315,6 +444,10 @@ def main() -> int:
         if project is None:
             print(f"Project {pid!r} not found under SAM3 projects root.", file=sys.stderr, flush=True)
             return 2
+        try:
+            project_dir = pm._project_dir(pid)
+        except ValueError:
+            pass
     else:
         print("Provide --project-dir or --pid", file=sys.stderr, flush=True)
         return 2
@@ -349,11 +482,14 @@ def main() -> int:
     pending: list[Tuple[str, dict[str, Any], bool, str]] = []
     filtered_out: list[str] = []
 
+    stale_cleared: set[str] = set()
     for vid, vm in (project["videos"] or {}).items():
         if vid_filter is not None and vid not in vid_filter:
             filtered_out.append(vid)
             continue
-        ok, msg = video_eligibility(vid, vm)
+        ok, msg = video_eligibility(vid, vm, project_dir=project_dir, stale_timeout_s=args.stale_timeout)
+        if ok and "killed/stale" in msg:
+            stale_cleared.add(vid)
         pending.append((vid, vm, ok, msg))
 
     will_run: list[Tuple[str, str]] = []
@@ -416,6 +552,14 @@ def main() -> int:
     if not to_run:
         _emit_plan_lines(["No videos to propagate (nothing eligible).", ""])
         return 0
+
+    # Reset inference status for stale/killed jobs before starting propagation
+    if stale_cleared:
+        for vid in stale_cleared:
+            try:
+                pm.set_video_inference_status(pid, vid, "none", host=None)
+            except Exception as e:
+                _emit_plan_lines([f"  (warning) could not reset stale status for {vid}: {e}"])
 
     backend = args.backend.rstrip("/")
     api_base = backend if backend.endswith("/api") else backend + "/api"

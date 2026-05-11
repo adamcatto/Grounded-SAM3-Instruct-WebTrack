@@ -6,6 +6,7 @@ Projects live under a configurable root directory (see default_projects_base_dir
 import re
 import uuid
 import json
+import fcntl
 import os
 import shutil
 import tempfile

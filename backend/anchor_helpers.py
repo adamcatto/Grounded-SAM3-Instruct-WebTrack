@@ -30,9 +30,25 @@ def is_anchor_labeling_complete(
     video: dict,
     batch_size: int = STREAM_BATCH_SIZE,
 ) -> bool:
-    """True if every computed anchor frame index appears in annotated_anchors."""
+    """True if every computed anchor frame has evidence of labeling.
+
+    A frame counts as labeled if it appears in ``annotated_anchors`` OR if at
+    least one object has point prompts saved for that frame.  This handles the
+    case where the commit didn't persist but the annotation data was saved.
+    """
     start = int(video.get("start_frame") or 0)
     num_frames = int(video["num_frames"])
     required = compute_anchor_frames(start, num_frames, batch_size)
+
     annotated = set(video.get("annotated_anchors") or [])
+
+    # Also count frames that have point prompts for any object
+    for obj_prompts in (video.get("point_prompts") or {}).values():
+        if isinstance(obj_prompts, dict):
+            for frame_key in obj_prompts:
+                try:
+                    annotated.add(int(frame_key))
+                except (ValueError, TypeError):
+                    pass
+
     return bool(required) and all(a in annotated for a in required)
