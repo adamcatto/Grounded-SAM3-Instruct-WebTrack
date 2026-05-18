@@ -683,6 +683,33 @@ def create_project(req: CreateProjectRequest):
     return pm.create_project(req.name)
 
 
+class MergeProjectsRequest(BaseModel):
+    name: str
+    left_project_id: str
+    right_project_id: str
+    output_parent: Optional[str] = None
+
+
+@app.post("/api/projects/merge", status_code=201)
+def merge_projects(req: MergeProjectsRequest):
+    if not req.name.strip():
+        raise HTTPException(400, "Project name is required")
+    if not req.left_project_id.strip() or not req.right_project_id.strip():
+        raise HTTPException(400, "Both source projects are required")
+    try:
+        output_parent = (
+            Path(req.output_parent).expanduser() if req.output_parent else None
+        )
+        return pm.merge_projects(
+            name=req.name.strip(),
+            left_ref=req.left_project_id.strip(),
+            right_ref=req.right_project_id.strip(),
+            output_parent=output_parent,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
 @app.get("/api/projects/{pid}")
 def get_project(pid: str):
     project = pm.get_project(pid)

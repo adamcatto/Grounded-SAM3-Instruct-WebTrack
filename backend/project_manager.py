@@ -133,11 +133,12 @@ class ProjectManager:
                     pass
         return projects
 
-    def create_project(self, name: str) -> dict:
+    def create_project(self, name: str, parent_dir: Optional[Path] = None) -> dict:
         pid = str(uuid.uuid4())[:8]
         slug = self._slugify(name)
         dir_name = f"{pid}-{slug}" if slug else pid
-        project_dir = self._base_dir / dir_name
+        parent = (parent_dir or self._base_dir).resolve()
+        project_dir = parent / dir_name
         project_dir.mkdir(parents=True)
         (project_dir / "videos").mkdir()
         config = {
@@ -146,8 +147,159 @@ class ProjectManager:
             "created_at": datetime.now(timezone.utc).isoformat(),
             "videos": {},
         }
-        self._save_config(pid, config)
+        self._save_config(pid, config, project_dir=project_dir)
         return config
+
+    def resolve_project_ref(self, ref: str) -> tuple[Path, dict]:
+        """Resolve a project by short id, folder name, or filesystem path."""
+        ref = (ref or "").strip()
+        if not ref:
+            raise ValueError("Empty project reference")
+
+        p = Path(ref).expanduser()
+        if p.is_dir():
+            cfg_path = p / "config.json"
+            if cfg_path.is_file():
+                config = self._normalize_project_config(json.loads(cfg_path.read_text()))
+                return p.resolve(), config
+
+        found = self._find_project_dir(ref)
+        if found is not None:
+            config = self._normalize_project_config(
+                json.loads((found / "config.json").read_text())
+            )
+            return found.resolve(), config
+
+        env_base = default_projects_base_dir().resolve()
+        if env_base != self._base_dir.resolve():
+            for d in sorted(env_base.iterdir()):
+                if not d.is_dir():
+                    continue
+                if d.name == ref or d.name.startswith(ref + "-"):
+                    cfg = d / "config.json"
+                    if cfg.is_file():
+                        config = self._normalize_project_config(json.loads(cfg.read_text()))
+                        return d.resolve(), config
+
+        raise ValueError(f"Project not found: {ref!r}")
+
+    def _default_merge_parent(self, left_dir: Path, right_dir: Path) -> Path:
+        left_parent = left_dir.parent.resolve()
+        right_parent = right_dir.parent.resolve()
+        if left_parent == right_parent and left_parent.is_dir():
+            return left_parent
+        return self._base_dir.resolve()
+
+    def _iter_video_entries(
+        self, project_dir: Path, config: dict
+    ) -> list[tuple[str, Path, dict]]:
+        videos_root = project_dir / "videos"
+        if not videos_root.is_dir():
+            return []
+        out: list[tuple[str, Path, dict]] = []
+        for vid, vm in (config.get("videos") or {}).items():
+            if not isinstance(vm, dict):
+                continue
+            video_dir = None
+            for child in videos_root.iterdir():
+                if not child.is_dir():
+                    continue
+                if child.name == vid or child.name.startswith(vid + "_"):
+                    video_dir = child
+                    break
+            if video_dir is None:
+                raise ValueError(
+                    f"Video directory for {vid!r} not found under {videos_root}"
+                )
+            out.append((str(vid), video_dir, dict(vm)))
+        out.sort(key=lambda t: (t[2].get("name") or t[0]).lower())
+        return out
+
+    def _copy_video_into_project(
+        self,
+        dest_project_dir: Path,
+        dest_pid: str,
+        src_video_dir: Path,
+        video_meta: dict,
+    ) -> dict:
+        new_vid = str(uuid.uuid4())[:8]
+        slug = self._slugify(video_meta.get("name") or "video")
+        dest_name = f"{new_vid}_{slug}" if slug else new_vid
+        dest_video_dir = dest_project_dir / "videos" / dest_name
+        if dest_video_dir.exists():
+            raise ValueError(f"Destination video directory already exists: {dest_video_dir}")
+
+        shutil.copytree(src_video_dir, dest_video_dir, symlinks=True)
+
+        vm = dict(video_meta)
+        vm["id"] = new_vid
+        vm.pop("propagated_frames", None)
+        vm["sam3_session_id"] = None
+
+        src_resolved = src_video_dir.resolve()
+        old_source = (vm.get("source_path") or "").strip()
+        if old_source:
+            old_path = Path(old_source)
+            try:
+                old_path.resolve().relative_to(src_resolved)
+                for candidate in dest_video_dir.glob("source.*"):
+                    if candidate.is_file() or candidate.is_symlink():
+                        vm["source_path"] = str(candidate)
+                        break
+            except ValueError:
+                pass
+
+        return self._normalize_video_meta(vm)
+
+    def merge_projects(
+        self,
+        name: str,
+        left_ref: str,
+        right_ref: str,
+        output_parent: Optional[Path] = None,
+    ) -> dict:
+        """
+        Copy all videos from two projects into a new project. Source projects are unchanged.
+        Symlinked source videos remain symlinks in the merged project.
+        """
+        left_dir, left_cfg = self.resolve_project_ref(left_ref)
+        right_dir, right_cfg = self.resolve_project_ref(right_ref)
+        if left_dir.resolve() == right_dir.resolve():
+            raise ValueError("Cannot merge a project with itself")
+
+        parent = (output_parent or self._default_merge_parent(left_dir, right_dir)).resolve()
+        parent.mkdir(parents=True, exist_ok=True)
+
+        pid = str(uuid.uuid4())[:8]
+        slug = self._slugify(name)
+        dir_name = f"{pid}-{slug}" if slug else pid
+        project_dir = parent / dir_name
+        if project_dir.exists():
+            raise ValueError(f"Project directory already exists: {project_dir}")
+        project_dir.mkdir(parents=True)
+        (project_dir / "videos").mkdir()
+
+        merged_config: dict = {
+            "id": pid,
+            "name": name,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "videos": {},
+        }
+
+        for _src_dir, src_cfg in ((left_dir, left_cfg), (right_dir, right_cfg)):
+            for _vid, video_dir, video_meta in self._iter_video_entries(_src_dir, src_cfg):
+                vm = self._copy_video_into_project(
+                    project_dir, pid, video_dir, video_meta
+                )
+                merged_config["videos"][vm["id"]] = vm
+
+        self._save_config(pid, merged_config, project_dir=project_dir)
+
+        if parent != self._base_dir.resolve() and left_dir.parent.resolve() == parent:
+            with self._root_lock:
+                self._base_dir = parent
+
+        return self.get_project(pid) or merged_config
 
     def get_project(self, pid: str) -> Optional[dict]:
         d = self._find_project_dir(pid)
@@ -550,8 +702,8 @@ class ProjectManager:
         out["videos"] = vids
         return out
 
-    def _save_config(self, pid: str, config: dict):
-        cfg_path = self._project_dir(pid) / "config.json"
+    def _save_config(self, pid: str, config: dict, project_dir: Optional[Path] = None):
+        cfg_path = (project_dir or self._project_dir(pid)) / "config.json"
         # Strip propagated_frames from config — stored in per-video progress files
         for vid_data in (config.get("videos") or {}).values():
             if isinstance(vid_data, dict):

@@ -57,6 +57,21 @@ export const listDir = (path?: string) =>
 export const createProject = (name: string) =>
   api.post<Project>('/projects', { name }).then(r => r.data)
 
+export const mergeProjects = (
+  name: string,
+  leftProjectId: string,
+  rightProjectId: string,
+  outputParent?: string,
+) =>
+  api
+    .post<Project>('/projects/merge', {
+      name,
+      left_project_id: leftProjectId,
+      right_project_id: rightProjectId,
+      output_parent: outputParent ?? null,
+    })
+    .then(r => r.data)
+
 export const getProject = (pid: string) =>
   api.get<Project>(`/projects/${pid}`).then(r => r.data)
 

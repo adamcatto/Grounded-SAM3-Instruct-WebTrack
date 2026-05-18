@@ -3,7 +3,7 @@ import { X, Plus, Film, FolderOpen, Trash2 } from 'lucide-react'
 import { useStore } from '../store/useStore'
 import { useResizable } from '../hooks/useResizable'
 import ProjectsFolderBrowserModal from './ProjectsFolderBrowserModal'
-import { listProjects, createProject, deleteProject, getProject, getProjectsRoot, removeVideo } from '../api/client'
+import { listProjects, createProject, mergeProjects, deleteProject, getProject, getProjectsRoot, removeVideo } from '../api/client'
 import type { ProjectsRootInfo } from '../api/client'
 import type { Project } from '../types'
 import VideoProgressRings from './VideoProgressRings'
@@ -24,6 +24,9 @@ export default function ProjectDrawer() {
   const [folderBrowserOpen, setFolderBrowserOpen] = useState(false)
   const [newName, setNewName] = useState('')
   const [creating, setCreating] = useState(false)
+  const [mergeMode, setMergeMode] = useState(false)
+  const [mergeLeftId, setMergeLeftId] = useState('')
+  const [mergeRightId, setMergeRightId] = useState('')
   const [drawerWidthPx, onDrawerResizeMouseDown] = useResizable(320, {
     min: 220,
     max: 560,
@@ -81,15 +84,39 @@ export default function ProjectDrawer() {
     } catch { /* ignore */ }
   }
 
+  const mergeableProjects = useMemo(
+    () => [...projects].sort((a, b) =>
+      a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }),
+    ),
+    [projects],
+  )
+
+  const canCreate = mergeMode
+    ? Boolean(newName.trim() && mergeLeftId && mergeRightId && mergeLeftId !== mergeRightId)
+    : Boolean(newName.trim())
+
   async function handleCreate() {
-    if (!newName.trim()) return
+    if (!canCreate) return
     setCreating(true)
     try {
-      const p = await createProject(newName.trim())
+      const p = mergeMode
+        ? await mergeProjects(newName.trim(), mergeLeftId, mergeRightId)
+        : await createProject(newName.trim())
       setProjects(prev => [...prev, p])
       setProject(p)
-      setCurrentVideo(null)
+      const vids = Object.keys(p.videos)
+      setCurrentVideo(vids.length > 0 ? vids[vids.length - 1] : null)
       setNewName('')
+      setMergeLeftId('')
+      setMergeRightId('')
+      addToast(
+        mergeMode
+          ? `Merged projects into "${p.name}" (${vids.length} videos)`
+          : `Created project "${p.name}"`,
+        'success',
+      )
+    } catch {
+      addToast(mergeMode ? 'Failed to merge projects' : 'Failed to create project', 'error')
     } finally {
       setCreating(false)
     }
@@ -225,20 +252,73 @@ export default function ProjectDrawer() {
 
           {/* New project */}
           <div className="space-y-2">
-            <label className="text-xs text-[#666] uppercase tracking-wider">New Project</label>
+            <div className="flex items-center justify-between gap-2">
+              <label className="text-xs text-[#666] uppercase tracking-wider">New Project</label>
+              <label className="flex items-center gap-1.5 text-[10px] text-[#888] cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={mergeMode}
+                  onChange={e => setMergeMode(e.target.checked)}
+                  className="rounded border-[#444]"
+                />
+                Merge two projects
+              </label>
+            </div>
+            {mergeMode && (
+              <p className="text-[10px] text-[#666] leading-snug">
+                Copies all videos and annotations into a new project. Original projects are kept unchanged.
+              </p>
+            )}
+            {mergeMode && (
+              <div className="space-y-2">
+                <select
+                  value={mergeLeftId}
+                  onChange={e => setMergeLeftId(e.target.value)}
+                  className="w-full text-sm"
+                  disabled={mergeableProjects.length === 0}
+                >
+                  <option value="">First project…</option>
+                  {mergeableProjects.map(p => (
+                    <option key={p.id} value={p.id}>
+                      {p.name} ({Object.keys(p.videos).length} videos)
+                    </option>
+                  ))}
+                </select>
+                <select
+                  value={mergeRightId}
+                  onChange={e => setMergeRightId(e.target.value)}
+                  className="w-full text-sm"
+                  disabled={mergeableProjects.length === 0}
+                >
+                  <option value="">Second project…</option>
+                  {mergeableProjects.map(p => (
+                    <option key={p.id} value={p.id}>
+                      {p.name} ({Object.keys(p.videos).length} videos)
+                    </option>
+                  ))}
+                </select>
+                {mergeLeftId && mergeRightId && mergeLeftId === mergeRightId && (
+                  <p className="text-[10px] text-red-400">Choose two different projects.</p>
+                )}
+                {mergeableProjects.length < 2 && (
+                  <p className="text-[10px] text-amber-500/90">Need at least two projects to merge.</p>
+                )}
+              </div>
+            )}
             <div className="flex gap-2">
               <input
                 type="text"
                 value={newName}
                 onChange={e => setNewName(e.target.value)}
                 onKeyDown={e => e.key === 'Enter' && handleCreate()}
-                placeholder="Project name..."
+                placeholder={mergeMode ? 'Merged project name…' : 'Project name…'}
                 className="flex-1 text-sm"
               />
               <button
                 onClick={handleCreate}
-                disabled={creating || !newName.trim()}
+                disabled={creating || !canCreate}
                 className="btn btn-primary px-2"
+                title={mergeMode ? 'Merge projects' : 'Create project'}
               >
                 <Plus size={14} />
               </button>
