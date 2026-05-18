@@ -3,7 +3,7 @@ import { X, Plus, Film, FolderOpen, Trash2 } from 'lucide-react'
 import { useStore } from '../store/useStore'
 import { useResizable } from '../hooks/useResizable'
 import ProjectsFolderBrowserModal from './ProjectsFolderBrowserModal'
-import { listProjects, createProject, deleteProject, getProject, getProjectsRoot } from '../api/client'
+import { listProjects, createProject, deleteProject, getProject, getProjectsRoot, removeVideo } from '../api/client'
 import type { ProjectsRootInfo } from '../api/client'
 import type { Project } from '../types'
 import VideoProgressRings from './VideoProgressRings'
@@ -15,6 +15,7 @@ export default function ProjectDrawer() {
     currentVideoId,
     setUploadModalOpen,
     addToast,
+    clearHistory,
   } = useStore()
 
   const [projects, setProjects] = useState<Project[]>([])
@@ -115,6 +116,39 @@ export default function ProjectDrawer() {
   function handleSelectVideo(vid: string) {
     setCurrentVideo(vid)
     setDrawerOpen(false)
+  }
+
+  async function handleDeleteVideo(vid: string, e: React.MouseEvent) {
+    e.stopPropagation()
+    if (!project) return
+    const meta = project.videos[vid]
+    const label = meta?.name ?? 'this video'
+    if (
+      !confirm(
+        `Delete "${label}" from this project?\n\n` +
+          'The video file and all annotations, masks, and tracking data on disk will be removed. This cannot be undone.',
+      )
+    ) {
+      return
+    }
+    try {
+      await removeVideo(project.id, vid)
+      const nextVideos = { ...project.videos }
+      delete nextVideos[vid]
+      const nextProject: Project = { ...project, videos: nextVideos }
+      setProjects(prev => prev.map(p => (p.id === project.id ? nextProject : p)))
+      setProject(nextProject)
+      clearHistory()
+      if (currentVideoId === vid) {
+        const sorted = Object.values(nextVideos).sort((a, b) =>
+          a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }),
+        )
+        setCurrentVideo(sorted.length > 0 ? sorted[0].id : null)
+      }
+      addToast(`Removed "${label}"`, 'success')
+    } catch {
+      addToast('Failed to delete video', 'error')
+    }
   }
 
   const currentVideos = useMemo(() => {
@@ -266,22 +300,36 @@ export default function ProjectDrawer() {
                 </div>
               )}
               {currentVideos.map(v => (
-                <button
+                <div
                   key={v.id}
-                  onClick={() => handleSelectVideo(v.id)}
-                  className={`w-full flex items-center gap-2 px-3 py-2 rounded-lg text-left text-sm transition-colors border ${
+                  className={`w-full flex items-center gap-1 pl-3 pr-1 py-2 rounded-lg text-sm transition-colors border ${
                     currentVideoId === v.id
-                      ? 'bg-blue-600/18 text-[#dce9ff] border-blue-500/35 hover:bg-blue-600/24'
+                      ? 'bg-blue-600/18 text-[#dce9ff] border-blue-500/35'
                       : 'border-transparent text-[#ccc] hover:bg-[#1a1a1a]'
                   }`}
                 >
-                  <Film size={14} className="flex-shrink-0 mt-0.5" />
-                  <div className="flex-1 min-w-0">
-                    <div className="truncate">{v.name}</div>
-                    <div className="text-[#555] text-xs">{v.num_frames} frames • {v.fps.toFixed(1)} fps</div>
-                  </div>
-                  <VideoProgressRings video={v} />
-                </button>
+                  <button
+                    type="button"
+                    onClick={() => handleSelectVideo(v.id)}
+                    className="flex-1 flex items-center gap-2 min-w-0 text-left rounded-md -my-1 py-1 pr-1 hover:bg-white/5"
+                  >
+                    <Film size={14} className="flex-shrink-0 mt-0.5" />
+                    <div className="flex-1 min-w-0">
+                      <div className="truncate">{v.name}</div>
+                      <div className="text-[#555] text-xs">{v.num_frames} frames • {v.fps.toFixed(1)} fps</div>
+                    </div>
+                    <VideoProgressRings video={v} />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={e => void handleDeleteVideo(v.id, e)}
+                    className="text-[#555] hover:text-red-400 p-1.5 rounded shrink-0"
+                    title="Delete video from project"
+                    aria-label={`Delete video ${v.name}`}
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                </div>
               ))}
 
               <button
