@@ -16,3 +16,28 @@ export function computeAnchorFrames(
   else if (anchors[anchors.length - 1] !== last) anchors.push(last)
   return anchors
 }
+
+/** 0-based anchor indices whose frame index is in `annotatedFrames`. */
+export function annotatedAnchorIndicesFromFrames(
+  anchorFrames: number[],
+  annotatedFrames: number[],
+): number[] {
+  const done = new Set(annotatedFrames)
+  const idxs: number[] = []
+  anchorFrames.forEach((fr, i) => {
+    if (done.has(fr)) idxs.push(i)
+  })
+  return idxs
+}
+
+/** First anchor index not present in `labeledFrameIndices` (queue order); `anchorFrames.length` if all done. */
+export function firstUnlabeledAnchorIndex(
+  anchorFrames: number[],
+  labeledFrameIndices: Iterable<number>,
+): number {
+  const done = new Set(labeledFrameIndices)
+  for (let i = 0; i < anchorFrames.length; i++) {
+    if (!done.has(anchorFrames[i]!)) return i
+  }
+  return anchorFrames.length
+}

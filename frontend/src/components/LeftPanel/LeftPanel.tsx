@@ -14,6 +14,10 @@ import {
 } from '../../api/client'
 import { getObjectColor } from '../../utils/colors'
 import { clearMaskCache } from '../../utils/maskUtils'
+import {
+  annotatedAnchorIndicesFromFrames,
+  firstUnlabeledAnchorIndex,
+} from '../../utils/anchorFrames'
 import ObjectCard from './ObjectCard'
 import StepIndicator from './StepIndicator'
 import type { PropagationEvent } from '../../types'
@@ -221,23 +225,68 @@ export default function LeftPanel() {
 
   // ── Anchor Annotation Phase ──────────────────────────────────────────────────
 
+  function labeledAnchorFrameSet(extraIndices: number[] = []): Set<number> {
+    const fromVideo = video?.annotated_anchors ?? []
+    const frames = new Set(fromVideo)
+    for (const i of extraIndices) {
+      const fr = anchorFrames[i]
+      if (fr !== undefined) frames.add(fr)
+    }
+    for (const i of annotatedAnchorIndices) {
+      const fr = anchorFrames[i]
+      if (fr !== undefined) frames.add(fr)
+    }
+    return frames
+  }
+
+  function goToFirstUnlabeledAnchor(
+    frames: number[],
+    labeledFrames: Set<number>,
+    options?: { toastIfAlreadyThere?: boolean },
+  ): boolean {
+    const nextIndex = firstUnlabeledAnchorIndex(frames, labeledFrames)
+    if (nextIndex >= frames.length) return false
+    if (
+      options?.toastIfAlreadyThere &&
+      nextIndex === currentAnchorIndex &&
+      currentFrame === frames[nextIndex]
+    ) {
+      addToast('You are already on the next anchor in the labeling queue.', 'info')
+      return true
+    }
+    anchorEnteredMsRef.current[nextIndex] = Date.now()
+    setCurrentAnchorIndex(nextIndex)
+    setCurrentFrame(frames[nextIndex]!)
+    return true
+  }
+
   async function handleStartAnchorAnnotation() {
     if (!hasObjects) return
     setTrackingError('')
 
-    // Fetch anchor frames
     try {
       const { anchor_frames, manual_anchor_prefix_before_infer: manualPre } = await getAnchorFrames(pid, vid)
       manualAnchorPrefixRef.current = typeof manualPre === 'number' && manualPre >= 1 ? manualPre : 5
+      const annFr = video?.annotated_anchors ?? []
+      const doneIndices = annotatedAnchorIndicesFromFrames(anchor_frames, annFr)
+      setAnnotatedAnchorIndices(doneIndices)
+
+      const nextIndex = firstUnlabeledAnchorIndex(anchor_frames, annFr)
+      if (nextIndex >= anchor_frames.length) {
+        addToast('All anchor frames are already labeled.', 'info')
+        return
+      }
+
       setAnchorFrames(anchor_frames)
-      setCurrentAnchorIndex(0)
       setAnchorPhase(true)
       anchorEnteredMsRef.current = {}
-      anchorEnteredMsRef.current[0] = Date.now()
-      // Navigate to first anchor frame
-      setCurrentFrame(anchor_frames[0] ?? propagationStartFrame)
+      goToFirstUnlabeledAnchor(anchor_frames, new Set(annFr))
+
+      const resumed = nextIndex > 0
       addToast(
-        "You're being timed — per-anchor and whole-video durations are saved in your project.",
+        resumed
+          ? `Resuming anchor labeling at frame ${anchor_frames[nextIndex]} (${nextIndex + 1}/${anchor_frames.length}).`
+          : "You're being timed — per-anchor and whole-video durations are saved in your project.",
         'success',
       )
     } catch (e: unknown) {
@@ -245,6 +294,20 @@ export default function LeftPanel() {
       setTrackingError(msg)
     }
   }
+
+  function handleGoToQueueAnchor() {
+    if (!anchorPhase || anchorFrames.length === 0) return
+    if (anchorRemainderInferencing && !anchorRemainderAwaitingCommit) return
+    goToFirstUnlabeledAnchor(anchorFrames, labeledAnchorFrameSet(), { toastIfAlreadyThere: true })
+  }
+
+  const queueAnchorIndex =
+    anchorPhase && anchorFrames.length > 0
+      ? firstUnlabeledAnchorIndex(anchorFrames, labeledAnchorFrameSet())
+      : anchorFrames.length
+  const offQueueAnchor =
+    queueAnchorIndex < anchorFrames.length &&
+    (currentAnchorIndex !== queueAnchorIndex || currentFrame !== anchorFrames[queueAnchorIndex])
 
   async function runAnchorRemainderPrediction(): Promise<void> {
     setAnchorRemainderInferencing(true)
@@ -263,11 +326,7 @@ export default function LeftPanel() {
       const fresh = await getProject(pid)
       setProject(fresh)
       const annFr = fresh.videos[vid]?.annotated_anchors ?? []
-      const idxs: number[] = []
-      anchorFrames.forEach((fr, i) => {
-        if (annFr.includes(fr)) idxs.push(i)
-      })
-      setAnnotatedAnchorIndices(idxs.sort((a, b) => a - b))
+      setAnnotatedAnchorIndices(annotatedAnchorIndicesFromFrames(anchorFrames, annFr))
     }
 
     const maskLoadTimeoutMs = 90_000
@@ -1191,6 +1250,15 @@ export default function LeftPanel() {
                   </>
                 ) : null}
               </p>
+              {offQueueAnchor && (
+                <button
+                  type="button"
+                  onClick={handleGoToQueueAnchor}
+                  className="mt-2 w-full text-xs py-1.5 px-2 rounded-md border border-blue-600/50 bg-blue-600/20 hover:bg-blue-600/30 text-blue-200 font-medium transition-colors"
+                >
+                  Go to next in queue — anchor {queueAnchorIndex + 1} (frame #{anchorFrames[queueAnchorIndex]})
+                </button>
+              )}
               {showInferRemainderButton && (
                 <button
                   type="button"
