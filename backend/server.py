@@ -29,7 +29,10 @@ from sse_starlette.sse import EventSourceResponse
 from anchor_helpers import (
     ANCHOR_MANUAL_PREFIX_COUNT,
     STREAM_BATCH_SIZE,
+    anchor_labeling_has_started,
     compute_anchor_frames,
+    normalize_anchor_batch_size,
+    video_anchor_batch_size,
 )
 from project_manager import ProjectManager
 from sam_predictor import SAMPredictor, _get_predictor
@@ -323,7 +326,8 @@ async def _run_anchor_remainder_inference_bg(
 
         start_f = int(video_f.get("start_frame") or 0)
         nframes = int(video_f["num_frames"])
-        anchors = compute_anchor_frames(start_f, nframes, STREAM_BATCH_SIZE)
+        batch_sz = video_anchor_batch_size(video_f)
+        anchors = compute_anchor_frames(start_f, nframes, batch_sz)
 
         annotated = sorted(set(video_f.get("annotated_anchors") or []))
         annotated_set = set(annotated)
@@ -347,7 +351,7 @@ async def _run_anchor_remainder_inference_bg(
         if not queue:
             vid_up = pm.get_video(pid, vid)
             if vid_up is not None:
-                req_a = compute_anchor_frames(start_f, int(vid_up["num_frames"]), STREAM_BATCH_SIZE)
+                req_a = compute_anchor_frames(start_f, int(vid_up["num_frames"]), batch_sz)
                 ann_now = sorted(set(vid_up.get("annotated_anchors") or []))
                 if bool(req_a) and all(a in ann_now for a in req_a):
                     pm.update_video(pid, vid, {"anchor_labeling_complete": True})
@@ -469,7 +473,7 @@ async def _run_anchor_remainder_inference_bg(
 
                     vf = pm.get_video(pid, vid)
                     ann2 = sorted(set((vf.get("annotated_anchors") or []) + [tgt]))
-                    req_a = compute_anchor_frames(start_f, int(vf["num_frames"]), STREAM_BATCH_SIZE)
+                    req_a = compute_anchor_frames(start_f, int(vf["num_frames"]), batch_sz)
                     pm.update_video(pid, vid, {
                         "annotated_anchors": ann2,
                         "anchor_labeling_complete": bool(req_a) and all(a in set(ann2) for a in req_a),
@@ -1111,17 +1115,25 @@ def video_info(pid: str, vid: str):
 
 class UpdateVideoRequest(BaseModel):
     start_frame: Optional[int] = None
+    anchor_batch_size: Optional[int] = None
 
 
 @app.patch("/api/projects/{pid}/videos/{vid}")
 def update_video_meta(pid: str, vid: str, req: UpdateVideoRequest):
-    """Update mutable video metadata fields (e.g. start_frame)."""
+    """Update mutable video metadata fields (e.g. start_frame, anchor_batch_size)."""
     video = pm.get_video(pid, vid)
     if video is None:
         raise HTTPException(404, "Video not found")
     updates = {k: v for k, v in req.model_dump().items() if v is not None}
     if not updates:
         return video
+    if "anchor_batch_size" in updates:
+        if anchor_labeling_has_started(video):
+            raise HTTPException(
+                409,
+                "Anchor labeling has already started — anchor frame interval cannot be changed.",
+            )
+        updates["anchor_batch_size"] = normalize_anchor_batch_size(updates["anchor_batch_size"])
     return pm.update_video(pid, vid, updates)
 
 
@@ -1491,7 +1503,9 @@ def rebuild_session_from_config(pid: str, vid: str, req: RebuildSessionRequest):
             af = req.anchor_frame
             start_f = video.get("start_frame", 0)
             num_frames_v = video["num_frames"]
-            anchor_frames = compute_anchor_frames(start_f, num_frames_v, STREAM_BATCH_SIZE)
+            anchor_frames = compute_anchor_frames(
+                start_f, num_frames_v, video_anchor_batch_size(video),
+            )
             if af not in anchor_frames:
                 raise HTTPException(
                     409,
@@ -1858,7 +1872,9 @@ def add_points(pid: str, vid: str, oid: str, req: AddPointsRequest):
     if req.anchor_mode:
         start_f = video.get("start_frame", 0)
         num_frames_v = video["num_frames"]
-        anchor_frames = compute_anchor_frames(start_f, num_frames_v, STREAM_BATCH_SIZE)
+        anchor_frames = compute_anchor_frames(
+            start_f, num_frames_v, video_anchor_batch_size(video),
+        )
         if req.frame_idx not in anchor_frames:
             raise HTTPException(
                 409,
@@ -2258,10 +2274,12 @@ def get_anchor_frames(pid: str, vid: str):
         raise HTTPException(404, "Video not found")
     start = video.get("start_frame", 0)
     num_frames = video["num_frames"]
-    anchors = compute_anchor_frames(start, num_frames, STREAM_BATCH_SIZE)
+    batch_sz = video_anchor_batch_size(video)
+    anchors = compute_anchor_frames(start, num_frames, batch_sz)
     return {
         "anchor_frames": anchors,
         "count": len(anchors),
+        "anchor_batch_size": batch_sz,
         "manual_anchor_prefix_before_infer": ANCHOR_MANUAL_PREFIX_COUNT,
     }
 
@@ -2315,7 +2333,7 @@ def commit_anchor_frame(pid: str, vid: str, frame_idx: int, req: CommitAnchorReq
 
     start = int(video.get("start_frame") or 0)
     num_frames_v = int(video["num_frames"])
-    req_anchors = compute_anchor_frames(start, num_frames_v, STREAM_BATCH_SIZE)
+    req_anchors = compute_anchor_frames(start, num_frames_v, video_anchor_batch_size(video))
     ann_set = set(annotated)
     updates["anchor_labeling_complete"] = bool(req_anchors) and all(a in ann_set for a in req_anchors)
 
@@ -2405,11 +2423,12 @@ async def _run_propagation_bg(
     use_all_anchors: bool = False,
     ds_max_dim: Optional[int] = None,
     ds_scale_factor: Optional[float] = None,
+    batch_size: int = STREAM_BATCH_SIZE,
 ) -> None:
     """
     Forward-only batch propagation.
 
-    Processes frames start_frame..num_frames-1 in STREAM_BATCH_SIZE chunks.
+    Processes frames start_frame..num_frames-1 in batch_size chunks.
     Each batch [P1, P2]:
       - Seeds P1 from the previous frame's saved mask (cross-batch continuity /
         resume continuity), when P1 > 0 and masks exist for frame P1-1.
@@ -2436,8 +2455,8 @@ async def _run_propagation_bg(
     batches: list[tuple[int, int]] = []
     p = start_frame
     while p <= effective_end:
-        batches.append((p, min(p + STREAM_BATCH_SIZE - 1, effective_end)))
-        p += STREAM_BATCH_SIZE
+        batches.append((p, min(p + batch_size - 1, effective_end)))
+        p += batch_size
 
     total_batches = len(batches)
     frames_to_process = effective_end - start_frame + 1
@@ -2790,6 +2809,7 @@ async def propagate_video(pid: str, vid: str, start_frame: int = 0, resume_from:
         except Exception as e:
             logger.warning(f"Persist inference running status: {e}")
         ds_max_dim, ds_scale_factor = _video_ds_params(video)
+        batch_sz = video_anchor_batch_size(video)
         state.task = asyncio.create_task(
             _run_propagation_bg(
                 pid, vid, actual_start, source_path, num_frames,
@@ -2798,6 +2818,7 @@ async def propagate_video(pid: str, vid: str, start_frame: int = 0, resume_from:
                 use_all_anchors=use_all_anchors,
                 ds_max_dim=ds_max_dim,
                 ds_scale_factor=ds_scale_factor,
+                batch_size=batch_sz,
             )
         )
     else:

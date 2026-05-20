@@ -45,6 +45,8 @@ export interface VideoMeta {
   width: number
   height: number
   start_frame?: number
+  /** Frames between anchor samples and propagation batches (default 1000). Locked after labeling starts. */
+  anchor_batch_size?: number
   objects: Record<string, ObjectDef>
   point_prompts: Record<string, PointPrompts>
   sam3_session_id: string | null

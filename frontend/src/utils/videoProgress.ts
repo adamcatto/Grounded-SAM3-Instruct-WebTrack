@@ -1,12 +1,12 @@
 import type { VideoMeta } from '../types'
-import { computeAnchorFrames } from './anchorFrames'
+import { computeAnchorFrames, videoAnchorBatchSize } from './anchorFrames'
 
 /** 0–100: how many computed anchor indices have evidence of labeling.
  *  A frame counts as labeled if it appears in annotated_anchors OR if any
  *  object has point_prompts saved for that frame (handles commits that didn't persist). */
 export function anchorLabelingPercent(v: VideoMeta): number {
   const start = v.start_frame ?? 0
-  const anchors = computeAnchorFrames(start, v.num_frames)
+  const anchors = computeAnchorFrames(start, v.num_frames, videoAnchorBatchSize(v))
   if (anchors.length === 0) return 0
   const done = new Set(v.annotated_anchors ?? [])
   // Also count frames with saved point prompts for any object

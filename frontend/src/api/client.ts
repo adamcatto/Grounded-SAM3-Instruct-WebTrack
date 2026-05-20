@@ -134,8 +134,11 @@ export const getVideoInfo = (pid: string, vid: string) =>
     `/projects/${pid}/videos/${vid}/info`
   ).then(r => r.data)
 
-export const updateVideoMeta = (pid: string, vid: string, updates: { start_frame?: number }) =>
-  api.patch(`/projects/${pid}/videos/${vid}`, updates).then(r => r.data)
+export const updateVideoMeta = (
+  pid: string,
+  vid: string,
+  updates: { start_frame?: number; anchor_batch_size?: number },
+) => api.patch(`/projects/${pid}/videos/${vid}`, updates).then(r => r.data)
 
 export const removeVideo = (pid: string, vid: string) =>
   api.delete(`/projects/${pid}/videos/${vid}`)
@@ -385,6 +388,7 @@ export const startPropagationSSE = (pid: string, vid: string, startFrame = 0, re
 export interface AnchorFramesResponse {
   anchor_frames: number[]
   count: number
+  anchor_batch_size?: number
   manual_anchor_prefix_before_infer?: number
 }
 

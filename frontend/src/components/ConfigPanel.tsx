@@ -3,7 +3,15 @@ import { Save } from 'lucide-react'
 import { useStore, currentVideo as selectCurrentVideo } from '../store/useStore'
 import { checkHealth, updateVideoMeta, downsampleVideo } from '../api/client'
 import type { DownsampleOptions } from '../api/client'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import {
+  ANCHOR_BATCH_SIZE_MAX,
+  ANCHOR_BATCH_SIZE_MIN,
+  computeAnchorFrames,
+  hasAnchorLabelingStarted,
+  normalizeAnchorBatchSize,
+  videoAnchorBatchSize,
+} from '../utils/anchorFrames'
 
 // ─── Primitive controls ────────────────────────────────────────────────────────
 
@@ -94,7 +102,7 @@ function SliderRow({ label, description, value, onChange, min, max, step, format
   )
 }
 
-function NumberRow({ label, description, value, onChange, onCommit, min, max }: {
+function NumberRow({ label, description, value, onChange, onCommit, min, max, disabled }: {
   label: string
   description: string
   value: number
@@ -102,25 +110,63 @@ function NumberRow({ label, description, value, onChange, onCommit, min, max }: 
   onCommit: (v: number) => void
   min: number
   max: number
+  disabled?: boolean
 }) {
+  const [draft, setDraft] = useState(() => String(value))
+  const focusedRef = useRef(false)
+
+  useEffect(() => {
+    if (!focusedRef.current) setDraft(String(value))
+  }, [value])
+
+  function clamp(n: number) {
+    return Math.max(min, Math.min(max, n))
+  }
+
+  function commitDraft() {
+    const trimmed = draft.trim()
+    const parsed = trimmed === '' ? null : parseInt(trimmed, 10)
+    const committed =
+      parsed !== null && Number.isFinite(parsed) ? clamp(parsed) : value
+    setDraft(String(committed))
+    onChange(committed)
+    onCommit(committed)
+  }
+
   return (
-    <div className="flex items-start gap-4 py-3 border-b border-[#1e1e1e] last:border-0">
+    <div className={`flex items-start gap-4 py-3 border-b border-[#1e1e1e] last:border-0 ${disabled ? 'opacity-50' : ''}`}>
       <div className="flex-1 min-w-0">
         <p className="text-sm text-[#ddd] font-medium">{label}</p>
         <p className="text-xs text-[#666] mt-0.5 leading-relaxed">{description}</p>
       </div>
       <input
-        type="number"
-        min={min}
-        max={max}
-        value={value}
-        onChange={e => {
-          const v = Math.max(min, Math.min(max, parseInt(e.target.value) || min))
-          onChange(v)
+        type="text"
+        inputMode="numeric"
+        autoComplete="off"
+        spellCheck={false}
+        value={draft}
+        disabled={disabled}
+        onFocus={e => {
+          focusedRef.current = true
+          setDraft(String(value))
+          requestAnimationFrame(() => e.currentTarget.select())
         }}
-        onKeyDown={e => { if (e.key === 'Enter') onCommit(value) }}
-        onBlur={() => onCommit(value)}
-        className="w-20 flex-shrink-0 text-xs py-1 px-2 rounded bg-[#1a1a1a] border border-[#333] text-[#ccc] text-right"
+        onChange={e => {
+          setDraft(e.target.value.replace(/\D/g, ''))
+        }}
+        onKeyDown={e => {
+          if (disabled) return
+          if (e.key === 'Enter') {
+            e.preventDefault()
+            commitDraft()
+            e.currentTarget.blur()
+          }
+        }}
+        onBlur={() => {
+          focusedRef.current = false
+          if (!disabled) commitDraft()
+        }}
+        className="w-20 flex-shrink-0 text-xs py-1 px-2 rounded bg-[#1a1a1a] border border-[#333] text-[#ccc] text-right disabled:cursor-not-allowed"
       />
     </div>
   )
@@ -145,7 +191,7 @@ export default function ConfigPanel() {
   const {
     config, setConfig, configDirty, persistConfig,
     propagationStartFrame, setPropagationStartFrame, setCurrentFrame,
-    project, currentVideoId, updateVideo,
+    project, currentVideoId, updateVideo, addToast,
   } = store
 
   const pid = project?.id ?? ''
@@ -160,10 +206,17 @@ export default function ConfigPanel() {
   const [dsAllRunning, setDsAllRunning] = useState(false)
   const [dsAllProgress, setDsAllProgress] = useState<{ done: number; total: number; current: string } | null>(null)
   const [dsAllMessage, setDsAllMessage] = useState<{ text: string; ok: boolean } | null>(null)
+  const [anchorBatchSizeLocal, setAnchorBatchSizeLocal] = useState(() =>
+    videoAnchorBatchSize(video, config.anchorBatchSize),
+  )
 
   useEffect(() => {
     checkHealth().then(h => setModelInfo({ model: h.sam_model, sam_ready: h.sam_ready })).catch(() => {})
   }, [])
+
+  useEffect(() => {
+    setAnchorBatchSizeLocal(videoAnchorBatchSize(video, config.anchorBatchSize))
+  }, [vid, video?.anchor_batch_size, config.anchorBatchSize, video])
 
   function handleSave() {
     persistConfig()
@@ -178,6 +231,35 @@ export default function ConfigPanel() {
         await updateVideoMeta(pid, vid, { start_frame: v })
         updateVideo({ start_frame: v })
       } catch { /* non-critical */ }
+    }
+  }
+
+  const anchorLabelingLocked = video
+    ? hasAnchorLabelingStarted(video, config.anchorBatchSize)
+    : false
+
+  const anchorPreviewCount = video
+    ? computeAnchorFrames(propagationStartFrame, video.num_frames, anchorBatchSizeLocal).length
+    : null
+
+  async function commitAnchorBatchSize(v: number) {
+    const normalized = normalizeAnchorBatchSize(v, config.anchorBatchSize)
+    setAnchorBatchSizeLocal(normalized)
+    setConfig({ anchorBatchSize: normalized })
+    if (!pid || !vid) return
+    try {
+      await updateVideoMeta(pid, vid, { anchor_batch_size: normalized })
+      updateVideo({ anchor_batch_size: normalized })
+    } catch (e: unknown) {
+      const detail =
+        e && typeof e === 'object' && 'response' in e
+          ? (e as { response?: { data?: { detail?: string } } }).response?.data?.detail
+          : undefined
+      addToast(
+        typeof detail === 'string' ? detail : 'Could not update anchor frame interval',
+        'error',
+      )
+      setAnchorBatchSizeLocal(videoAnchorBatchSize(video, config.anchorBatchSize))
     }
   }
 
@@ -427,6 +509,25 @@ export default function ConfigPanel() {
 
         {/* Tracking */}
         <Section title="Tracking">
+          <NumberRow
+            label="Anchor frame interval (frames)"
+            description={
+              (anchorLabelingLocked
+                ? 'Locked after anchor labeling has started on this video. '
+                : '') +
+              'Spacing between anchor frames to label before tracking (from start frame through end). ' +
+              'Also sets whole-video propagation batch size. ' +
+              (anchorPreviewCount != null
+                ? `Current video: ${anchorPreviewCount} anchor frame${anchorPreviewCount === 1 ? '' : 's'}.`
+                : 'Select a video to preview anchor count.')
+            }
+            value={anchorBatchSizeLocal}
+            onChange={setAnchorBatchSizeLocal}
+            onCommit={commitAnchorBatchSize}
+            min={ANCHOR_BATCH_SIZE_MIN}
+            max={ANCHOR_BATCH_SIZE_MAX}
+            disabled={anchorLabelingLocked || !video}
+          />
           <ToggleRow
             label="Default to all-anchor context mode"
             description={

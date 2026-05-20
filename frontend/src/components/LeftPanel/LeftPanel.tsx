@@ -17,6 +17,7 @@ import { clearMaskCache } from '../../utils/maskUtils'
 import {
   annotatedAnchorIndicesFromFrames,
   firstUnlabeledAnchorIndex,
+  videoAnchorBatchSize,
 } from '../../utils/anchorFrames'
 import ObjectCard from './ObjectCard'
 import StepIndicator from './StepIndicator'
@@ -163,7 +164,8 @@ export default function LeftPanel() {
       setTrackFrame(lastFrame + 1)
       setExtractedFrameCount(lastFrame + 1)
       setActualStartFrame(startF)
-      totalBatchesRef.current = Math.max(1, Math.ceil((total - startF) / 1000))
+      const batchSz = videoAnchorBatchSize(video, useStore.getState().config.anchorBatchSize)
+      totalBatchesRef.current = Math.max(1, Math.ceil((total - startF) / batchSz))
 
       if (status.propagation_complete) {
         if (useStore.getState().propagationStatus !== 'done') {

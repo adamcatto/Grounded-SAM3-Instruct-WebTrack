@@ -353,6 +353,7 @@ class ProjectManager:
             "width": width,
             "height": height,
             "start_frame": 0,
+            "anchor_batch_size": 1000,
             "objects": {},
             "point_prompts": {},
             "sam3_session_id": None,

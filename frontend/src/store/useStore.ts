@@ -25,6 +25,8 @@ export interface AppConfig {
   useAllAnchors: boolean  // default tracking method when anchor frames are labeled
   /** After the manual anchor prefix, auto-run SAM to fill remaining anchors (SSE job). Default off. */
   autoInferAnchorRemainder: boolean
+  /** Default anchor / propagation batch interval (frames) for new videos. */
+  anchorBatchSize: number
 }
 
 const CONFIG_KEY = 'sam3wt_config'
@@ -36,6 +38,7 @@ const CONFIG_DEFAULTS: AppConfig = {
   pointSize: 1.0,
   useAllAnchors: false,
   autoInferAnchorRemainder: false,
+  anchorBatchSize: 1000,
 }
 
 function loadConfig(): AppConfig {
