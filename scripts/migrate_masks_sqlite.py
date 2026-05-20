@@ -7,6 +7,8 @@ Run from repo root with backend on PYTHONPATH, e.g.:
 
 Or migrate every propagation-complete video in a project:
   python scripts/migrate_masks_sqlite.py --project-dir /path/to/project --all-complete
+
+Progress bars use tqdm when installed (see backend/requirements.txt); use ``--no-progress`` to disable.
 """
 
 from __future__ import annotations
@@ -33,6 +35,39 @@ from video_processor import (  # noqa: E402
     bbox_norm_xywh_score_from_mask,
     load_masks_npz,
 )
+
+
+class _NullProgress:
+    """Minimal tqdm-like API for manual updates when tqdm is not installed."""
+
+    def __init__(self, total=None):
+        self.total = total
+        self.n = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def update(self, n=1):
+        self.n += n
+
+
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+
+    def tqdm(iterable=None, *, total=None, desc=None, unit=None, disable=False, **_kw):  # type: ignore
+        """No-op fallback when tqdm is not installed."""
+        if disable:
+            if iterable is not None:
+                return iterable
+            return _NullProgress(total=total)
+        if iterable is not None:
+            return iterable
+        return _NullProgress(total=total)
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("migrate_masks_sqlite")
@@ -80,6 +115,7 @@ def migrate_video(
     *,
     batch_size: int,
     dry_run: bool,
+    show_progress: bool,
 ) -> tuple[int, int, int]:
     """
     Returns (frames_imported, npz_frames_seen, bbox_json_missing_count).
@@ -90,7 +126,12 @@ def migrate_video(
     bbox_missing = 0
     rows_ready: list[tuple[int, bytes, str]] = []
 
-    for fi in indices:
+    for fi in tqdm(
+        indices,
+        desc=f"Read NPZ [{video_dir.name}]",
+        unit="frm",
+        disable=not show_progress or not indices,
+    ):
         npz_path = masks_dir / f"{fi:06d}.npz"
         masks = load_masks_npz(str(npz_path))
         if not masks:
@@ -127,7 +168,13 @@ def migrate_video(
     conn = storage._connect()
     try:
         total_rows = len(rows_ready)
-        for batch_start in range(0, total_rows, batch_size):
+        batches = range(0, total_rows, batch_size)
+        for batch_start in tqdm(
+            batches,
+            desc=f"SQLite insert [{video_dir.name}]",
+            unit="batch",
+            disable=not show_progress or total_rows == 0,
+        ):
             chunk = rows_ready[batch_start : batch_start + batch_size]
             conn.execute("BEGIN IMMEDIATE")
             for fi, blob, bjson in chunk:
@@ -148,12 +195,22 @@ def migrate_video(
     return imported, npz_seen, bbox_missing
 
 
-def verify_frames(video_dir: Path, frame_indices: list[int]) -> tuple[bool, str]:
+def verify_frames(
+    video_dir: Path,
+    frame_indices: list[int],
+    *,
+    show_progress: bool,
+) -> tuple[bool, str]:
     masks_dir = video_dir / "masks"
     ms = VideoMaskStorage(video_dir)
     conn = ms._connect()
     try:
-        for fi in frame_indices:
+        for fi in tqdm(
+            frame_indices,
+            desc=f"Verify [{video_dir.name}]",
+            unit="frm",
+            disable=not show_progress or not frame_indices,
+        ):
             row = conn.execute(
                 "SELECT seg_blob, bbox_json FROM frame_segmentation WHERE frame_idx=?",
                 (fi,),
@@ -234,7 +291,13 @@ def main() -> int:
         help="Remove masks/*.npz and bboxes/*.json after successful verify",
     )
     ap.add_argument("--yes", action="store_true", help="Confirm --delete-legacy")
+    ap.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable tqdm progress bars (default: show if tqdm is installed)",
+    )
     args = ap.parse_args()
+    show_progress = not args.no_progress
 
     video_dirs: list[Path] = []
     if args.video_dir:
@@ -258,10 +321,17 @@ def main() -> int:
         ap.error("Specify --video-dir or (--project-dir and --video-id) or (--project-dir and --all-complete)")
         return 2
 
-    rng_frames = []
-    for vd in video_dirs:
+    for vd in tqdm(
+        video_dirs,
+        desc="Videos",
+        unit="video",
+        disable=not show_progress or len(video_dirs) <= 1,
+    ):
         imported, npz_seen, bbox_miss = migrate_video(
-            vd, batch_size=args.batch_size, dry_run=args.dry_run
+            vd,
+            batch_size=args.batch_size,
+            dry_run=args.dry_run,
+            show_progress=show_progress,
         )
         if args.dry_run:
             continue
@@ -281,7 +351,7 @@ def main() -> int:
             check_idx = []
 
         if check_idx:
-            ok, msg = verify_frames(vd, check_idx)
+            ok, msg = verify_frames(vd, check_idx, show_progress=show_progress)
             if not ok:
                 logger.error("VERIFY FAILED %s: %s", vd, msg)
                 return 3

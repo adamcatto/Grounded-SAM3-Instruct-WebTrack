@@ -11,5 +11,6 @@ einops
 decord
 pycocotools
 psutil
+tqdm>=4.66
 PyYAML>=6.0
 
