@@ -3,7 +3,8 @@ import { Save } from 'lucide-react'
 import { useStore, currentVideo as selectCurrentVideo } from '../store/useStore'
 import { checkHealth, updateVideoMeta, downsampleVideo } from '../api/client'
 import type { DownsampleOptions } from '../api/client'
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
+import NumericDraftInput from './NumericDraftInput'
 import {
   ANCHOR_BATCH_SIZE_MAX,
   ANCHOR_BATCH_SIZE_MIN,
@@ -112,60 +113,21 @@ function NumberRow({ label, description, value, onChange, onCommit, min, max, di
   max: number
   disabled?: boolean
 }) {
-  const [draft, setDraft] = useState(() => String(value))
-  const focusedRef = useRef(false)
-
-  useEffect(() => {
-    if (!focusedRef.current) setDraft(String(value))
-  }, [value])
-
-  function clamp(n: number) {
-    return Math.max(min, Math.min(max, n))
-  }
-
-  function commitDraft() {
-    const trimmed = draft.trim()
-    const parsed = trimmed === '' ? null : parseInt(trimmed, 10)
-    const committed =
-      parsed !== null && Number.isFinite(parsed) ? clamp(parsed) : value
-    setDraft(String(committed))
-    onChange(committed)
-    onCommit(committed)
-  }
-
   return (
     <div className={`flex items-start gap-4 py-3 border-b border-[#1e1e1e] last:border-0 ${disabled ? 'opacity-50' : ''}`}>
       <div className="flex-1 min-w-0">
         <p className="text-sm text-[#ddd] font-medium">{label}</p>
         <p className="text-xs text-[#666] mt-0.5 leading-relaxed">{description}</p>
       </div>
-      <input
-        type="text"
-        inputMode="numeric"
-        autoComplete="off"
-        spellCheck={false}
-        value={draft}
+      <NumericDraftInput
+        value={value}
+        onChange={v => {
+          onChange(v)
+          onCommit(v)
+        }}
+        min={min}
+        max={max}
         disabled={disabled}
-        onFocus={e => {
-          focusedRef.current = true
-          setDraft(String(value))
-          requestAnimationFrame(() => e.currentTarget.select())
-        }}
-        onChange={e => {
-          setDraft(e.target.value.replace(/\D/g, ''))
-        }}
-        onKeyDown={e => {
-          if (disabled) return
-          if (e.key === 'Enter') {
-            e.preventDefault()
-            commitDraft()
-            e.currentTarget.blur()
-          }
-        }}
-        onBlur={() => {
-          focusedRef.current = false
-          if (!disabled) commitDraft()
-        }}
         className="w-20 flex-shrink-0 text-xs py-1 px-2 rounded bg-[#1a1a1a] border border-[#333] text-[#ccc] text-right disabled:cursor-not-allowed"
       />
     </div>

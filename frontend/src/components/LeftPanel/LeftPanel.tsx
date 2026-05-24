@@ -15,10 +15,15 @@ import {
 import { getObjectColor } from '../../utils/colors'
 import { clearMaskCache } from '../../utils/maskUtils'
 import {
+  ANCHOR_BATCH_SIZE_MAX,
+  ANCHOR_BATCH_SIZE_MIN,
   annotatedAnchorIndicesFromFrames,
+  computeAnchorFrames,
   firstUnlabeledAnchorIndex,
+  normalizeAnchorBatchSize,
   videoAnchorBatchSize,
 } from '../../utils/anchorFrames'
+import NumericDraftInput from '../NumericDraftInput'
 import ObjectCard from './ObjectCard'
 import StepIndicator from './StepIndicator'
 import type { PropagationEvent } from '../../types'
@@ -47,6 +52,7 @@ export default function LeftPanel() {
     setCurrentFrameMasks,
     addToast,
     config,
+    setConfig,
     // Anchor phase
     anchorPhase, setAnchorPhase,
     anchorFrames, setAnchorFrames,
@@ -111,6 +117,12 @@ export default function LeftPanel() {
   const [showTrackRangeModal, setShowTrackRangeModal] = useState(false)
   const [trackRangeStart, setTrackRangeStart] = useState('')
   const [trackRangeEnd, setTrackRangeEnd] = useState('')
+
+  // Anchor sampling modal (first-time anchor labeling on a video)
+  const [showAnchorSamplingModal, setShowAnchorSamplingModal] = useState(false)
+  const [anchorSamplingInterval, setAnchorSamplingInterval] = useState(1000)
+  const [anchorSamplingLive, setAnchorSamplingLive] = useState<number | null>(null)
+  const [anchorSamplingSaving, setAnchorSamplingSaving] = useState(false)
 
   // Tracking method modal (shown when all anchors are labeled)
   const [showTrackMethodModal, setShowTrackMethodModal] = useState(false)
@@ -260,6 +272,55 @@ export default function LeftPanel() {
     setCurrentAnchorIndex(nextIndex)
     setCurrentFrame(frames[nextIndex]!)
     return true
+  }
+
+  const anchorSamplingPreviewCount =
+    video && showAnchorSamplingModal
+      ? computeAnchorFrames(
+          propagationStartFrame,
+          video.num_frames,
+          anchorSamplingLive ?? anchorSamplingInterval,
+        ).length
+      : null
+
+  function handleAnnotateAnchorsClick() {
+    if (!hasObjects) return
+    const committed = video?.annotated_anchors ?? []
+    if (committed.length === 0) {
+      const initial = videoAnchorBatchSize(video, config.anchorBatchSize)
+      setAnchorSamplingInterval(initial)
+      setAnchorSamplingLive(initial)
+      setShowAnchorSamplingModal(true)
+      return
+    }
+    void handleStartAnchorAnnotation()
+  }
+
+  async function confirmAnchorSamplingAndStart() {
+    const normalized = normalizeAnchorBatchSize(anchorSamplingInterval, config.anchorBatchSize)
+    setAnchorSamplingSaving(true)
+    setTrackingError('')
+    try {
+      if (pid && vid) {
+        await updateVideoMeta(pid, vid, { anchor_batch_size: normalized })
+        updateVideo({ anchor_batch_size: normalized })
+      }
+      setConfig({ anchorBatchSize: normalized })
+      setAnchorSamplingInterval(normalized)
+      setShowAnchorSamplingModal(false)
+      await handleStartAnchorAnnotation()
+    } catch (e: unknown) {
+      const detail =
+        e && typeof e === 'object' && 'response' in e
+          ? (e as { response?: { data?: { detail?: string } } }).response?.data?.detail
+          : undefined
+      const msg =
+        typeof detail === 'string' ? detail : (e instanceof Error ? e.message : 'Could not save anchor interval')
+      setTrackingError(msg)
+      addToast(msg, 'error')
+    } finally {
+      setAnchorSamplingSaving(false)
+    }
   }
 
   async function handleStartAnchorAnnotation() {
@@ -1634,7 +1695,7 @@ export default function LeftPanel() {
           ) : (
             <>
               <button
-                onClick={handleStartAnchorAnnotation}
+                onClick={handleAnnotateAnchorsClick}
                 disabled={!hasObjects || initializingSession || isPaused}
                 className="btn btn-secondary flex-1 min-w-0 flex flex-col items-center justify-center gap-0.5 px-1 py-2 disabled:opacity-40"
                 style={{ fontSize: 'clamp(8px, 5cqi, 12px)', lineHeight: 1.2 }}
@@ -1983,6 +2044,67 @@ export default function LeftPanel() {
                 className="btn btn-ghost w-full py-2 text-xs text-[#555] hover:text-[#aaa]"
               >
                 Dismiss
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Anchor frame sampling modal (before first anchor labeling on a video) */}
+      {showAnchorSamplingModal && video && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+          <div className="bg-[#1a1a1a] rounded-xl border border-[#333] p-5 w-[22rem] max-w-[calc(100vw-2rem)] shadow-xl">
+            <h3 className="text-sm font-semibold text-[#eee] mb-1">Anchor frame sampling</h3>
+            <p className="text-xs text-[#666] mb-4 leading-relaxed">
+              Choose how often to place anchor frames across this video (from the start frame through
+              the end). You can change this later in Settings only before any anchor is labeled.
+            </p>
+
+            <label htmlFor="anchor-sampling-interval" className="text-xs text-[#aaa] font-medium block mb-1.5">
+              Frame interval (frames)
+            </label>
+            <div className="flex items-center gap-3 mb-3">
+              <NumericDraftInput
+                id="anchor-sampling-interval"
+                value={anchorSamplingInterval}
+                onChange={setAnchorSamplingInterval}
+                onLiveChange={setAnchorSamplingLive}
+                min={ANCHOR_BATCH_SIZE_MIN}
+                max={ANCHOR_BATCH_SIZE_MAX}
+                autoFocus
+                className="w-28 text-sm py-2 px-3 rounded-lg bg-[#111] border border-[#333] text-[#eee] text-right"
+              />
+              <span className="text-xs text-[#555]">min {ANCHOR_BATCH_SIZE_MIN} · max {ANCHOR_BATCH_SIZE_MAX}</span>
+            </div>
+
+            <p className="text-xs text-blue-200/90 mb-5 rounded-lg border border-blue-700/30 bg-blue-500/10 px-3 py-2 leading-relaxed">
+              {anchorSamplingPreviewCount != null ? (
+                <>
+                  This video will have{' '}
+                  <span className="font-semibold text-blue-100">{anchorSamplingPreviewCount}</span>
+                  {' '}anchor frame{anchorSamplingPreviewCount === 1 ? '' : 's'} to label.
+                </>
+              ) : (
+                'Anchor count updates as you change the interval.'
+              )}
+            </p>
+
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => setShowAnchorSamplingModal(false)}
+                disabled={anchorSamplingSaving}
+                className="btn btn-ghost flex-1 py-2 text-xs"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => void confirmAnchorSamplingAndStart()}
+                disabled={anchorSamplingSaving}
+                className="btn btn-primary flex-1 py-2 text-xs font-medium disabled:opacity-50"
+              >
+                {anchorSamplingSaving ? 'Starting…' : 'Start labeling'}
               </button>
             </div>
           </div>
