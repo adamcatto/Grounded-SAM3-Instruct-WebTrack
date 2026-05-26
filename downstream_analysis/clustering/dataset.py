@@ -6,7 +6,9 @@ Supports save/load via npz + JSON sidecar.
 
 from __future__ import annotations
 
+import dataclasses
 import json
+import re
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any
@@ -33,20 +35,35 @@ class WindowMetadata:
     camera_view: str        # extracted from video folder name (e.g. "3A")
     interaction_type: str   # "isolated+group", "group+group", etc.
 
+    # Multi-project identity fields (optional, backward-compatible defaults)
+    project_id: str = ""
+    experiment_name: str = ""       # "hab", "test_day", "sh_intruder"
+    experiment_number: int = 0      # 1, 2, 3
+    session: str = ""               # "hab2a", "test1d", "HCGH_ISH1"
+    mouse_a_id: str = ""            # "GH1", "SH2", "novel_GH_intruder"
+    mouse_b_id: str = ""
+    mouse_a_role: str = ""          # "resident", "intruder", "littermate"
+    mouse_b_role: str = ""
+    mouse_a_housing: str = ""       # "SH" or "GH"
+    mouse_b_housing: str = ""
+    batch_id: str = ""              # "{experiment_name}_{camera_view}"
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> WindowMetadata:
-        return cls(**d)
+        known = {f.name for f in dataclasses.fields(cls)}
+        filtered = {k: v for k, v in d.items() if k in known}
+        return cls(**filtered)
 
 
 # ---------------------------------------------------------------------------
 # Housing condition helpers
 # ---------------------------------------------------------------------------
 
-_ISOLATED_NAMES = {"headshave"}
-_GROUP_NAMES = {"noshave", "backshave"}
+_ISOLATED_NAMES = {"headshave", "headshaved"}
+_GROUP_NAMES = {"noshave", "backshave", "backshaved"}
 
 
 def housing_condition(object_name: str) -> str:
@@ -65,6 +82,16 @@ def interaction_type_from_names(name_a: str, name_b: str) -> str:
     cond_b = housing_condition(name_b)
     conditions = sorted([cond_a, cond_b])
     return "+".join(conditions)
+
+
+def session_from_video_name(video_name: str) -> str:
+    """Extract session from video name.
+
+    e.g. '1A_video_test1a_20260130_090255.mp4' → 'test1a'
+         '1A_video_HCGH_ISH1_20260131_084152.mp4' → 'HCGH_ISH1'
+    """
+    m = re.match(r"^(\w+)_video_(.+)_(\d{8})_(\d{6})\.mp4$", video_name)
+    return m.group(2) if m else "unknown"
 
 
 def camera_view_from_folder(folder_name: str) -> str:

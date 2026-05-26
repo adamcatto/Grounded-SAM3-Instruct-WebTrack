@@ -48,6 +48,7 @@ from .dataset import (
     WindowMetadata,
     camera_view_from_folder,
     interaction_type_from_names,
+    session_from_video_name,
 )
 from .frame_features import N_FRAME_FEATURES, extract_frame_features
 from .sequence_features import SEQUENCE_FEATURE_NAMES, compute_sequence_features
@@ -412,6 +413,8 @@ def extract_all_features(
         name_b = object_display_name(ctx.config, obj_b_key) or obj_b_key
         cam_view = camera_view_from_folder(ctx.video_dir.name)
         itype = interaction_type_from_names(name_a, name_b)
+        vid_session = session_from_video_name(ctx.video_name)
+        proj_id = project_dir.name.split("-")[0]
 
         for i, s in enumerate(starts):
             all_metadata.append(WindowMetadata(
@@ -425,6 +428,8 @@ def extract_all_features(
                 window_size=cfg.window_size,
                 camera_view=cam_view,
                 interaction_type=itype,
+                project_id=proj_id,
+                session=vid_session,
             ))
 
         all_features.append(seq_feats)
