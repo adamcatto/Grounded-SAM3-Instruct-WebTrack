@@ -85,19 +85,40 @@ def _discover_object_keys(
     ms: VideoMaskStorage,
     ctx: VideoTrackContext,
 ) -> tuple[str, str] | None:
-    """Find the two object keys for a video by sampling a frame.
+    """Find the object keys for a video by sampling frames.
 
-    Returns (obj_a_key, obj_b_key) sorted canonically, or None if not 2 objects.
+    Returns (obj_a_key, obj_b_key) sorted canonically. If only 1 object
+    is present, returns (obj_a_key, "") to support single-animal videos.
+    Returns None if no objects are found.
     """
     start = int(ctx.config.get("start_frame") or 0)
     n = int(ctx.config["num_frames"])
 
-    # Sample a few frames to find object keys (some early frames might be empty)
+    seen_keys = set()
+    # Sample a few frames first. If we find a frame with >= 2 keys, we can instantly return them.
     for fi in range(start, min(start + 50, n)):
         masks = ms.load_masks_dense(fi)
         keys = sorted(masks.keys())
         if len(keys) >= 2:
             return keys[0], keys[1]
+        for k in keys:
+            seen_keys.add(k)
+
+    # If we didn't find >= 2 keys in the first 50 frames, let's sample more frames across
+    # the entire video (up to 200 frames) to be absolutely sure there isn't a second animal.
+    sample_indices = np.linspace(start, n - 1, min(200, n - start), dtype=int)
+    for fi in sample_indices:
+        masks = ms.load_masks_dense(int(fi))
+        keys = sorted(masks.keys())
+        if len(keys) >= 2:
+            return keys[0], keys[1]
+        for k in keys:
+            seen_keys.add(k)
+
+    # If we still only see 1 key, return (key, "") to support single animal
+    if len(seen_keys) == 1:
+        return list(seen_keys)[0], ""
+
     return None
 
 
@@ -152,13 +173,13 @@ def _extract_video_frame_features(
     # Discover object keys
     keys = _discover_object_keys(ms, ctx)
     if keys is None:
-        logger.warning('%s SKIP "%s": could not find 2 object keys', tag, ctx.video_name)
+        logger.warning('%s SKIP "%s": could not find any object keys', tag, ctx.video_name)
         return None
     obj_a_key, obj_b_key = keys
 
     # Look up display names for progress messages
     name_a = object_display_name(ctx.config, obj_a_key) or obj_a_key
-    name_b = object_display_name(ctx.config, obj_b_key) or obj_b_key
+    name_b = (object_display_name(ctx.config, obj_b_key) or obj_b_key) if obj_b_key else "none"
 
     logger.info(
         '%s Extracting frame features for "%s" | %d frames (%s) | %dx%d | objects: %s, %s',
@@ -410,7 +431,7 @@ def extract_all_features(
 
         # Build metadata for each window
         name_a = object_display_name(ctx.config, obj_a_key) or obj_a_key
-        name_b = object_display_name(ctx.config, obj_b_key) or obj_b_key
+        name_b = (object_display_name(ctx.config, obj_b_key) or obj_b_key) if obj_b_key else "none"
         cam_view = camera_view_from_folder(ctx.video_dir.name)
         itype = interaction_type_from_names(name_a, name_b)
         vid_session = session_from_video_name(ctx.video_name)

@@ -46,6 +46,7 @@ _ITYPE_COLORS = {
     "group-housed+isolated": "#B06DD8",
     "group-housed+group-housed": "#5588DD",
     "isolated+isolated": "#E05555",
+    "single_animal": "#2CA02C",
 }
 
 

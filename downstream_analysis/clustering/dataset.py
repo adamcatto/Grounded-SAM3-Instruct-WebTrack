@@ -78,6 +78,8 @@ def housing_condition(object_name: str) -> str:
 
 def interaction_type_from_names(name_a: str, name_b: str) -> str:
     """Derive interaction type from two object display names."""
+    if not name_b or name_b == "none":
+        return "single_animal"
     cond_a = housing_condition(name_a)
     cond_b = housing_condition(name_b)
     conditions = sorted([cond_a, cond_b])

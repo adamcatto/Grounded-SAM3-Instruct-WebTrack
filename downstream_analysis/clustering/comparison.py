@@ -46,6 +46,12 @@ def compare_housing_conditions(result: ClusteringResult) -> dict[str, Any]:
     obj_b_conditions = [housing_condition(m.object_b_name) for m in meta]
     interaction_types = [m.interaction_type for m in meta]
 
+    # Mask of windows that contain valid social interactions (exclude single-animal and unknown)
+    valid_comparison_mask = np.array([
+        "single" not in it.lower() and "unknown" not in it.lower()
+        for it in interaction_types
+    ])
+
     itype_counts = Counter(interaction_types)
     logger.info("Interaction type breakdown:")
     for itype, cnt in itype_counts.most_common():
@@ -74,13 +80,13 @@ def compare_housing_conditions(result: ClusteringResult) -> dict[str, Any]:
         for i in np.where(mask)[0]:
             itype_in_cluster[interaction_types[i]] += 1
 
-        # Fisher's exact test: isolated enrichment
+        # Fisher's exact test: isolated enrichment (excluding single animal and unknown)
         iso_in = sum(1 for i in np.where(mask)[0]
-                     if obj_a_conditions[i] == "isolated" or obj_b_conditions[i] == "isolated")
+                     if (obj_a_conditions[i] == "isolated" or obj_b_conditions[i] == "isolated") and valid_comparison_mask[i])
         iso_out = sum(1 for i in np.where(~mask)[0]
-                      if obj_a_conditions[i] == "isolated" or obj_b_conditions[i] == "isolated")
-        grp_in = n_in - iso_in
-        grp_out = n_out - iso_out
+                      if (obj_a_conditions[i] == "isolated" or obj_b_conditions[i] == "isolated") and valid_comparison_mask[i])
+        grp_in = sum(1 for i in np.where(mask)[0] if valid_comparison_mask[i]) - iso_in
+        grp_out = sum(1 for i in np.where(~mask)[0] if valid_comparison_mask[i]) - iso_out
 
         if n_in > 0 and n_out > 0:
             table = [[iso_in, grp_in], [iso_out, grp_out]]
@@ -124,9 +130,13 @@ def compare_housing_conditions(result: ClusteringResult) -> dict[str, Any]:
 
     per_feature_tests: dict[str, dict[str, Any]] = {}
     itypes_unique = sorted(set(interaction_types))
+    itypes_for_comparison = [
+        it for it in itypes_unique
+        if "single" not in it.lower() and "unknown" not in it.lower()
+    ]
 
-    if len(itypes_unique) >= 2:
-        type_a, type_b = itypes_unique[0], itypes_unique[1]
+    if len(itypes_for_comparison) >= 2:
+        type_a, type_b = itypes_for_comparison[0], itypes_for_comparison[1]
         mask_a = np.array([it == type_a for it in interaction_types])
         mask_b = np.array([it == type_b for it in interaction_types])
         n_a, n_b = int(np.sum(mask_a)), int(np.sum(mask_b))
@@ -219,12 +229,15 @@ def compare_housing_conditions(result: ClusteringResult) -> dict[str, Any]:
     logger.info("Computing per-feature enrichment (isolated vs group-only windows)...")
     feature_enrichment: list[dict[str, Any]] = []
 
-    # Split windows: those involving an isolated mouse vs group-only pairs
+    # Split windows: those involving an isolated mouse vs group-only pairs (excluding single-animal and unknown)
     iso_mask = np.array([
-        obj_a_conditions[i] == "isolated" or obj_b_conditions[i] == "isolated"
+        (obj_a_conditions[i] == "isolated" or obj_b_conditions[i] == "isolated") and valid_comparison_mask[i]
         for i in range(n_total)
     ])
-    grp_mask = ~iso_mask
+    grp_mask = np.array([
+        valid_comparison_mask[i] and not iso_mask[i]
+        for i in range(n_total)
+    ])
     n_iso, n_grp = int(np.sum(iso_mask)), int(np.sum(grp_mask))
 
     if n_iso >= 5 and n_grp >= 5:
@@ -317,9 +330,9 @@ def compare_housing_conditions(result: ClusteringResult) -> dict[str, Any]:
     # ---------------------------------------------------------------------------
 
     overall_enrichment: dict[str, Any] = {}
-    total_iso = sum(1 for a, b in zip(obj_a_conditions, obj_b_conditions)
-                    if a == "isolated" or b == "isolated")
-    total_grp = n_total - total_iso
+    total_iso = sum(1 for i, (a, b) in enumerate(zip(obj_a_conditions, obj_b_conditions))
+                    if (a == "isolated" or b == "isolated") and valid_comparison_mask[i])
+    total_grp = sum(1 for i in range(n_total) if valid_comparison_mask[i]) - total_iso
     overall_enrichment["total_windows_with_isolated"] = total_iso
     overall_enrichment["total_windows_group_only"] = total_grp
     overall_enrichment["interaction_type_counts"] = dict(Counter(interaction_types))
