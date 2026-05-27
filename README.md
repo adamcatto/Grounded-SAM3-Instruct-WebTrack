@@ -486,6 +486,12 @@ python scripts/parallel_tracking_launcher.py \
 bsub < scripts/bsub_parallel_project_tracking.bsub
 ```
 
+For a **single project on one machine** (sequential propagation, or a dry-run before launching
+workers), use `scripts/run_pending_inference.py`. It prints a RUN/SKIP plan for each video, then
+calls the same `/api/.../propagate` SSE endpoint the web UI uses. Start the backend first
+(`uvicorn server:app` or `./start.sh`). See [Scripts & Utilities](#scripts--utilities) for
+examples including `--list-only`.
+
 ---
 
 ## Scripts & Utilities
@@ -496,9 +502,53 @@ bsub < scripts/bsub_parallel_project_tracking.bsub
 | `scripts/download_model.py`             | Download SAM3/SAM2 checkpoints from HuggingFace (requires `HF_TOKEN`) |
 | `scripts/parallel_tracking_launcher.py` | Orchestrate batch propagation across projects                         |
 | `scripts/parallel_tracking_worker.py`   | Single-video propagation worker process                               |
-| `scripts/run_pending_inference.py`      | Monitor and auto-resume incomplete propagations                       |
+| `scripts/run_pending_inference.py`      | CLI propagation for eligible videos (dry-run with `--list-only`, or run sequentially) |
 | `scripts/merge_projects.py`             | Merge two SAM3 projects (combine configs, videos)                     |
 | `scripts/migrate_masks_sqlite.py`       | Migrate legacy NPZ/JSON masks to SQLite storage                       |
+
+### `run_pending_inference.py`
+
+Runs whole-video propagation for videos that are ready: anchor labeling complete,
+`propagation_complete` false, not actively running on another worker, and with point prompts
+present. Useful after labeling in the UI when you want to finish tracking from a terminal, retry
+failed jobs, or inspect eligibility before starting HPC workers.
+
+**Prerequisites:** SAM backend running and reachable (default `http://127.0.0.1:8000`). Project
+resolved via `--project-dir` (directory containing `config.json`) or `--pid` under
+`SAM3_PROJECTS_DIR` / `~/.sam3_zero_projects`.
+
+**Output:** eligibility summary on **stderr**; live SSE progress on **stdout** (suppress with
+`--quiet-stream`).
+
+```bash
+# Dry-run: show which videos would RUN vs SKIP (no HTTP calls)
+python scripts/run_pending_inference.py \
+  --project-dir ~/.sam3_zero_projects/ab12-demo \
+  --backend http://127.0.0.1:8000 \
+  --list-only
+
+# Propagate all eligible videos in the project (sequential)
+python scripts/run_pending_inference.py \
+  --project-dir /path/to/project \
+  --backend http://127.0.0.1:8000
+
+# Reset stuck "running" status left by a killed job, then propagate
+python scripts/run_pending_inference.py \
+  --project-dir /path/to/project \
+  --clear-stuck \
+  --backend http://127.0.0.1:8000
+
+# Single video, match web UI "use all anchors", less progress spam
+python scripts/run_pending_inference.py \
+  --pid ab12-demo \
+  --videos vid001 \
+  --use-all-anchors \
+  --quiet-stream
+```
+
+Common flags: `--videos` (subset), `--stale-timeout` (seconds before a `running` job is treated
+as dead), `--sse-timeout` (HTTP read timeout for long propagations). `parallel_tracking_worker.py`
+reuses the same eligibility logic and SSE client for multi-GPU / LSF batch runs.
 
 
 ---

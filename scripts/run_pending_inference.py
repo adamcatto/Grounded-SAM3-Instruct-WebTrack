@@ -1,22 +1,60 @@
 #!/usr/bin/env python3
 """
-Run whole-video propagation (tracking) only for videos that are ready:
+Run whole-video propagation (tracking) from the CLI for eligible videos in one project.
 
-  • anchor labeling is complete (all anchor frames committed in the UI)
-  • propagation_complete is False
-  • whole_video_inference.status is not "running" (failed/complete/none are OK to queue when
-    incomplete)
+Use this when anchor frames are labeled in the web UI (or on disk) but propagation has not
+finished — e.g. after closing the browser, on a login node, or to retry failed jobs without
+clicking "Track Objects" again. For many videos in parallel on HPC, prefer
+``parallel_tracking_launcher.py`` (which calls ``parallel_tracking_worker.py`` over the same
+HTTP/SSE propagate path).
 
-Requires the SAM backend (uvicorn server:app) to be reachable.
+Eligibility (per video)
+  • Anchor labeling complete (``anchor_labeling_complete`` in config, or all required anchor
+    frames have point prompts / mask ``.npz`` files on disk)
+  • ``propagation_complete`` is false
+  • At least one object has point prompts
+  • ``whole_video_inference.status`` is not actively ``running`` (unless stale — see
+    ``--stale-timeout``). Status ``failed`` / ``none`` queue for retry; ``complete`` with
+    incomplete propagation is skipped (config repair needed)
+  • Not listed in the project's ``tracked_videos_in_progress.txt`` (claimed by a parallel worker)
+
+Requires a running SAM backend (``uvicorn server:app``) reachable at ``--backend``.
+
+Usage:
+  run_pending_inference.py (--project-dir PATH | --pid PROJECT_ID) [options]
+
+Options (common):
+  --list-only          Print RUN/SKIP eligibility summary and exit (no HTTP propagation)
+  --clear-stuck        Reset ``whole_video_inference`` status ``running`` -> ``none`` before checks
+  --videos VID [VID …] Restrict to specific video ids
+  --use-all-anchors    Match web UI "use all anchors" propagate mode
+  --quiet-stream       Suppress per-frame SSE progress on stdout (eligibility still on stderr)
+  --backend URL        FastAPI origin (default http://127.0.0.1:8000; ``/api`` added if omitted)
+  --stale-timeout SEC  Treat ``running`` as killed if no progress file update (default 300)
+
+Output:
+  • RUN/SKIP plan -> stderr (unbuffered via ``os.write``, so it appears immediately under
+    ``conda run``)
+  • Propagation SSE progress -> stdout (unless ``--quiet-stream``)
 
 Examples:
-  export SAM3_PROJECTS_DIR=/path/to/projects-root   # optional
-  uvicorn server:app --host 127.0.0.1 --port 8000   # elsewhere
-  python scripts/run_pending_inference.py … --backend http://127.0.0.1:8000 [--list-only] [--quiet-stream]
+  # Start backend elsewhere, then dry-run eligibility only:
+  uvicorn server:app --host 127.0.0.1 --port 8000
+  python scripts/run_pending_inference.py \\
+    --project-dir ~/.sam3_zero_projects/ab12-demo \\
+    --backend http://127.0.0.1:8000 \\
+    --list-only
 
-  • RUN/SKIP eligibility is written to stderr via os.write (unbuffered), so it appears
-    immediately even with `conda run`; SSE progress still prints on stdout.
-  • Without --quiet-stream, propagation progress is mirrored on this terminal from SSE events.
+  # Propagate all eligible videos sequentially (live progress on stdout):
+  python scripts/run_pending_inference.py --pid ab12-demo --backend http://127.0.0.1:8000
+
+  # Retry after a crashed job left status stuck at "running":
+  python scripts/run_pending_inference.py \\
+    --project-dir /path/to/project --clear-stuck --backend http://127.0.0.1:8000
+
+  # One video, all anchor frames, minimal terminal noise:
+  python scripts/run_pending_inference.py --pid ab12-demo \\
+    --videos vid001 --use-all-anchors --quiet-stream
 """
 
 from __future__ import annotations
