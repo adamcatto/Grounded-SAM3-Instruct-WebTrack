@@ -487,6 +487,15 @@ class MultiProjectPipeline:
         except Exception as e:
             logger.warning("Multi-project UMAP plots failed: %s", e)
 
+        try:
+            from .condition_boxplots import _GROUP_ORDER
+            from .plots_transitions import generate_transition_plots
+            generate_transition_plots(
+                result, comparison, plots_dir, group_order=_GROUP_ORDER,
+            )
+        except Exception as e:
+            logger.warning("Transition network plots failed: %s", e)
+
     # ------------------------------------------------------------------
     # Save results
     # ------------------------------------------------------------------

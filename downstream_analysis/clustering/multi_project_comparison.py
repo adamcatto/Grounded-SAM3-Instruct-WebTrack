@@ -301,6 +301,16 @@ def compare_experiments(result: ClusteringResult) -> dict[str, Any]:
             "cluster_labels": [int(labels[i]) for i in indices_sorted],
         }
 
+    from .transition_analysis import compute_transition_matrices_by_group
+
+    transition_matrices = compute_transition_matrices_by_group(
+        ethograms,
+        result.n_clusters,
+        group_field="condition_group",
+        group_labels=CONDITION_GROUP_LABELS,
+        exclude_groups={"unknown"},
+    )
+
     elapsed = time.monotonic() - t0
     logger.info("Multi-project comparison done in %.1fs", elapsed)
 
@@ -309,4 +319,5 @@ def compare_experiments(result: ClusteringResult) -> dict[str, Any]:
         "comparisons": comparisons,
         "per_cluster_by_experiment": per_cluster_by_exp,
         "ethograms": ethograms,
+        "transition_matrices": transition_matrices,
     }

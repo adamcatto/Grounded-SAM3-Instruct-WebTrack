@@ -337,10 +337,21 @@ def compare_housing_conditions(result: ClusteringResult) -> dict[str, Any]:
     overall_enrichment["total_windows_group_only"] = total_grp
     overall_enrichment["interaction_type_counts"] = dict(Counter(interaction_types))
 
+    from .transition_analysis import compute_transition_matrices_by_group
+
+    transition_matrices = compute_transition_matrices_by_group(
+        ethograms,
+        n_clusters,
+        group_field="interaction_type",
+        exclude_groups={"unknown", "single_animal"},
+    )
+
     elapsed = time.monotonic() - t0
     logger.info(
-        "Comparison complete in %.1fs: %d clusters, %d feature tests, %d enriched features, %d video ethograms.",
+        "Comparison complete in %.1fs: %d clusters, %d feature tests, %d enriched features, "
+        "%d video ethograms, %d transition groups.",
         elapsed, n_clusters, len(per_feature_tests), len(feature_enrichment), len(ethograms),
+        len(transition_matrices),
     )
 
     return {
@@ -350,4 +361,5 @@ def compare_housing_conditions(result: ClusteringResult) -> dict[str, Any]:
         "feature_enrichment": feature_enrichment,
         "interaction_type_distribution": itype_dist,
         "ethograms": ethograms,
+        "transition_matrices": transition_matrices,
     }

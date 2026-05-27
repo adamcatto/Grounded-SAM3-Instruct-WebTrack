@@ -400,4 +400,10 @@ def generate_all_plots(
             ethogram_dir / f"ethogram_{vid_id}.png",
         )
 
+    try:
+        from .plots_transitions import generate_transition_plots
+        generate_transition_plots(result, comparison, plots_dir)
+    except Exception as e:
+        logger.warning("Transition plots failed: %s", e)
+
     logger.info("All plots saved to %s", plots_dir)
