@@ -8,22 +8,91 @@ A full-stack web application for interactive video object segmentation and track
 
 ## Table of Contents
 
+<details open>
+<summary><strong>Getting started</strong></summary>
+
 - [Overview](#overview)
 - [Features](#features)
-- [Architecture](#architecture)
 - [Quick Start](#quick-start)
+  - [Prerequisites](#prerequisites)
+  - [One-Time Setup](#one-time-setup)
+  - [Start the Application](#start-the-application)
+  - [Stop](#stop)
 - [Usage Workflow](#usage-workflow)
+
+</details>
+
+<details>
+<summary><strong>Web application</strong></summary>
+
+- [Architecture](#architecture)
+  - [Data Flow](#data-flow)
 - [Backend API](#backend-api)
+  - [SAM Model Fallback](#sam-model-fallback)
+  - [Key Backend Modules](#key-backend-modules)
 - [Frontend](#frontend)
+  - [Key Components](#key-components)
+  - [Environment Variables](#environment-variables)
 - [Storage Layout](#storage-layout)
+
+</details>
+
+<details>
+<summary><strong>Downstream analysis</strong></summary>
+
 - [Downstream Analysis](#downstream-analysis)
-  - [Locomotion Pipeline](#locomotion-pipeline)
-  - [Behavioral Clustering](#behavioral-clustering)
-  - [Multi-Project Pipeline](#multi-project-pipeline)
+- [Locomotion Pipeline](#locomotion-pipeline)
+- [Behavioral Clustering](#behavioral-clustering)
+  - [Feature Hierarchy](#feature-hierarchy)
+  - [Single-Project Pipeline](#single-project-pipeline)
+- [Multi-Project Pipeline](#multi-project-pipeline)
+  - [Experiment Design](#experiment-design)
+  - [Running the Multi-Project Pipeline](#running-the-multi-project-pipeline)
+  - [Pipeline Stages](#pipeline-stages)
+  - [Multi-Project Output Layout](#multi-project-output-layout)
+  - [Multi-Project Modules](#multi-project-modules)
+
+</details>
+
+<details>
+<summary><strong>HPC &amp; automation</strong></summary>
+
 - [HPC Batch Processing](#hpc-batch-processing)
-- [Scripts & Utilities](#scripts--utilities)
+  - [Generate and Submit Jobs](#generate-and-submit-jobs)
+  - [Parallel Tracking (Propagation)](#parallel-tracking-propagation)
+- [Scripts &amp; Utilities](#scripts--utilities)
+
+</details>
+
+<details open>
+<summary><strong>Configuration</strong></summary>
+
 - [Configuration](#configuration)
+- [Recommended first-time setup](#recommended-first-time-setup)
+- [Environment variables](#environment-variables)
+- [Project storage and <code>config.json</code>](#project-storage-and-configjson)
+- [Model checkpoints](#model-checkpoints)
+- [HPC configuration (<code>configs/env.yaml</code>)](#hpc-configuration-configsenvyaml)
+- [Clustering pipeline parameters](#clustering-pipeline-parameters)
+- [Multi-project analysis configuration](#multi-project-analysis-configuration)
+  - [Project directory → experiment name mapping](#1-project-directory--experiment-name-mapping)
+  - [Identity registry (<code>experiment_registry.csv</code>)](#2-identity-registry-experiment_registrycsv)
+  - [Batch definition and correction](#3-batch-definition-and-correction)
+- [Feature-extraction bsub jobs](#feature-extraction-bsub-jobs)
+- [Configuration quick reference](#configuration-quick-reference)
+
+</details>
+
+<details>
+<summary><strong>Development</strong></summary>
+
 - [Development](#development)
+  - [Project Structure](#project-structure)
+  - [Running Without GPU](#running-without-gpu)
+  - [Adding New Analysis Modules](#adding-new-analysis-modules)
+- [License](#license)
+
+</details>
 
 ---
 
