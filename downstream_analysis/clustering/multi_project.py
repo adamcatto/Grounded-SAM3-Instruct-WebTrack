@@ -276,6 +276,32 @@ class MultiProjectPipeline:
         pre_correction_features = X.copy()
 
         # ------------------------------------------------------------------
+        # Phase 3.5: Batch diagnostics
+        # ------------------------------------------------------------------
+        logger.info("PHASE 3.5: Batch diagnostics")
+        logger.info("-" * 40)
+        t0 = time.monotonic()
+
+        batch_diag_dir = self.output_dir / "batch_diagnostics"
+        try:
+            from .batch_diagnostics import run_batch_diagnostics
+            run_batch_diagnostics(
+                pre_correction_features,
+                corrected,
+                batch_labels,
+                list(combined_dataset.feature_names),
+                all_metadata,
+                batch_diag_dir,
+                batch_info,
+            )
+        except Exception as e:
+            logger.warning("Batch diagnostics failed: %s", e)
+
+        phase35_time = time.monotonic() - t0
+        logger.info("Phase 3.5 done in %s", _fmt_duration(phase35_time))
+        logger.info("")
+
+        # ------------------------------------------------------------------
         # Phase 4: Clustering
         # ------------------------------------------------------------------
         logger.info("PHASE 4: Clustering + embedding")
@@ -355,6 +381,7 @@ class MultiProjectPipeline:
         logger.info("#   Time breakdown:")
         logger.info("#     Feature extraction:    %s", _fmt_duration(phase1_time))
         logger.info("#     Batch correction:      %s", _fmt_duration(phase3_time))
+        logger.info("#     Batch diagnostics:     %s", _fmt_duration(phase35_time))
         logger.info("#     Clustering + embedding: %s", _fmt_duration(phase4_time))
         logger.info("#     Condition comparison:  %s", _fmt_duration(phase5_time))
         if locomotion_results is not None:
