@@ -42,6 +42,7 @@ The system consists of three layers:
 ## Features
 
 **Annotation & Tracking**
+
 - Point-click annotation: select any frame, click to place positive/negative prompts on objects
 - Real-time SAM inference: see mask predictions instantly after each click
 - Batch propagation: track objects across thousands of frames via SSE-streamed mini-batches
@@ -50,6 +51,7 @@ The system consists of three layers:
 - Pause/resume propagation mid-video
 
 **Video Management**
+
 - Upload or import videos from server paths
 - Automatic MP4 faststart optimization for smooth browser streaming
 - HTTP 206 range-request support for seeking
@@ -58,6 +60,7 @@ The system consists of three layers:
 - Project merging
 
 **Visualization & Review**
+
 - Smooth playback with HTML5 video element
 - Frame-by-frame scrubbing with mask overlays
 - Per-object progress tracking on the timeline
@@ -65,6 +68,7 @@ The system consists of three layers:
 - SAM session state debug panel
 
 **Downstream Analysis**
+
 - Locomotion quantification (centroid path-length in sliding windows)
 - 33-dimensional behavioral feature extraction from mask pairs
 - Leiden community detection clustering with UMAP embedding
@@ -155,8 +159,8 @@ bash stop.sh
 2. **Import or upload a video** (MP4 recommended)
 3. **Add objects** (e.g., "Mouse A", "Mouse B") with the + button
 4. **Navigate to a frame** and click on an object to place point prompts
-   - Left-click = positive prompt (this is the object)
-   - Right-click = negative prompt (this is NOT the object)
+  - Left-click = positive prompt (this is the object)
+  - Right-click = negative prompt (this is NOT the object)
 5. **Review the predicted mask** -- add more points to refine
 6. **Repeat** for each object on one or more anchor frames
 7. **Click "Track Objects"** to propagate masks across all frames
@@ -169,15 +173,17 @@ bash stop.sh
 
 The FastAPI backend (`backend/server.py`) exposes 60+ endpoints. Key groups:
 
-| Group | Endpoints | Description |
-|-------|-----------|-------------|
-| **Projects** | `POST/GET/PATCH/DELETE /api/projects` | CRUD, merge |
-| **Videos** | `POST /api/projects/{pid}/videos` | Upload/import, info, source streaming (HTTP 206) |
-| **Sessions** | `POST/DELETE /api/.../session` | Open/close SAM inference session per (project, video) |
-| **Annotation** | `POST /api/.../objects/{oid}/points` | Add point prompts, receive mask predictions |
-| **Propagation** | `GET /api/.../propagate` | SSE endpoint streaming batch progress |
-| **Masks** | `GET /api/.../masks/{frame}` | Load/delete/swap masks and bounding boxes |
-| **Export** | `GET /api/.../export` | Render video with mask overlays |
+
+| Group           | Endpoints                             | Description                                           |
+| --------------- | ------------------------------------- | ----------------------------------------------------- |
+| **Projects**    | `POST/GET/PATCH/DELETE /api/projects` | CRUD, merge                                           |
+| **Videos**      | `POST /api/projects/{pid}/videos`     | Upload/import, info, source streaming (HTTP 206)      |
+| **Sessions**    | `POST/DELETE /api/.../session`        | Open/close SAM inference session per (project, video) |
+| **Annotation**  | `POST /api/.../objects/{oid}/points`  | Add point prompts, receive mask predictions           |
+| **Propagation** | `GET /api/.../propagate`              | SSE endpoint streaming batch progress                 |
+| **Masks**       | `GET /api/.../masks/{frame}`          | Load/delete/swap masks and bounding boxes             |
+| **Export**      | `GET /api/.../export`                 | Render video with mask overlays                       |
+
 
 ### SAM Model Fallback
 
@@ -185,15 +191,17 @@ The backend loads SAM3 (`pretrained_models/sam3.pt`) as the primary model. If un
 
 ### Key Backend Modules
 
-| File | Responsibility |
-|------|----------------|
-| `server.py` | All FastAPI routes, SSE propagation, range-request video streaming |
-| `sam_predictor.py` | SAM3/SAM2 wrapper: session lifecycle, point prompt inference, propagation |
-| `project_manager.py` | Project/video/object CRUD, `config.json` persistence |
-| `video_processor.py` | Frame extraction (OpenCV), mask encoding, MP4 faststart |
-| `mask_store.py` | SQLite mask storage with RLE compression, legacy NPZ fallback |
-| `mask_seg_codec.py` | Binary COCO RLE compression codec |
-| `classifier.py` | Optional DINOv2-small per-pixel object classifier |
+
+| File                 | Responsibility                                                            |
+| -------------------- | ------------------------------------------------------------------------- |
+| `server.py`          | All FastAPI routes, SSE propagation, range-request video streaming        |
+| `sam_predictor.py`   | SAM3/SAM2 wrapper: session lifecycle, point prompt inference, propagation |
+| `project_manager.py` | Project/video/object CRUD, `config.json` persistence                      |
+| `video_processor.py` | Frame extraction (OpenCV), mask encoding, MP4 faststart                   |
+| `mask_store.py`      | SQLite mask storage with RLE compression, legacy NPZ fallback             |
+| `mask_seg_codec.py`  | Binary COCO RLE compression codec                                         |
+| `classifier.py`      | Optional DINOv2-small per-pixel object classifier                         |
+
 
 ---
 
@@ -203,21 +211,25 @@ React 18 + TypeScript + Vite, styled with Tailwind CSS.
 
 ### Key Components
 
-| Component | Role |
-|-----------|------|
-| `FrameViewer/` | JPEG frame display (paused) or HTML5 `<video>` (playback) with canvas mask overlay |
-| `AnnotationCanvas` | Click-to-annotate with normalized coordinate conversion and live mask rendering |
-| `LeftPanel/` | Object list, propagation controls, SSE event handler |
-| `Timeline/` | Playback controls, frame thumbnail strip, per-object progress rows |
-| `VideoPlayer/` | HTML5 video element wrapper for smooth playback |
-| `store/useStore.ts` | Zustand global state: projects, videos, objects, masks, propagation status |
-| `api/client.ts` | Typed Axios wrappers for all backend endpoints + SSE helper |
+
+| Component           | Role                                                                               |
+| ------------------- | ---------------------------------------------------------------------------------- |
+| `FrameViewer/`      | JPEG frame display (paused) or HTML5 `<video>` (playback) with canvas mask overlay |
+| `AnnotationCanvas`  | Click-to-annotate with normalized coordinate conversion and live mask rendering    |
+| `LeftPanel/`        | Object list, propagation controls, SSE event handler                               |
+| `Timeline/`         | Playback controls, frame thumbnail strip, per-object progress rows                 |
+| `VideoPlayer/`      | HTML5 video element wrapper for smooth playback                                    |
+| `store/useStore.ts` | Zustand global state: projects, videos, objects, masks, propagation status         |
+| `api/client.ts`     | Typed Axios wrappers for all backend endpoints + SSE helper                        |
+
 
 ### Environment Variables
 
-| Variable | Default | Purpose |
-|----------|---------|---------|
+
+| Variable           | Default                 | Purpose                                                            |
+| ------------------ | ----------------------- | ------------------------------------------------------------------ |
 | `VITE_BACKEND_URL` | `http://localhost:8000` | Backend URL for direct video/SSE connections (bypasses Vite proxy) |
+
 
 ---
 
@@ -302,14 +314,17 @@ Merges interaction data across experiments, applies batch correction, and runs c
 
 The pipeline supports 4 experiment types with an identity registry mapping each video to specific mice:
 
-| Exp | Name | Description | Pairs |
-|-----|------|-------------|-------|
-| 1 | Habituation | Two familiar GH littermates | 10 |
-| 2 | Test Day | SH or GH resident + novel GH intruder | 21 |
-| 3 | SH Intruder | GH resident + SH intruder | 10 |
-| 4 | Locomotion | Single mouse alone (SH or GH) | 21 |
+
+| Exp | Name        | Description                           | Pairs |
+| --- | ----------- | ------------------------------------- | ----- |
+| 1   | Habituation | Two familiar GH littermates           | 10    |
+| 2   | Test Day    | SH or GH resident + novel GH intruder | 21    |
+| 3   | SH Intruder | GH resident + SH intruder             | 10    |
+| 4   | Locomotion  | Single mouse alone (SH or GH)         | 21    |
+
 
 **Condition groups** for statistical comparison:
+
 - GH + Littermate (Exp 1)
 - SH Resident + GH Intruder (Exp 2)
 - GH Resident + GH Intruder (Exp 2)
@@ -339,20 +354,37 @@ conda run --no-capture-output -n sam3 python -m downstream_analysis.clustering.m
 5. **Condition comparisons** -- Fisher's exact per-cluster, Mann-Whitney U per-feature, Cohen's d
 6. **Locomotion comparison** (optional) -- paired Wilcoxon signed-rank for same-mouse alone vs. with-intruder
 7. **Plots** -- condition boxplots, cluster composition bars, UMAP colored by experiment/condition/batch, before/after correction, locomotion paired boxplots, ethograms
+8. **Batch diagnostics** -- per-feature batch effects, PERMANOVA, PCA before/after correction (`batch_diagnostics/`)
+
+#### Multi-Project Output Layout
+
+```
+<output-dir>/
+  plots/                    # UMAPs, boxplots, ethograms, etc.
+  batch_diagnostics/        # Batch QA stats + figures (η², PERMANOVA, PCA)
+  results/                  # JSON/CSV assignments, comparisons, batch info
+    cluster_assignments.csv
+    condition_comparison.json
+    batch_correction_info.json
+    combined_dataset.npz
+```
 
 #### Multi-Project Modules
 
-| Module | Purpose |
-|--------|---------|
-| `experiment_registry.csv` | Identity mapping: 103 rows, (experiment, session, box, shave_pattern) to mouse ID/role/housing |
-| `experiment_registry.py` | Registry loader with `resolve_identities()` and `validate_registry()` |
-| `batch_correction.py` | Parametric ComBat (empirical Bayes) + z-score fallback, pure numpy/scipy |
-| `multi_project.py` | `MultiProjectPipeline` orchestrator |
-| `multi_project_comparison.py` | Cross-condition statistical tests |
-| `locomotion_comparison.py` | 12-dim per-object features, per-camera paired design |
-| `condition_boxplots.py` | Per-feature and cluster composition boxplots |
-| `plots_multi.py` | UMAP variants (by experiment, condition, batch, before/after correction) |
-| `multi_project_cli.py` | CLI entry point |
+
+| Module                        | Purpose                                                                                        |
+| ----------------------------- | ---------------------------------------------------------------------------------------------- |
+| `experiment_registry.csv`     | Identity mapping: 103 rows, (experiment, session, box, shave_pattern) to mouse ID/role/housing |
+| `experiment_registry.py`      | Registry loader with `resolve_identities()` and `validate_registry()`                          |
+| `batch_correction.py`         | Parametric ComBat (empirical Bayes) + z-score fallback, pure numpy/scipy                       |
+| `multi_project.py`            | `MultiProjectPipeline` orchestrator                                                            |
+| `multi_project_comparison.py` | Cross-condition statistical tests                                                              |
+| `locomotion_comparison.py`    | 12-dim per-object features, per-camera paired design                                           |
+| `condition_boxplots.py`       | Per-feature and cluster composition boxplots                                                   |
+| `plots_multi.py`              | UMAP variants (by experiment, condition, batch, before/after correction)                       |
+| `batch_diagnostics.py`        | Batch effect stats, PERMANOVA, PCA/heatmap diagnostics                                         |
+| `multi_project_cli.py`        | CLI entry point                                                                                |
+
 
 ---
 
@@ -389,43 +421,341 @@ bsub < scripts/bsub_parallel_project_tracking.bsub
 
 ## Scripts & Utilities
 
-| Script | Purpose |
-|--------|---------|
-| `scripts/download_model.py` | Download SAM3/SAM2 checkpoints from HuggingFace (requires `HF_TOKEN`) |
-| `scripts/parallel_tracking_launcher.py` | Orchestrate batch propagation across projects |
-| `scripts/parallel_tracking_worker.py` | Single-video propagation worker process |
-| `scripts/run_pending_inference.py` | Monitor and auto-resume incomplete propagations |
-| `scripts/merge_projects.py` | Merge two SAM3 projects (combine configs, videos) |
-| `scripts/migrate_masks_sqlite.py` | Migrate legacy NPZ/JSON masks to SQLite storage |
+
+| Script                                  | Purpose                                                               |
+| --------------------------------------- | --------------------------------------------------------------------- |
+| `scripts/download_model.py`             | Download SAM3/SAM2 checkpoints from HuggingFace (requires `HF_TOKEN`) |
+| `scripts/parallel_tracking_launcher.py` | Orchestrate batch propagation across projects                         |
+| `scripts/parallel_tracking_worker.py`   | Single-video propagation worker process                               |
+| `scripts/run_pending_inference.py`      | Monitor and auto-resume incomplete propagations                       |
+| `scripts/merge_projects.py`             | Merge two SAM3 projects (combine configs, videos)                     |
+| `scripts/migrate_masks_sqlite.py`       | Migrate legacy NPZ/JSON masks to SQLite storage                       |
+
 
 ---
 
 ## Configuration
 
-### Backend
+Configuration is layered: **environment variables** (where data and models live), **`configs/env.yaml`** (HPC batch tracking), **`config.json` per project** (videos/objects/masks), **CLI flags** (clustering parameters), and **Python defaults** in `downstream_analysis/clustering/config.py`. In practice you usually set the env vars once per machine, copy `env_template.yaml` for HPC work, and pass CLI flags when re-running analysis with different clustering settings.
 
-| Environment Variable | Default | Description |
-|---------------------|---------|-------------|
-| `SAM3_TRACKING_PROJECTS_DIR` | `~/.sam3_zero_projects` | Root directory for project data |
-| `HF_TOKEN` | -- | HuggingFace token for model download |
+### Recommended first-time setup
 
-### Clustering
+Use this checklist when configuring a new machine (laptop, lab workstation, or HPC login node):
 
-Parameters are set in `downstream_analysis/clustering/config.py` or via CLI flags:
+```bash
+# 1. Clone and enter the repo
+git clone https://github.com/adamcatto/Grounded-SAM3-Instruct-WebTrack.git
+cd Grounded-SAM3-Instruct-WebTrack
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--window-size` | 90 | Sliding window size in frames (3s at 30fps) |
-| `--stride` | 30 | Window stride in frames (1s) |
-| `--n-neighbors` | 30 | k-NN graph neighbors |
-| `--resolution` | 1.0 | Leiden community detection resolution |
-| `--batch-correction` | `combat` | Batch correction method (`combat`, `zscore_per_batch`, `none`) |
+# 2. Create / activate the sam3 conda environment (Python 3.10+)
+conda create -n sam3 python=3.10 -y
+conda activate sam3
 
-### Frontend
+# 3. Run setup (edit conda path inside setup.sh if yours differs from the default)
+bash setup.sh
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `VITE_BACKEND_URL` | `http://localhost:8000` | Backend URL (bypasses Vite proxy for Range requests and SSE) |
+# 4. Point project storage at a writable location (see below)
+export SAM3_TRACKING_PROJECTS_DIR=/path/to/your/projects
+
+# 5. Download model weights (requires HuggingFace access to facebook/sam3)
+export HF_TOKEN=hf_your_token_here
+conda run -n sam3 python scripts/download_model.py
+
+# 6. For HPC batch propagation / feature extraction, create a local env file:
+cp configs/env_template.yaml configs/env.yaml
+# Edit configs/env.yaml — queue, account, conda path, log directories
+
+# 7. Verify the web app
+bash start_backend.sh    # terminal 1
+bash start_frontend.sh   # terminal 2
+# Open http://localhost:5173
+```
+
+Add the `export SAM3_TRACKING_PROJECTS_DIR=...` line to your `~/.bashrc` (or job preamble) so the backend, downstream CLIs, and HPC workers all resolve the same project folders.
+
+On shared HPC filesystems, prefer a project directory under your allocation (e.g. `/sc/arion/projects/YourLab/Behavior/projects/`) rather than `~/.sam3_zero_projects`, so jobs on compute nodes see the same data as your interactive sessions.
+
+---
+
+### Environment variables
+
+
+| Variable                     | Default                 | Used by                      | Description                                                                                                                                               |
+| ---------------------------- | ----------------------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SAM3_TRACKING_PROJECTS_DIR` | `~/.sam3_zero_projects` | Backend, downstream analysis | Root folder for all SAM3 project directories. **Set this first** on any machine that runs tracking or analysis.                                           |
+| `SAM3_PROJECTS_DIR`          | (same as above)         | Backend, downstream analysis | Legacy alias; if both are set, `SAM3_TRACKING_PROJECTS_DIR` wins.                                                                                         |
+| `HF_TOKEN`                   | —                       | `scripts/download_model.py`  | HuggingFace token for downloading gated SAM3 weights.                                                                                                     |
+| `SAM3_ENV_YAML`              | `configs/env.yaml`      | Parallel tracking scripts    | Path to YAML config for HPC propagation workers (see below).                                                                                              |
+| `VITE_BACKEND_URL`           | `http://localhost:8000` | Frontend (build-time)        | Backend URL for video Range requests and SSE propagation when not using the Vite dev proxy. Set when the UI runs on a different host than the GPU server. |
+
+
+**Example — shared lab storage on Minerva:**
+
+```bash
+export SAM3_TRACKING_PROJECTS_DIR=/sc/arion/projects/KennyComputational/Behavior/projects
+export HF_TOKEN=hf_...
+```
+
+**Example — frontend on laptop, backend on GPU node:**
+
+```bash
+# On the GPU machine
+bash start_backend.sh   # listens on 0.0.0.0:8000
+
+# On your laptop (before npm run dev / start_frontend.sh)
+export VITE_BACKEND_URL=http://gpu-node.your.cluster:8000
+bash start_frontend.sh
+```
+
+The backend reads `SAM3_TRACKING_PROJECTS_DIR` at startup. You can also change the active projects root at runtime from the UI (project drawer → set projects folder); that override applies to the running server process only and does not change downstream CLI behavior — CLIs always use the env var.
+
+---
+
+### Project storage and `config.json`
+
+Each tracked experiment is a directory under the projects root:
+
+```
+$SAM3_TRACKING_PROJECTS_DIR/
+  3c9bddf2-Home-Cage-Interactions-0126-test-day/   # {short-uuid}-{slug}
+    config.json                                      # project metadata
+    videos/
+      <video-uuid>_<video-name>/
+        source.mp4
+        masks.sqlite
+        ...
+```
+
+**Naming:** Directories are `{8-char-uuid}-{human-readable-slug}`. Downstream tools resolve projects by short uuid prefix (the part before the first `-` that matches `config.json → id`).
+
+**`config.json` structure (simplified):** The web backend owns this file. Downstream analysis reads it for video lists, object names, frame ranges, and propagation status — it does not edit project metadata.
+
+```json
+{
+  "id": "3c9bddf2",
+  "name": "Home-Cage-Interactions-0126-test-day",
+  "videos": {
+    "<video-uuid>": {
+      "id": "<video-uuid>",
+      "name": "test1a_3A",
+      "width": 1920,
+      "height": 1080,
+      "num_frames": 54000,
+      "start_frame": 0,
+      "objects": {
+        "1": { "name": "HeadShave", "color": "#5B8DD9" },
+        "2": { "name": "NoShave", "color": "#E8A445" }
+      },
+      "propagation_complete": true
+    }
+  }
+}
+```
+
+**Practical notes:**
+
+- Object display names (`HeadShave`, `BackShave`, `NoShave`) are matched against `experiment_registry.csv` during multi-project analysis to assign mouse identities.
+- Video folder names (`test1a_3A`) encode session + camera view; the registry parser expects this convention.
+- Analysis outputs are written beside the project: `<project>/analysis_of_tracking_data/clustering/` (single-project) or a separate `--output-dir` (multi-project).
+
+---
+
+### Model checkpoints
+
+
+| File                                      | Purpose                                                         |
+| ----------------------------------------- | --------------------------------------------------------------- |
+| `pretrained_models/sam3.pt`               | Primary SAM3 weights (download via `scripts/download_model.py`) |
+| `pretrained_models/sam2.1_hiera_large.pt` | Automatic fallback if SAM3 is missing                           |
+
+
+Both paths are relative to the repo root. The backend loads whichever checkpoint exists (`backend/sam_predictor.py`). No environment variable is required if files are in the default location.
+
+---
+
+### HPC configuration (`configs/env.yaml`)
+
+Batch propagation and LSF job submission use a **per-clone, gitignored** YAML file. Copy the template and customize for your cluster:
+
+```bash
+cp configs/env_template.yaml configs/env.yaml
+```
+
+Alternatively, point at a shared config elsewhere:
+
+```bash
+export SAM3_ENV_YAML=/sc/arion/projects/YourLab/sam3-env.yaml
+```
+
+**`parallel_tracking`** — read by `scripts/parallel_tracking_worker.py`:
+
+
+| Key                         | Typical value                    | Purpose                                                     |
+| --------------------------- | -------------------------------- | ----------------------------------------------------------- |
+| `backend_url`               | `http://127.0.0.1:8000`          | FastAPI server used for SSE propagation                     |
+| `local_gpu_workers`         | `0` or `4`                       | Spawn one worker process per GPU on the same node           |
+| `backend_port_base`         | `8810`                           | Ports `8810`, `8811`, … when using multi-GPU local backends |
+| `auto_start_local_backends` | `true` / `false`                 | Worker starts uvicorn per GPU automatically                 |
+| `claims_file`               | `tracked_videos_in_progress.txt` | Coordination file beside `config.json`                      |
+| `idle_loops_before_exit`    | `288`                            | Worker exits after N idle polls (for batch arrays)          |
+
+
+**`lsf_parallel_tracking`** — read by `scripts/parallel_tracking_launcher.py`:
+
+
+| Key                 | Example (Minerva)                               | Maps to                        |
+| ------------------- | ----------------------------------------------- | ------------------------------ |
+| `queue_project`     | `acc_KennyComputational`                        | `bsub -P`                      |
+| `queue`             | `gpu`                                           | `bsub -q`                      |
+| `num_process_slots` | `32`                                            | `bsub -n`                      |
+| `resources`         | `rusage[mem=16000]`, `span[hosts=1]`, `h100nvl` | `bsub -R` (one per entry)      |
+| `gpu_allocation`    | `num=1`                                         | `bsub -gpu`                    |
+| `run_limit`         | `144:00`                                        | `bsub -W`                      |
+| `stdout` / `stderr` | `/sc/arion/.../logs/%J.out`                     | Log paths (`%J` = job id)      |
+| `shell_preamble`    | `conda activate ...`                            | Commands run before the worker |
+| `worker_python`     | `/path/to/envs/sam3/bin/python`                 | Python in batch jobs           |
+
+
+**Submit parallel tracking:**
+
+```bash
+# Edit configs/env.yaml first, then:
+python scripts/parallel_tracking_launcher.py /path/to/project
+
+# Or run locally without LSF:
+python scripts/parallel_tracking_launcher.py --local /path/to/project
+```
+
+CLI flags on the worker/launcher override YAML values when provided.
+
+---
+
+### Clustering pipeline parameters
+
+Defaults live in `downstream_analysis/clustering/config.py` (`ClusteringConfig` dataclass). Override via CLI on both single- and multi-project runs:
+
+
+| Parameter         | CLI flag                   | Default                   | When to change                                                                                  |
+| ----------------- | -------------------------- | ------------------------- | ----------------------------------------------------------------------------------------------- |
+| Window size       | `--window-size`            | 90 frames (~3 s @ 30 fps) | Longer windows smooth behavior; shorter windows capture brief motifs                            |
+| Stride            | `--stride`                 | 30 frames (~1 s)          | Smaller stride = more overlapping windows, denser sampling                                      |
+| k-NN neighbors    | `--n-neighbors`            | 30                        | Increase for smoother cluster graphs on large datasets                                          |
+| Leiden resolution | `--resolution`             | 1.0                       | **Lower → fewer clusters; higher → more clusters** (cheap to re-run; frame features are cached) |
+| Batch correction  | `--batch-correction`       | `combat`                  | Multi-project only: `combat`, `zscore_per_batch`, or `none`                                     |
+| Skip mask check   | `--skip-mask-verification` | off                       | Use after full propagation; saves startup time on large projects                                |
+
+
+**Internal defaults** (edit `config.py` if needed, not exposed on CLI):
+
+
+| Field                        | Default  | Purpose                                          |
+| ---------------------------- | -------- | ------------------------------------------------ |
+| `close_proximity_threshold`  | 0.05     | Fraction of video diagonal for "close" proximity |
+| `stationary_speed_threshold` | 0.001    | Speed below which an animal counts as stationary |
+| `normalize_method`           | `zscore` | Feature normalization before clustering          |
+| `umap_min_dist`              | 0.1      | UMAP embedding compactness                       |
+
+
+**Single-project example — re-cluster with fewer clusters:**
+
+```bash
+conda run --no-capture-output -n sam3 python -m downstream_analysis.clustering \
+  --project-dir /path/to/project \
+  --skip-mask-verification \
+  --resolution 0.5
+```
+
+Cached per-video frame features in `<project>/analysis_of_tracking_data/clustering/features/` are reused; only clustering and plots re-run.
+
+---
+
+### Multi-project analysis configuration
+
+The multi-project pipeline merges several interaction projects and optionally one locomotion project. Three things usually need attention beyond CLI flags:
+
+#### 1. Project directory → experiment name mapping
+
+`experiment_registry.py` maps the **8-character uuid prefix** of each project folder to an experiment name:
+
+
+| UUID prefix | Experiment    | Role in pipeline                                 |
+| ----------- | ------------- | ------------------------------------------------ |
+| `185b3df6`  | `hab`         | Habituation (littermates)                        |
+| `3c9bddf2`  | `test_day`    | Test day (SH/GH resident + GH intruder)          |
+| `a3d11289`  | `sh_intruder` | SH intruder condition                            |
+| `37254501`  | `locomotion`  | Single-mouse alone (optional `--locomotion-dir`) |
+
+
+For new study cohorts, add entries to `_PROJECT_SLUG_MAP` in `experiment_registry.py` or ensure your project folder uuid prefix is listed.
+
+#### 2. Identity registry (`experiment_registry.csv`)
+
+Maps `(experiment, session, box, shave_pattern)` → mouse ID, role, housing. Bundled CSV covers the Home-Cage-Interactions-0126 study. For new experiments:
+
+1. Copy `downstream_analysis/clustering/experiment_registry.csv` to a study-specific path.
+2. Add rows for each `(session, box, mouse)` combination.
+3. Pass `--registry-csv /path/to/your_registry.csv` to `multi_project_cli`.
+
+Validate coverage before a long run:
+
+```python
+from pathlib import Path
+from downstream_analysis.clustering.experiment_registry import validate_registry
+
+errors = validate_registry([
+    Path("/path/to/Hab"),
+    Path("/path/to/test-day"),
+])
+print(errors)  # empty list = all 2-object videos resolved
+```
+
+#### 3. Batch definition and correction
+
+Batch ID is `{experiment_name}_{camera_view}` (e.g. `test_day_3A`). ComBat correction runs at this level by default to remove camera/session technical variation while preserving biological condition structure.
+
+After correction, inspect `<output-dir>/batch_diagnostics/`:
+
+- `batch_diagnostics.json` — global η² and PERMANOVA before/after
+- `pca_before_after_by_batch.png` — visual check that batch clusters mix post-correction
+- `per_feature_batch_effects.csv` — features that still carry batch signal
+
+Use `--batch-correction zscore_per_batch` if some batches are very small (<10 windows); use `none` to disable correction for debugging.
+
+---
+
+### Feature-extraction bsub jobs
+
+`downstream_analysis/clustering/generate_bsub_jobs.py` has **site-specific constants** at the top of the file (account, queue, walltime, conda path in the generated LSF scripts). Edit these for your cluster, or override at generation time:
+
+```bash
+conda run -n sam3 python -m downstream_analysis.clustering.generate_bsub_jobs \
+  --project-dir /path/to/project \
+  --account acc_YourProject \
+  --queue premium \
+  --walltime 08:00 \
+  --mem 16000 \
+  --submit-all
+```
+
+Generated scripts land in `<project>/analysis_of_tracking_data/clustering/bsub_jobs/` with logs in `bsub_logs/`. See `downstream_analysis/clustering/RUN_PIPELINE.md` for the full step-by-step.
+
+---
+
+### Configuration quick reference
+
+
+| Goal                             | What to configure                                                   |
+| -------------------------------- | ------------------------------------------------------------------- |
+| Store projects on shared disk    | `SAM3_TRACKING_PROJECTS_DIR`                                        |
+| Download SAM3 weights            | `HF_TOKEN` + `scripts/download_model.py`                            |
+| UI on laptop, GPU backend remote | `VITE_BACKEND_URL`                                                  |
+| HPC parallel propagation         | `configs/env.yaml` (from `env_template.yaml`)                       |
+| LSF queue/account/memory         | `configs/env.yaml → lsf_parallel_tracking`                          |
+| Multi-GPU on one node            | `parallel_tracking.local_gpu_workers` + `auto_start_local_backends` |
+| Fewer/more behavior clusters     | `--resolution` (re-run clustering only)                             |
+| New mouse cohort / study         | Custom `experiment_registry.csv` + uuid map                         |
+| Batch effect QA                  | Inspect `<output-dir>/batch_diagnostics/` after multi-project run   |
+
 
 ---
 
