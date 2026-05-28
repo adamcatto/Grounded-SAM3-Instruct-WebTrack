@@ -16,10 +16,21 @@ import numpy as np  # noqa: E402
 
 from .clustering_pipeline import ClusteringResult
 from .plots import _cluster_cmap
+from .transition_analysis import normalize_transition_matrix
 
 logger = logging.getLogger(__name__)
 
 _DPI = 140
+
+
+def _matrix_for_display(matrix: np.ndarray, *, include_self_loops: bool) -> np.ndarray:
+    """Return transition matrix for plotting; optionally drop and renormalize diagonal."""
+    m = np.asarray(matrix, dtype=np.float64)
+    if include_self_loops:
+        return m
+    m = m.copy()
+    np.fill_diagonal(m, 0.0)
+    return normalize_transition_matrix(m)
 
 
 def _node_positions(n: int, radius: float = 1.0) -> np.ndarray:
@@ -89,13 +100,18 @@ def plot_transition_network(
     *,
     cluster_colors: list[Any] | None = None,
     prob_max: float | None = None,
+    include_self_loops: bool = True,
 ) -> None:
-    """Circular network diagram: nodes = clusters, edges = P(B | A) with self-loops.
+    """Circular network diagram: nodes = clusters, edges = P(B | A).
 
     Edge linewidth and color encode transition probability (row-normalized).
+    When ``include_self_loops`` is False, diagonal transitions are omitted and
+    rows are renormalized over off-diagonal targets only.
     """
     if n_clusters <= 0 or matrix.shape != (n_clusters, n_clusters):
         return
+
+    matrix = _matrix_for_display(matrix, include_self_loops=include_self_loops)
 
     colors = cluster_colors or _cluster_cmap(n_clusters)
     pos = _node_positions(n_clusters, radius=1.0)
@@ -194,10 +210,14 @@ def plot_transition_heatmap(
     n_clusters: int,
     title: str,
     outfile: Path,
+    *,
+    include_self_loops: bool = True,
 ) -> None:
-    """Optional companion heatmap for the same transition matrix."""
+    """Companion heatmap for the same transition matrix."""
     if n_clusters <= 0:
         return
+
+    matrix = _matrix_for_display(matrix, include_self_loops=include_self_loops)
 
     fig, ax = plt.subplots(figsize=(max(5, n_clusters * 0.55), max(4.5, n_clusters * 0.5)))
     im = ax.imshow(matrix, vmin=0, vmax=max(matrix.max(), 1e-9), cmap="plasma", aspect="auto")
@@ -255,19 +275,26 @@ def generate_transition_plots(
         title = f"{label}\n(n={n_videos} videos, {n_trans} transitions)"
 
         safe_name = group_key.replace("/", "_").replace(" ", "_")
-        plot_transition_network(
-            matrix,
-            result.n_clusters,
-            title,
-            out_dir / f"transition_network_{safe_name}.png",
-            cluster_colors=cluster_colors,
-            prob_max=prob_max,
-        )
-        plot_transition_heatmap(
-            matrix,
-            result.n_clusters,
-            f"Transition matrix — {label}",
-            out_dir / f"transition_matrix_{safe_name}.png",
-        )
+        for include_self_loops, suffix in (
+            (True, "with_self_loops"),
+            (False, "no_self_loops"),
+        ):
+            loop_label = "with self-loops" if include_self_loops else "no self-loops"
+            plot_transition_network(
+                matrix,
+                result.n_clusters,
+                f"{title}\n({loop_label})",
+                out_dir / f"transition_network_{safe_name}_{suffix}.png",
+                cluster_colors=cluster_colors,
+                prob_max=prob_max,
+                include_self_loops=include_self_loops,
+            )
+            plot_transition_heatmap(
+                matrix,
+                result.n_clusters,
+                f"Transition matrix — {label} ({loop_label})",
+                out_dir / f"transition_matrix_{safe_name}_{suffix}.png",
+                include_self_loops=include_self_loops,
+            )
 
     logger.info("Transition plots saved to %s", out_dir)
