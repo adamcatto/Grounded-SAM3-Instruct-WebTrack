@@ -535,9 +535,11 @@ def compare_locomotion_vs_paired(
 
     if sh_mask.sum() >= 3:
         results["SH_mice"] = _run_tests(loc_arr[sh_mask], paired_arr[sh_mask], "SH")
+        results["SH_resident_locomotion_vs_paired"] = results["SH_mice"]
 
     if gh_mask.sum() >= 3:
         results["GH_mice"] = _run_tests(loc_arr[gh_mask], paired_arr[gh_mask], "GH")
+        results["GH_resident_locomotion_vs_paired"] = results["GH_mice"]
 
     # SH alone vs GH alone (locomotion only, unpaired)
     if sh_mask.sum() >= 3 and gh_mask.sum() >= 3:
@@ -567,5 +569,50 @@ def compare_locomotion_vs_paired(
     results["loc_features"] = loc_arr.tolist()
     results["paired_features"] = paired_arr.tolist()
     results["feature_names"] = SINGLE_MOUSE_FEATURE_NAMES
+
+    def _tests_to_plot_format(
+        tests: list[dict[str, Any]],
+        label_alone: str,
+        label_paired: str,
+    ) -> list[dict[str, Any]]:
+        return [
+            {
+                "feature": t["feature"],
+                "mean_alone": t["mean_locomotion"],
+                "mean_paired": t["mean_paired"],
+                "wilcoxon_p_value": t["wilcoxon_p_value"],
+                "mannwhitney_p_value": t["mannwhitney_p_value"],
+            }
+            for t in tests
+        ]
+
+    paired_comparisons: list[dict[str, Any]] = []
+    if "SH_resident_locomotion_vs_paired" in results:
+        sh_tests = results["SH_resident_locomotion_vs_paired"]
+        paired_comparisons.append({
+            "key": "SH_resident_locomotion_vs_paired",
+            "label_a": "SH Resident (locomotion)",
+            "label_b": "SH Resident (paired test)",
+            "n_pairs": results["n_SH"],
+            "per_feature": _tests_to_plot_format(
+                sh_tests,
+                "SH Resident (locomotion)",
+                "SH Resident (paired test)",
+            ),
+        })
+    if "GH_resident_locomotion_vs_paired" in results:
+        gh_tests = results["GH_resident_locomotion_vs_paired"]
+        paired_comparisons.append({
+            "key": "GH_resident_locomotion_vs_paired",
+            "label_a": "GH Resident (locomotion)",
+            "label_b": "GH Resident (paired test)",
+            "n_pairs": results["n_GH"],
+            "per_feature": _tests_to_plot_format(
+                gh_tests,
+                "GH Resident (locomotion)",
+                "GH Resident (paired test)",
+            ),
+        })
+    results["paired_comparisons"] = paired_comparisons
 
     return results

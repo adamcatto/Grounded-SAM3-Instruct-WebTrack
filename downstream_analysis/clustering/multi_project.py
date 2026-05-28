@@ -439,10 +439,13 @@ class MultiProjectPipeline:
 
         # Run comparison
         results = compare_locomotion_vs_paired(loc_features, all_paired_features)
-        logger.info(
-            "Locomotion comparison: %d paired comparisons",
-            len(results.get("paired_comparisons", [])),
-        )
+        n_paired = len(results.get("paired_comparisons", []))
+        logger.info("Locomotion comparison: %d housing-specific paired tests", n_paired)
+        for comp in results.get("paired_comparisons", []):
+            logger.info(
+                "  %s: %d mouse-camera pairs",
+                comp.get("key", "?"), comp.get("n_pairs", 0),
+            )
 
         return results
 
@@ -499,6 +502,12 @@ class MultiProjectPipeline:
                 )
         except Exception as e:
             logger.warning("Multi-project UMAP plots failed: %s", e)
+
+        try:
+            from .plots_pairwise import generate_pairwise_comparison_plots
+            generate_pairwise_comparison_plots(comparison, plots_dir)
+        except Exception as e:
+            logger.warning("Pairwise comparison plots failed: %s", e)
 
         try:
             from .condition_boxplots import _GROUP_ORDER
@@ -588,6 +597,12 @@ class MultiProjectPipeline:
         p.write_text(json.dumps(comparison, indent=2, default=str))
         logger.info("  Wrote %s (%s)", p.name, _fmt_size(p.stat().st_size))
 
+        try:
+            from .plots_pairwise import save_pairwise_comparison_results
+            save_pairwise_comparison_results(comparison, results_dir)
+        except Exception as e:
+            logger.warning("Pairwise comparison CSV export failed: %s", e)
+
         # 5. Batch correction info
         p = results_dir / "batch_correction_info.json"
         p.write_text(json.dumps(batch_info, indent=2, default=str))
@@ -598,6 +613,28 @@ class MultiProjectPipeline:
             p = results_dir / "locomotion_comparison.json"
             p.write_text(json.dumps(locomotion_results, indent=2, default=str))
             logger.info("  Wrote %s (%s)", p.name, _fmt_size(p.stat().st_size))
+
+            loc_dir = results_dir / "locomotion_comparisons"
+            loc_dir.mkdir(parents=True, exist_ok=True)
+            for comp in locomotion_results.get("paired_comparisons", []):
+                key = comp.get("key", "comparison")
+                comp_path = loc_dir / f"{key}.json"
+                comp_path.write_text(json.dumps(comp, indent=2, default=str))
+                per_feat = comp.get("per_feature", [])
+                if per_feat:
+                    csv_path = loc_dir / f"{key}_stats.csv"
+                    with open(csv_path, "w", newline="") as f:
+                        writer = csv.DictWriter(
+                            f,
+                            fieldnames=[
+                                "feature", "mean_alone", "mean_paired",
+                                "wilcoxon_p_value", "mannwhitney_p_value",
+                            ],
+                            extrasaction="ignore",
+                        )
+                        writer.writeheader()
+                        writer.writerows(per_feat)
+            logger.info("  Wrote locomotion comparison tables to %s", loc_dir.name)
 
         # 7. Combined dataset (npz + json sidecar) for reproducibility
         ds_path = results_dir / "combined_dataset.npz"

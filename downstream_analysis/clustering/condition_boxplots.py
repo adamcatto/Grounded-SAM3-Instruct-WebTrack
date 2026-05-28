@@ -295,73 +295,121 @@ def plot_locomotion_paired(
     locomotion_results: dict[str, Any],
     plots_dir: Path,
 ) -> None:
-    """Paired boxplots: locomotion (alone) vs paired, with connecting lines per mouse."""
+    """Paired scatter plots: locomotion (alone) vs paired test, per housing subgroup."""
     paired = locomotion_results.get("paired_comparisons", [])
     if not paired:
         logger.info("No paired comparisons for locomotion plots")
         return
 
-    # Collect feature-level data across all paired comparisons
-    feature_data: dict[str, dict[str, list[float]]] = {}
-    for comp in paired:
-        per_feature = comp.get("per_feature", [])
-        for feat in per_feature:
-            fname = feat["feature"]
-            if fname not in feature_data:
-                feature_data[fname] = {"alone": [], "paired": []}
-            feature_data[fname]["alone"].append(feat["mean_alone"])
-            feature_data[fname]["paired"].append(feat["mean_paired"])
+    loc_arr = np.array(locomotion_results.get("loc_features", []), dtype=np.float64)
+    paired_arr = np.array(locomotion_results.get("paired_features", []), dtype=np.float64)
+    housing = locomotion_results.get("housing", [])
+    feature_names = locomotion_results.get("feature_names", [])
 
-    if not feature_data:
+    for comp in paired:
+        key = comp.get("key", "comparison")
+        label_a = comp.get("label_a", "Alone")
+        label_b = comp.get("label_b", "Paired")
+
+        if key == "SH_resident_locomotion_vs_paired":
+            mask = np.array([h == "SH" for h in housing])
+        elif key == "GH_resident_locomotion_vs_paired":
+            mask = np.array([h == "GH" for h in housing])
+        else:
+            mask = np.ones(len(housing), dtype=bool) if housing else np.array([], dtype=bool)
+
+        if loc_arr.size == 0 or not mask.any():
+            continue
+
+        loc_sub = loc_arr[mask]
+        paired_sub = paired_arr[mask]
+        features_to_plot = feature_names[:12] if feature_names else []
+
+        n_features = len(features_to_plot)
+        n_cols = 3
+        n_rows = max(1, (n_features + n_cols - 1) // n_cols)
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4 * n_rows))
+        axes = np.array(axes).flatten()
+
+        for fi, fname in enumerate(features_to_plot):
+            if fname not in feature_names:
+                continue
+            col = feature_names.index(fname)
+            ax = axes[fi]
+            alone = loc_sub[:, col]
+            paired_vals = paired_sub[:, col]
+            valid = np.isfinite(alone) & np.isfinite(paired_vals)
+            alone_v = alone[valid]
+            paired_v = paired_vals[valid]
+
+            for a, p in zip(alone_v, paired_v):
+                ax.plot([0, 1], [a, p], color="#888888", linewidth=0.5, alpha=0.5)
+            ax.scatter(np.zeros(len(alone_v)), alone_v, c="#4CAF50", s=20, zorder=3, label=label_a)
+            ax.scatter(np.ones(len(paired_v)), paired_v, c="#E05555", s=20, zorder=3, label=label_b)
+            ax.set_xticks([0, 1])
+            ax.set_xticklabels(["Locomotion", "Paired test"], fontsize=9)
+            ax.set_title(fname, fontsize=9)
+            ax.tick_params(axis="y", labelsize=7)
+            if fi == 0:
+                ax.legend(fontsize=7)
+
+        for i in range(n_features, len(axes)):
+            axes[i].set_visible(False)
+
+        title = f"{label_a} vs {label_b} (n={int(mask.sum())} mouse-camera pairs)"
+        fig.suptitle(title, fontsize=12, y=1.01)
+        fig.tight_layout()
+        outfile = plots_dir / f"locomotion_{key}.png"
+        fig.savefig(outfile, dpi=_DPI, bbox_inches="tight")
+        plt.close(fig)
+        logger.info("Saved %s", outfile)
+
+        _plot_locomotion_effect_bars(comp, plots_dir / f"locomotion_{key}_effect_sizes.png")
+
+    _plot_locomotion_group_boxplots(locomotion_results, plots_dir)
+
+
+def _plot_locomotion_effect_bars(comp: dict[str, Any], outfile: Path) -> None:
+    """Bar chart of mean difference (paired - locomotion) per feature with significance."""
+    per_feature = comp.get("per_feature", [])
+    if not per_feature:
         return
 
-    features_to_plot = list(feature_data.keys())[:12]
-    n_features = len(features_to_plot)
-    n_cols = 3
-    n_rows = (n_features + n_cols - 1) // n_cols
+    feats = per_feature[:12]
+    names = [f["feature"] for f in feats]
+    diffs = [f["mean_paired"] - f["mean_alone"] for f in feats]
+    pvals = [f.get("wilcoxon_p_value", float("nan")) for f in feats]
 
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4 * n_rows))
-    axes = np.array(axes).flatten()
-
-    for fi, fname in enumerate(features_to_plot):
-        ax = axes[fi]
-        alone = np.array(feature_data[fname]["alone"])
-        paired_vals = np.array(feature_data[fname]["paired"])
-
-        # Paired connected scatter
-        for a, p in zip(alone, paired_vals):
-            ax.plot([0, 1], [a, p], color="#888888", linewidth=0.5, alpha=0.5)
-
-        ax.scatter(np.zeros(len(alone)), alone, c="#4CAF50", s=20, zorder=3, label="Alone")
-        ax.scatter(np.ones(len(paired_vals)), paired_vals, c="#E05555", s=20, zorder=3, label="Paired")
-
-        ax.set_xticks([0, 1])
-        ax.set_xticklabels(["Alone", "Paired"], fontsize=9)
-        ax.set_title(fname, fontsize=9)
-        ax.tick_params(axis="y", labelsize=7)
-        if fi == 0:
-            ax.legend(fontsize=7)
-
-    for i in range(n_features, len(axes)):
-        axes[i].set_visible(False)
-
-    fig.suptitle("Locomotion vs Paired: Per-Mouse Comparison", fontsize=13, y=1.01)
+    fig, ax = plt.subplots(figsize=(8, max(4, len(names) * 0.35)))
+    y = np.arange(len(names))
+    colors = ["#E05555" if d > 0 else "#5588DD" for d in diffs]
+    ax.barh(y, diffs, color=colors, alpha=0.75, height=0.7)
+    for i, (d, p) in enumerate(zip(diffs, pvals)):
+        if np.isfinite(p) and p < 0.05:
+            marker = "***" if p < 0.001 else "**" if p < 0.01 else "*"
+            offset = 0.02 if d >= 0 else -0.02
+            ha = "left" if d >= 0 else "right"
+            ax.text(d + offset, i, marker, ha=ha, va="center", fontsize=9, fontweight="bold")
+    ax.axvline(0, color="gray", linewidth=0.8)
+    ax.set_yticks(y)
+    ax.set_yticklabels(names, fontsize=7)
+    ax.set_xlabel("Mean difference (paired test − locomotion)")
+    ax.set_title(comp.get("label_b", "Paired") + " vs " + comp.get("label_a", "Locomotion"))
     fig.tight_layout()
-    outfile = plots_dir / "locomotion_vs_paired_boxplots.png"
-    fig.savefig(outfile, dpi=_DPI, bbox_inches="tight")
+    fig.savefig(outfile, dpi=_DPI)
     plt.close(fig)
     logger.info("Saved %s", outfile)
-
-    # Also make group-level boxplots (SH alone vs SH paired, GH alone vs GH paired)
-    _plot_locomotion_group_boxplots(locomotion_results, plots_dir)
 
 
 def _plot_locomotion_group_boxplots(
     locomotion_results: dict[str, Any],
     plots_dir: Path,
 ) -> None:
-    """Group-level boxplots for SH and GH separately."""
+    """Wilcoxon effect summary for SH vs GH locomotion-only (unpaired)."""
     unpaired = locomotion_results.get("unpaired_comparisons", {})
+    sh_vs_gh = locomotion_results.get("SH_vs_GH_locomotion")
+    if sh_vs_gh:
+        unpaired = {**unpaired, "SH_vs_GH_locomotion": {"per_feature": sh_vs_gh, "label_a": "SH", "label_b": "GH"}}
     if not unpaired:
         return
 

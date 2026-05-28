@@ -1,15 +1,18 @@
 """Statistical comparisons across experimental conditions for the multi-project pipeline.
 
-Produces per-cluster enrichment, per-feature Mann-Whitney U tests, and
-cluster composition analysis for each condition group.
+Produces per-cluster enrichment, per-feature Mann-Whitney U tests, feature enrichment
+(Cohen's d, log2FC, Fisher OR), and all N-choose-2 pairwise comparisons for:
+  - Condition groups (upper triangle of the 4-group matrix)
+  - Role conditions (SH/GH resident, intruder, GH littermate)
 """
 
 from __future__ import annotations
 
 import logging
 import time
-from collections import Counter
-from typing import Any
+from collections import Counter, defaultdict
+from itertools import combinations
+from typing import Any, Callable
 
 import numpy as np
 from scipy.stats import fisher_exact, mannwhitneyu
@@ -25,27 +28,24 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def _assign_condition_group(m: WindowMetadata) -> str:
-    """Assign a window to one of the 6 condition groups based on metadata.
-
-    Groups:
-      'GH_littermate'       — Exp 1 (hab): two familiar GH mice
-      'SH_res_GH_int'       — Exp 2 (test_day): SH resident + novel GH intruder
-      'GH_res_GH_int'       — Exp 2 (test_day): GH resident + novel GH intruder
-      'GH_res_SH_int'       — Exp 3 (sh_intruder): GH resident + SH intruder
-      'unknown'             — could not classify
-    """
+    """Assign a window to one of the 4 condition groups based on metadata."""
     if m.experiment_name == "hab":
         return "GH_littermate"
-    elif m.experiment_name == "test_day":
-        # SH resident sessions vs GH resident sessions
+    if m.experiment_name == "test_day":
         if m.mouse_a_housing == "SH" or m.mouse_b_housing == "SH":
             return "SH_res_GH_int"
-        else:
-            return "GH_res_GH_int"
-    elif m.experiment_name == "sh_intruder":
+        return "GH_res_GH_int"
+    if m.experiment_name == "sh_intruder":
         return "GH_res_SH_int"
     return "unknown"
 
+
+CONDITION_GROUP_ORDER = [
+    "GH_littermate",
+    "SH_res_GH_int",
+    "GH_res_GH_int",
+    "GH_res_SH_int",
+]
 
 CONDITION_GROUP_LABELS = {
     "GH_littermate": "GH + Littermate",
@@ -53,6 +53,160 @@ CONDITION_GROUP_LABELS = {
     "GH_res_GH_int": "GH Resident + GH Intruder",
     "GH_res_SH_int": "GH Resident + SH Intruder",
 }
+
+# Role-specific conditions for resident/intruder/littermate comparisons
+ROLE_CONDITION_ORDER = [
+    "SH_resident",
+    "SH_intruder",
+    "GH_resident",
+    "GH_intruder",
+    "GH_littermate",
+]
+
+ROLE_CONDITION_LABELS = {
+    "SH_resident": "SH Resident",
+    "SH_intruder": "SH Intruder",
+    "GH_resident": "GH Resident",
+    "GH_intruder": "GH Intruder",
+    "GH_littermate": "GH Littermate",
+}
+
+
+def _mask_sh_resident(meta: list[WindowMetadata]) -> np.ndarray:
+    return np.array([
+        m.experiment_name == "test_day"
+        and (
+            (m.mouse_a_role == "resident" and m.mouse_a_housing == "SH")
+            or (m.mouse_b_role == "resident" and m.mouse_b_housing == "SH")
+        )
+        for m in meta
+    ])
+
+
+def _mask_sh_intruder(meta: list[WindowMetadata]) -> np.ndarray:
+    return np.array([
+        m.experiment_name == "sh_intruder"
+        and (m.mouse_a_housing == "SH" or m.mouse_b_housing == "SH")
+        for m in meta
+    ])
+
+
+def _mask_gh_resident(meta: list[WindowMetadata]) -> np.ndarray:
+    return np.array([
+        m.experiment_name in ("test_day", "sh_intruder")
+        and (
+            (m.mouse_a_role == "resident" and m.mouse_a_housing == "GH")
+            or (m.mouse_b_role == "resident" and m.mouse_b_housing == "GH")
+        )
+        for m in meta
+    ])
+
+
+def _mask_gh_intruder(meta: list[WindowMetadata]) -> np.ndarray:
+    return np.array([
+        m.experiment_name == "test_day"
+        and (
+            (m.mouse_a_role == "intruder" and m.mouse_a_housing == "GH")
+            or (m.mouse_b_role == "intruder" and m.mouse_b_housing == "GH")
+        )
+        for m in meta
+    ])
+
+
+def _mask_gh_littermate(meta: list[WindowMetadata]) -> np.ndarray:
+    return np.array([m.experiment_name == "hab" for m in meta])
+
+
+ROLE_MASK_BUILDERS: dict[str, Callable[[list[WindowMetadata]], np.ndarray]] = {
+    "SH_resident": _mask_sh_resident,
+    "SH_intruder": _mask_sh_intruder,
+    "GH_resident": _mask_gh_resident,
+    "GH_intruder": _mask_gh_intruder,
+    "GH_littermate": _mask_gh_littermate,
+}
+
+
+def _pairwise_key(label_a: str, label_b: str) -> str:
+    return f"{label_a}_vs_{label_b}"
+
+
+def _compute_feature_enrichment(
+    result: ClusteringResult,
+    mask_a: np.ndarray,
+    mask_b: np.ndarray,
+    label_a: str,
+    label_b: str,
+) -> list[dict[str, Any]]:
+    """Per-feature enrichment between two groups (mirrors single-project comparison.py)."""
+    enrichment: list[dict[str, Any]] = []
+    n_a, n_b = int(mask_a.sum()), int(mask_b.sum())
+    if n_a < 5 or n_b < 5:
+        return enrichment
+
+    for fi, fname in enumerate(result.feature_names):
+        vals_a = result.features_normalized[mask_a, fi]
+        vals_b = result.features_normalized[mask_b, fi]
+        vals_a = vals_a[np.isfinite(vals_a)]
+        vals_b = vals_b[np.isfinite(vals_b)]
+        if len(vals_a) < 2 or len(vals_b) < 2:
+            continue
+
+        mean_a = float(np.mean(vals_a))
+        mean_b = float(np.mean(vals_b))
+        std_a = float(np.std(vals_a, ddof=1))
+        std_b = float(np.std(vals_b, ddof=1))
+
+        pooled_std = np.sqrt(
+            ((len(vals_a) - 1) * std_a ** 2 + (len(vals_b) - 1) * std_b ** 2)
+            / max(len(vals_a) + len(vals_b) - 2, 1)
+        )
+        cohens_d = (mean_a - mean_b) / pooled_std if pooled_std > 1e-12 else 0.0
+
+        median_all = float(np.median(
+            result.features_normalized[np.isfinite(result.features_normalized[:, fi]), fi]
+        ))
+        shift = abs(min(mean_a, mean_b, median_all)) + 1.0
+        log2fc = float(np.log2((mean_a + shift) / (mean_b + shift)))
+
+        above_a = int(np.sum(vals_a > median_all))
+        below_a = len(vals_a) - above_a
+        above_b = int(np.sum(vals_b > median_all))
+        below_b = len(vals_b) - above_b
+        try:
+            odds_r, p_fisher = fisher_exact([[above_a, below_a], [above_b, below_b]])
+        except ValueError:
+            odds_r, p_fisher = float("nan"), float("nan")
+
+        try:
+            u_stat, p_mw = mannwhitneyu(vals_a, vals_b, alternative="two-sided")
+        except ValueError:
+            u_stat, p_mw = float("nan"), float("nan")
+
+        enrichment.append({
+            "feature": fname,
+            f"mean_{label_a}": mean_a,
+            f"mean_{label_b}": mean_b,
+            "mean_a": mean_a,
+            "mean_b": mean_b,
+            f"std_{label_a}": std_a,
+            f"std_{label_b}": std_b,
+            "cohens_d": float(cohens_d),
+            "log2_fold_change": log2fc,
+            "odds_ratio": float(odds_r),
+            "fisher_p_value": float(p_fisher),
+            "mannwhitney_U": float(u_stat),
+            "mannwhitney_p_value": float(p_mw),
+            f"n_{label_a}": len(vals_a),
+            f"n_{label_b}": len(vals_b),
+            "n_a": len(vals_a),
+            "n_b": len(vals_b),
+            "direction": f"higher_in_{label_a}" if mean_a > mean_b else f"higher_in_{label_b}",
+        })
+
+    enrichment.sort(
+        key=lambda x: x["mannwhitney_p_value"] if np.isfinite(x["mannwhitney_p_value"]) else 999
+    )
+    return enrichment
 
 
 # ---------------------------------------------------------------------------
@@ -65,14 +219,21 @@ def _pairwise_comparison(
     mask_b: np.ndarray,
     label_a: str,
     label_b: str,
+    *,
+    display_a: str | None = None,
+    display_b: str | None = None,
 ) -> dict[str, Any]:
-    """Run Fisher's exact (per-cluster) and Mann-Whitney U (per-feature) between two groups."""
+    """Fisher (per-cluster), Mann-Whitney + enrichment (per-feature) between two groups."""
     n_a, n_b = int(mask_a.sum()), int(mask_b.sum())
     labels = result.cluster_labels
+    disp_a = display_a or label_a
+    disp_b = display_b or label_b
 
     comparison: dict[str, Any] = {
         "label_a": label_a,
         "label_b": label_b,
+        "display_a": disp_a,
+        "display_b": disp_b,
         "n_a": n_a,
         "n_b": n_b,
     }
@@ -83,6 +244,7 @@ def _pairwise_comparison(
 
     # Per-cluster Fisher's exact test (enrichment in group A)
     per_cluster: dict[str, dict[str, Any]] = {}
+    cluster_stats: dict[str, dict[str, Any]] = {}
     for c in range(result.n_clusters):
         c_mask = labels == c
         a_in = int((mask_a & c_mask).sum())
@@ -93,18 +255,23 @@ def _pairwise_comparison(
             odds_ratio, p_value = fisher_exact([[a_in, b_in], [a_out, b_out]])
         except ValueError:
             odds_ratio, p_value = float("nan"), float("nan")
-        per_cluster[str(c)] = {
+        entry = {
             "a_in_cluster": a_in,
             "b_in_cluster": b_in,
             "a_frac": a_in / max(n_a, 1),
             "b_frac": b_in / max(n_b, 1),
             "odds_ratio": float(odds_ratio),
             "p_value": float(p_value),
+            "comparison": f"{disp_a} vs {disp_b}",
         }
+        per_cluster[str(c)] = entry
+        cluster_stats[str(c)] = entry
     comparison["per_cluster"] = per_cluster
+    comparison["cluster_stats"] = cluster_stats
 
-    # Per-feature Mann-Whitney U
+    # Per-feature Mann-Whitney U (list + dict)
     per_feature: list[dict[str, Any]] = []
+    per_feature_tests: dict[str, dict[str, Any]] = {}
     for fi, fname in enumerate(result.feature_names):
         vals_a = result.features_normalized[mask_a, fi]
         vals_b = result.features_normalized[mask_b, fi]
@@ -125,8 +292,9 @@ def _pairwise_comparison(
         )
         cohens_d = (mean_a - mean_b) / pooled_std if pooled_std > 1e-12 else 0.0
 
-        per_feature.append({
+        feat_entry = {
             "feature": fname,
+            "comparison": f"{disp_a} vs {disp_b}",
             "mean_a": mean_a,
             "mean_b": mean_b,
             "std_a": std_a,
@@ -134,18 +302,71 @@ def _pairwise_comparison(
             "cohens_d": float(cohens_d),
             "U_statistic": float(u_stat),
             "p_value": float(p_val),
+            "effect_direction": f"higher_in_{label_a}" if mean_a > mean_b else f"higher_in_{label_b}",
             "direction": f"higher_in_{label_a}" if mean_a > mean_b else f"higher_in_{label_b}",
-        })
+        }
+        per_feature.append(feat_entry)
+        per_feature_tests[fname] = feat_entry
 
     per_feature.sort(
         key=lambda x: x["p_value"] if np.isfinite(x["p_value"]) else 999
     )
     comparison["per_feature"] = per_feature
+    comparison["per_feature_tests"] = per_feature_tests
+    comparison["n_significant_features"] = sum(
+        1 for f in per_feature if np.isfinite(f["p_value"]) and f["p_value"] < 0.05
+    )
 
-    n_sig = sum(1 for f in per_feature if np.isfinite(f["p_value"]) and f["p_value"] < 0.05)
-    comparison["n_significant_features"] = n_sig
+    comparison["feature_enrichment"] = _compute_feature_enrichment(
+        result, mask_a, mask_b, label_a, label_b,
+    )
 
     return comparison
+
+
+def _run_pairwise_matrix(
+    result: ClusteringResult,
+    groups: list[str],
+    masks: dict[str, np.ndarray],
+    labels: dict[str, str],
+    *,
+    min_windows: int = 5,
+) -> dict[str, dict[str, Any]]:
+    """Run all upper-triangular pairwise comparisons for ordered groups."""
+    comparisons: dict[str, dict[str, Any]] = {}
+    for ga, gb in combinations(groups, 2):
+        mask_a, mask_b = masks[ga], masks[gb]
+        if int(mask_a.sum()) < min_windows or int(mask_b.sum()) < min_windows:
+            key = _pairwise_key(ga, gb)
+            comparisons[key] = {
+                "label_a": ga,
+                "label_b": gb,
+                "display_a": labels.get(ga, ga),
+                "display_b": labels.get(gb, gb),
+                "n_a": int(mask_a.sum()),
+                "n_b": int(mask_b.sum()),
+                "note": "too few samples for statistical testing",
+            }
+            logger.info(
+                "  Skip %s vs %s: n=%d vs %d (< %d)",
+                labels.get(ga, ga), labels.get(gb, gb),
+                int(mask_a.sum()), int(mask_b.sum()), min_windows,
+            )
+            continue
+
+        key = _pairwise_key(ga, gb)
+        comparisons[key] = _pairwise_comparison(
+            result, mask_a, mask_b, ga, gb,
+            display_a=labels.get(ga, ga),
+            display_b=labels.get(gb, gb),
+        )
+        n_sig = comparisons[key].get("n_significant_features", 0)
+        logger.info(
+            "  %s vs %s: %d vs %d windows, %d sig features (p<0.05)",
+            labels.get(ga, ga), labels.get(gb, gb),
+            comparisons[key]["n_a"], comparisons[key]["n_b"], n_sig,
+        )
+    return comparisons
 
 
 # ---------------------------------------------------------------------------
@@ -155,11 +376,12 @@ def _pairwise_comparison(
 def compare_experiments(result: ClusteringResult) -> dict[str, Any]:
     """Run all multi-project comparisons.
 
-    Returns a dict with:
-      - condition_groups: per-group window counts and cluster composition
-      - comparisons: the 4 specific researcher-requested comparisons
-      - per_cluster_by_experiment: cluster enrichment by experiment number
-      - ethograms: per-video cluster label timelines
+    Returns:
+      - condition_groups: per-group cluster composition
+      - pairwise_condition_groups: all C(4,2)=6 condition-group pairs
+      - pairwise_role_conditions: all C(5,2)=10 role-condition pairs
+      - comparisons: union of both pairwise dicts (backward compatible)
+      - per_cluster_by_experiment, ethograms, transition_matrices
     """
     if len(result.metadata) == 0:
         return {"note": "no data"}
@@ -171,7 +393,6 @@ def compare_experiments(result: ClusteringResult) -> dict[str, Any]:
 
     logger.info("Multi-project comparison: %d windows, %d clusters", n_total, result.n_clusters)
 
-    # Assign condition groups
     groups = np.array([_assign_condition_group(m) for m in meta])
     group_counts = Counter(groups)
     logger.info("Condition group breakdown:")
@@ -198,72 +419,34 @@ def compare_experiments(result: ClusteringResult) -> dict[str, Any]:
         }
 
     # ---------------------------------------------------------------------------
-    # 2. Specific comparisons
+    # 2. All pairwise condition-group comparisons (upper triangle)
     # ---------------------------------------------------------------------------
-    comparisons: dict[str, dict[str, Any]] = {}
-
-    # 2a. SH resident (exp2) vs SH intruder (exp3)
-    mask_sh_res = np.array([
-        m.experiment_name == "test_day" and m.mouse_a_housing == "SH" and m.mouse_a_role == "resident"
-        for m in meta
-    ])
-    # For exp3, the SH mice are intruders
-    mask_sh_int = np.array([
-        m.experiment_name == "sh_intruder" and (m.mouse_a_housing == "SH" or m.mouse_b_housing == "SH")
-        for m in meta
-    ])
-    comparisons["SH_resident_vs_SH_intruder"] = _pairwise_comparison(
-        result, mask_sh_res, mask_sh_int,
-        "SH_resident_exp2", "SH_intruder_exp3",
-    )
-    logger.info(
-        "Comparison SH_resident vs SH_intruder: %d vs %d windows",
-        int(mask_sh_res.sum()), int(mask_sh_int.sum()),
-    )
-
-    # 2b. GH resident vs intruder within exp2
-    mask_gh_res_exp2 = np.array([
-        m.experiment_name == "test_day" and m.mouse_a_housing == "GH" and m.mouse_a_role == "resident"
-        for m in meta
-    ])
-    # The intruder windows are the same videos but from the intruder perspective —
-    # since features are computed per-pair, we compare GH-resident sessions vs SH-resident sessions
-    # Actually we compare group composition: GH_res_GH_int group
-    mask_gh_int_exp2 = groups == "GH_res_GH_int"
-    mask_sh_int_exp2 = groups == "SH_res_GH_int"
-    comparisons["SH_vs_GH_residents_exp2"] = _pairwise_comparison(
-        result, mask_sh_int_exp2, mask_gh_int_exp2,
-        "SH_resident_exp2", "GH_resident_exp2",
-    )
-    logger.info(
-        "Comparison SH vs GH residents (exp2): %d vs %d windows",
-        int(mask_sh_int_exp2.sum()), int(mask_gh_int_exp2.sum()),
-    )
-
-    # 2c. Exp1 littermate profile (vs all other experiments)
-    mask_exp1 = groups == "GH_littermate"
-    mask_not_exp1 = ~mask_exp1 & (groups != "unknown")
-    comparisons["littermate_vs_other"] = _pairwise_comparison(
-        result, mask_exp1, mask_not_exp1,
-        "GH_littermate", "other_interactions",
-    )
-    logger.info("Comparison littermate vs other: %d vs %d windows",
-                int(mask_exp1.sum()), int(mask_not_exp1.sum()))
-
-    # 2d. GH resident + GH intruder (exp2) vs GH resident + SH intruder (exp3)
-    mask_gh_res_gh_int = groups == "GH_res_GH_int"
-    mask_gh_res_sh_int = groups == "GH_res_SH_int"
-    comparisons["GH_with_GH_intruder_vs_SH_intruder"] = _pairwise_comparison(
-        result, mask_gh_res_gh_int, mask_gh_res_sh_int,
-        "GH_res+GH_int", "GH_res+SH_int",
-    )
-    logger.info(
-        "Comparison GH+GH_int vs GH+SH_int: %d vs %d windows",
-        int(mask_gh_res_gh_int.sum()), int(mask_gh_res_sh_int.sum()),
+    logger.info("Pairwise condition-group comparisons (N choose 2):")
+    cg_masks = {g: groups == g for g in CONDITION_GROUP_ORDER}
+    pairwise_condition_groups = _run_pairwise_matrix(
+        result,
+        CONDITION_GROUP_ORDER,
+        cg_masks,
+        CONDITION_GROUP_LABELS,
     )
 
     # ---------------------------------------------------------------------------
-    # 3. Per-cluster enrichment by experiment
+    # 3. All pairwise role-condition comparisons (upper triangle)
+    # ---------------------------------------------------------------------------
+    logger.info("Pairwise role-condition comparisons (N choose 2):")
+    role_masks = {r: ROLE_MASK_BUILDERS[r](meta) for r in ROLE_CONDITION_ORDER}
+    pairwise_role_conditions = _run_pairwise_matrix(
+        result,
+        ROLE_CONDITION_ORDER,
+        role_masks,
+        ROLE_CONDITION_LABELS,
+    )
+
+    # Union for backward compatibility
+    comparisons = {**pairwise_condition_groups, **pairwise_role_conditions}
+
+    # ---------------------------------------------------------------------------
+    # 4. Per-cluster enrichment by experiment
     # ---------------------------------------------------------------------------
     exp_numbers = np.array([m.experiment_number for m in meta])
     per_cluster_by_exp: dict[str, dict[str, Any]] = {}
@@ -280,9 +463,8 @@ def compare_experiments(result: ClusteringResult) -> dict[str, Any]:
         }
 
     # ---------------------------------------------------------------------------
-    # 4. Ethograms
+    # 5. Ethograms
     # ---------------------------------------------------------------------------
-    from collections import defaultdict
     ethograms: dict[str, dict[str, Any]] = {}
     vid_groups: defaultdict[str, list[int]] = defaultdict(list)
     for i, m in enumerate(meta):
@@ -312,10 +494,15 @@ def compare_experiments(result: ClusteringResult) -> dict[str, Any]:
     )
 
     elapsed = time.monotonic() - t0
-    logger.info("Multi-project comparison done in %.1fs", elapsed)
+    logger.info(
+        "Multi-project comparison done in %.1fs (%d condition pairs, %d role pairs)",
+        elapsed, len(pairwise_condition_groups), len(pairwise_role_conditions),
+    )
 
     return {
         "condition_groups": condition_group_info,
+        "pairwise_condition_groups": pairwise_condition_groups,
+        "pairwise_role_conditions": pairwise_role_conditions,
         "comparisons": comparisons,
         "per_cluster_by_experiment": per_cluster_by_exp,
         "ethograms": ethograms,
