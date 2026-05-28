@@ -385,6 +385,31 @@ class MultiProjectPipeline:
 
         self._save_results(results_dir, result, comparison, batch_info, locomotion_results)
 
+        from .report_outputs import (
+            build_multi_project_summary,
+            write_multi_project_excel_report,
+            write_summary_json,
+        )
+
+        summary = build_multi_project_summary(
+            self.output_dir,
+            self.project_dirs,
+            self.cfg,
+            result,
+            comparison,
+            batch_correction_method=self.batch_correction_method,
+            locomotion_dir=self.locomotion_dir,
+        )
+        write_summary_json(self.output_dir, summary)
+        write_multi_project_excel_report(
+            self.output_dir,
+            result,
+            comparison,
+            self.cfg,
+            project_dirs=self.project_dirs,
+            batch_correction_method=self.batch_correction_method,
+        )
+
         overall_elapsed = time.monotonic() - overall_t0
         logger.info("")
         logger.info("#" * 70)
@@ -645,3 +670,12 @@ class MultiProjectPipeline:
         )
         combined_ds.save(ds_path)
         logger.info("  Wrote %s + .json sidecar", ds_path.name)
+
+        # 8. Embedding coordinates (for Excel regeneration)
+        p = results_dir / "embedding.npz"
+        np.savez_compressed(
+            p,
+            embedding=result.embedding_2d,
+            labels=result.cluster_labels,
+        )
+        logger.info("  Wrote %s (%s)", p.name, _fmt_size(p.stat().st_size))

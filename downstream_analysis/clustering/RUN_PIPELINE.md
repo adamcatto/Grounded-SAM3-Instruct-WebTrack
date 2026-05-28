@@ -97,8 +97,13 @@ plots/
   ethograms/ethogram_<vid>.png     # per-video behavioral timelines
 bsub_jobs/                         # generated .lsf files
 bsub_logs/                         # stdout/stderr from jobs
-summary.json
+summary.json                       # run metadata and cluster counts
+clustering_report.xlsx             # Excel workbook (tables + embedded plots)
 ```
+
+Multi-project merged runs use the same layout under ``--output-dir`` (typically
+``analysis_of_tracking_data/clustering``), with ``condition_comparison.json`` in
+``results/`` instead of ``housing_comparison.json``.
 
 ## Troubleshooting
 
