@@ -21,6 +21,43 @@ logger = logging.getLogger(__name__)
 _DPI = 140
 
 
+def _legend_layout_rect(n_items: int, ncol: int = 1) -> float:
+    """Right edge of the axes area (figure coords) reserved for an external legend."""
+    nrows = max(1, (n_items + ncol - 1) // ncol)
+    if nrows >= 16:
+        return 0.52
+    if nrows >= 10:
+        return 0.60
+    if nrows >= 6:
+        return 0.67
+    return 0.74
+
+
+def _add_legend_right_of_axes(
+    ax: plt.Axes,
+    *,
+    ncol: int = 1,
+    fontsize: float = 8,
+    markerscale: float = 3,
+    n_items: int | None = None,
+) -> None:
+    """Place legend to the right of the scatter axes (not over the points)."""
+    handles, labels = ax.get_legend_handles_labels()
+    if not handles:
+        return
+    n = n_items if n_items is not None else len(handles)
+    ax.legend(
+        fontsize=fontsize,
+        markerscale=markerscale,
+        ncol=max(1, ncol),
+        loc="center left",
+        bbox_to_anchor=(1.02, 0.5),
+        borderaxespad=0,
+    )
+    rect_right = _legend_layout_rect(n, ncol)
+    ax.figure.tight_layout(rect=[0, 0, rect_right, 1])
+
+
 # ---------------------------------------------------------------------------
 # Color helpers
 # ---------------------------------------------------------------------------
@@ -74,9 +111,11 @@ def plot_umap_by_cluster(result: ClusteringResult, outfile: Path) -> None:
     ax.set_xlabel(f"{result.embedding_method.upper()} 1")
     ax.set_ylabel(f"{result.embedding_method.upper()} 2")
     ax.set_title("Behavioral clusters")
-    ax.legend(fontsize=7, markerscale=3, ncol=max(1, result.n_clusters // 8))
-    fig.tight_layout()
-    fig.savefig(outfile, dpi=_DPI)
+    ncol = max(1, result.n_clusters // 8)
+    _add_legend_right_of_axes(
+        ax, ncol=ncol, fontsize=7, markerscale=3, n_items=result.n_clusters,
+    )
+    fig.savefig(outfile, dpi=_DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("Saved %s", outfile)
 
@@ -103,9 +142,10 @@ def plot_umap_by_housing(result: ClusteringResult, outfile: Path) -> None:
     ax.set_xlabel(f"{result.embedding_method.upper()} 1")
     ax.set_ylabel(f"{result.embedding_method.upper()} 2")
     ax.set_title("Interaction types")
-    ax.legend(fontsize=8, markerscale=3)
-    fig.tight_layout()
-    fig.savefig(outfile, dpi=_DPI)
+    _add_legend_right_of_axes(
+        ax, fontsize=8, markerscale=3, n_items=len(unique_types),
+    )
+    fig.savefig(outfile, dpi=_DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("Saved %s", outfile)
 

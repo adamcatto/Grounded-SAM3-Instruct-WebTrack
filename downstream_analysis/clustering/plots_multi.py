@@ -18,6 +18,7 @@ import numpy as np  # noqa: E402
 from .clustering_pipeline import ClusteringResult
 from .dataset import WindowMetadata
 from .multi_project_comparison import _assign_condition_group, CONDITION_GROUP_LABELS
+from .plots import _add_legend_right_of_axes
 
 logger = logging.getLogger(__name__)
 
@@ -73,9 +74,10 @@ def plot_umap_by_experiment(result: ClusteringResult, outfile: Path) -> None:
     ax.set_xlabel(f"{result.embedding_method.upper()} 1")
     ax.set_ylabel(f"{result.embedding_method.upper()} 2")
     ax.set_title("UMAP by Experiment")
-    ax.legend(fontsize=8, markerscale=4)
-    fig.tight_layout()
-    fig.savefig(outfile, dpi=_DPI)
+    _add_legend_right_of_axes(
+        ax, fontsize=8, markerscale=4, n_items=len(experiments),
+    )
+    fig.savefig(outfile, dpi=_DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("Saved %s", outfile)
 
@@ -110,9 +112,10 @@ def plot_umap_by_condition_group(result: ClusteringResult, outfile: Path) -> Non
     ax.set_xlabel(f"{result.embedding_method.upper()} 1")
     ax.set_ylabel(f"{result.embedding_method.upper()} 2")
     ax.set_title("UMAP by Condition Group")
-    ax.legend(fontsize=7, markerscale=4)
-    fig.tight_layout()
-    fig.savefig(outfile, dpi=_DPI)
+    _add_legend_right_of_axes(
+        ax, fontsize=7, markerscale=4, n_items=len(unique_groups),
+    )
+    fig.savefig(outfile, dpi=_DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("Saved %s", outfile)
 
@@ -153,9 +156,11 @@ def plot_umap_by_batch(result: ClusteringResult, outfile: Path) -> None:
     ax.set_xlabel(f"{result.embedding_method.upper()} 1")
     ax.set_ylabel(f"{result.embedding_method.upper()} 2")
     ax.set_title("UMAP by Batch")
-    ax.legend(fontsize=5, markerscale=3, ncol=max(1, n_batches // 10))
-    fig.tight_layout()
-    fig.savefig(outfile, dpi=_DPI)
+    ncol = max(1, n_batches // 10)
+    _add_legend_right_of_axes(
+        ax, ncol=ncol, fontsize=5, markerscale=3, n_items=n_batches,
+    )
+    fig.savefig(outfile, dpi=_DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("Saved %s", outfile)
 
@@ -218,11 +223,26 @@ def plot_batch_correction_before_after(
     ax2.set_title("After Batch Correction")
     ax2.set_xlabel("UMAP 1")
     ax2.set_ylabel("UMAP 2")
-    ax2.legend(fontsize=5, markerscale=3, ncol=max(1, n_batches // 10),
-               bbox_to_anchor=(1.05, 1), loc="upper left")
+
+    ncol = max(1, n_batches // 10)
+    handles, labels = ax2.get_legend_handles_labels()
+    leg = ax2.get_legend()
+    if leg is not None:
+        leg.remove()
+    if handles:
+        fig.legend(
+            handles,
+            labels,
+            loc="center left",
+            bbox_to_anchor=(0.98, 0.5),
+            fontsize=5,
+            markerscale=3,
+            ncol=ncol,
+            borderaxespad=0,
+        )
 
     fig.suptitle("Batch Effect Correction (color = batch)", fontsize=13)
-    fig.tight_layout()
+    fig.tight_layout(rect=[0, 0, 0.82, 0.96])
     fig.savefig(outfile, dpi=_DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("Saved %s", outfile)
