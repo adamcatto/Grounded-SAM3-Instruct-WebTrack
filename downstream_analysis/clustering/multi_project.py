@@ -26,6 +26,7 @@ from .experiment_registry import (
     load_registry,
     parse_video_name,
     resolve_identities,
+    resolve_single_identity,
 )
 from .feature_extraction import extract_all_features, _fmt_duration, _fmt_size
 from .multi_project_comparison import compare_experiments
@@ -63,22 +64,34 @@ def _enrich_metadata(
         m.session = session
         box = box_from_camera_view(camera_view)
 
-        result = resolve_identities(
-            experiment_name, session, box,
-            m.object_a_name, m.object_b_name,
-            csv_path=csv_path,
-        )
-        if result is None:
-            n_unresolved += 1
-            continue
+        if not m.object_b_name or m.object_b_name.lower() == "none":
+            identity = resolve_single_identity(
+                experiment_name, session, box, m.object_a_name,
+                csv_path=csv_path,
+            )
+            if identity is None:
+                n_unresolved += 1
+                continue
+            m.mouse_a_id = identity.mouse_id
+            m.mouse_a_role = identity.role
+            m.mouse_a_housing = identity.housing
+        else:
+            result = resolve_identities(
+                experiment_name, session, box,
+                m.object_a_name, m.object_b_name,
+                csv_path=csv_path,
+            )
+            if result is None:
+                n_unresolved += 1
+                continue
 
-        id_a, id_b = result
-        m.mouse_a_id = id_a.mouse_id
-        m.mouse_a_role = id_a.role
-        m.mouse_a_housing = id_a.housing
-        m.mouse_b_id = id_b.mouse_id
-        m.mouse_b_role = id_b.role
-        m.mouse_b_housing = id_b.housing
+            id_a, id_b = result
+            m.mouse_a_id = id_a.mouse_id
+            m.mouse_a_role = id_a.role
+            m.mouse_a_housing = id_a.housing
+            m.mouse_b_id = id_b.mouse_id
+            m.mouse_b_role = id_b.role
+            m.mouse_b_housing = id_b.housing
 
     return n_unresolved
 

@@ -65,15 +65,74 @@ SINGLE_MOUSE_FEATURE_NAMES = list(_PER_OBJECT_NAMES)  # 12 features
 # Extract per-object frame features for a single mouse
 # ---------------------------------------------------------------------------
 
+def _frame_features_cache_path(project_dir: Path, video_id: str) -> Path:
+    return (
+        project_dir
+        / "analysis_of_tracking_data"
+        / "clustering"
+        / "features"
+        / f"frame_features_{video_id}.npz"
+    )
+
+
+def _load_single_mouse_frame_features_from_cache(
+    project_dir: Path,
+    ctx: VideoTrackContext,
+    obj_key: str,
+) -> np.ndarray | None:
+    """Load (T, 7) frame features from Phase-1 cache when fresh enough."""
+    cache_path = _frame_features_cache_path(project_dir, ctx.video_id)
+    if not cache_path.is_file():
+        return None
+
+    sqlite_path = ctx.video_dir / "masks.sqlite"
+    if sqlite_path.is_file() and cache_path.stat().st_mtime <= sqlite_path.stat().st_mtime:
+        return None
+
+    data = np.load(cache_path, allow_pickle=True)
+    ff21 = np.asarray(data["frame_features"], dtype=np.float64)
+    obj_a_key = str(data["obj_a_key"])
+    obj_b_key = str(data["obj_b_key"])
+
+    start = int(ctx.config.get("start_frame") or 0)
+    n = int(ctx.config["num_frames"])
+    total_fr = max(0, n - start)
+    if ff21.shape[0] != total_fr:
+        return None
+
+    if obj_key == obj_a_key:
+        return ff21[:, :N_SINGLE_FEATURES].copy()
+    if obj_b_key and obj_key == obj_b_key:
+        return ff21[:, N_SINGLE_FEATURES : 2 * N_SINGLE_FEATURES].copy()
+
+    # Single-animal videos: use object-A columns when only one track was cached.
+    if not obj_b_key:
+        cols_a = ff21[:, :N_SINGLE_FEATURES]
+        if np.any(np.isfinite(cols_a)):
+            return cols_a.copy()
+
+    return None
+
+
 def _extract_single_mouse_frame_features(
     ctx: VideoTrackContext,
     obj_key: str,
     cfg: ClusteringConfig,
-) -> np.ndarray | None:
+    *,
+    project_dir: Path | None = None,
+) -> tuple[np.ndarray | None, bool]:
     """Extract (T, 7) frame features for a single object in a video.
 
-    Returns array of shape (n_frames, 7) or None on failure.
+    Uses ``frame_features_<video_id>.npz`` from Phase 1 when available; otherwise
+    reads masks from SQLite.
+
+    Returns (features, from_cache). features is (n_frames, 7) or None on failure.
     """
+    if project_dir is not None:
+        cached = _load_single_mouse_frame_features_from_cache(project_dir, ctx, obj_key)
+        if cached is not None:
+            return cached, True
+
     start = int(ctx.config.get("start_frame") or 0)
     n = int(ctx.config["num_frames"])
     total_fr = max(0, n - start)
@@ -90,7 +149,7 @@ def _extract_single_mouse_frame_features(
             if feats is not None:
                 frame_features[row] = feats
 
-    return frame_features
+    return frame_features, False
 
 
 def _frame_to_sequence_features(
@@ -161,8 +220,13 @@ def extract_locomotion_features(
     results: dict[str, dict[str, Any]] = {}
 
     videos = config.get("videos", {})
-    logger.info("Extracting locomotion features from %d videos in %s", len(videos), project_dir.name)
+    cache_dir = project_dir / "analysis_of_tracking_data" / "clustering" / "features"
+    logger.info(
+        "Extracting locomotion features from %d videos in %s (cache: %s)",
+        len(videos), project_dir.name, cache_dir,
+    )
 
+    n_from_cache = 0
     for vid, v in videos.items():
         if not v.get("propagation_complete"):
             continue
@@ -199,9 +263,13 @@ def extract_locomotion_features(
             config=dict(v), video_dir=vdir,
         )
 
-        ff = _extract_single_mouse_frame_features(ctx, obj_key, cfg)
+        ff, from_cache = _extract_single_mouse_frame_features(
+            ctx, obj_key, cfg, project_dir=project_dir,
+        )
         if ff is None:
             continue
+        if from_cache:
+            n_from_cache += 1
 
         seq, starts = _frame_to_sequence_features(ff, cfg, diag, area)
         if seq.shape[0] == 0:
@@ -217,9 +285,16 @@ def extract_locomotion_features(
             "video_name": vname,
             "n_windows": seq.shape[0],
         }
-        logger.info("  %s (%s, %s): %d windows", vname, identity.mouse_id, camera_view, seq.shape[0])
+        src = "cache" if from_cache else "masks"
+        logger.info(
+            "  %s (%s, %s): %d windows [%s]",
+            vname, identity.mouse_id, camera_view, seq.shape[0], src,
+        )
 
-    logger.info("Locomotion features: %d mouse-camera pairs extracted", len(results))
+    logger.info(
+        "Locomotion features: %d mouse-camera pairs extracted (%d from cache)",
+        len(results), n_from_cache,
+    )
     return results
 
 
@@ -241,8 +316,13 @@ def extract_resident_features(
     results: dict[str, dict[str, Any]] = {}
 
     videos = config.get("videos", {})
-    logger.info("Extracting resident features from %d videos in %s", len(videos), project_dir.name)
+    cache_dir = project_dir / "analysis_of_tracking_data" / "clustering" / "features"
+    logger.info(
+        "Extracting resident features from %d videos in %s (cache: %s)",
+        len(videos), project_dir.name, cache_dir,
+    )
 
+    n_from_cache = 0
     for vid, v in videos.items():
         if not v.get("propagation_complete"):
             continue
@@ -289,12 +369,13 @@ def extract_resident_features(
             config=dict(v), video_dir=vdir,
         )
 
-        # Determine column offset based on which object is the resident
-        # Object A is obj_keys[0], Object B is obj_keys[1]
-        # In the mask storage, keys are "1", "2" etc.
-        ff = _extract_single_mouse_frame_features(ctx, resident_key, cfg)
+        ff, from_cache = _extract_single_mouse_frame_features(
+            ctx, resident_key, cfg, project_dir=project_dir,
+        )
         if ff is None:
             continue
+        if from_cache:
+            n_from_cache += 1
 
         seq, starts = _frame_to_sequence_features(ff, cfg, diag, area)
         if seq.shape[0] == 0:
@@ -310,10 +391,16 @@ def extract_resident_features(
             "video_name": vname,
             "n_windows": seq.shape[0],
         }
-        logger.info("  %s (%s resident, %s): %d windows",
-                     vname, resident_id.mouse_id, camera_view, seq.shape[0])
+        src = "cache" if from_cache else "masks"
+        logger.info(
+            "  %s (%s resident, %s): %d windows [%s]",
+            vname, resident_id.mouse_id, camera_view, seq.shape[0], src,
+        )
 
-    logger.info("Resident features: %d mouse-camera pairs extracted", len(results))
+    logger.info(
+        "Resident features: %d mouse-camera pairs extracted (%d from cache)",
+        len(results), n_from_cache,
+    )
     return results
 
 
