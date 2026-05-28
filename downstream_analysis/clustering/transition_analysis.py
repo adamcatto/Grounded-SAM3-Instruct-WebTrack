@@ -7,6 +7,7 @@ transition probability matrices.
 
 from __future__ import annotations
 
+from itertools import combinations
 from typing import Any
 
 import numpy as np
@@ -35,6 +36,32 @@ def normalize_transition_matrix(counts: np.ndarray) -> np.ndarray:
     with np.errstate(invalid="ignore", divide="ignore"):
         probs = np.where(row_sums > 0, mat / row_sums, 0.0)
     return probs
+
+
+def transition_matrix_view(
+    matrix: np.ndarray,
+    *,
+    include_self_loops: bool,
+) -> np.ndarray:
+    """Return transition matrix for display; optionally drop and renormalize diagonal."""
+    m = np.asarray(matrix, dtype=np.float64)
+    if include_self_loops:
+        return m
+    m = m.copy()
+    np.fill_diagonal(m, 0.0)
+    return normalize_transition_matrix(m)
+
+
+def differential_transition_matrix(
+    matrix_a: np.ndarray,
+    matrix_b: np.ndarray,
+    *,
+    include_self_loops: bool,
+) -> np.ndarray:
+    """Element-wise difference P(B|A) for condition A minus condition B."""
+    a = transition_matrix_view(matrix_a, include_self_loops=include_self_loops)
+    b = transition_matrix_view(matrix_b, include_self_loops=include_self_loops)
+    return a - b
 
 
 def _matrix_to_json(probs: np.ndarray) -> list[list[float]]:
@@ -116,5 +143,53 @@ def compute_transition_matrices_by_group(
             "counts": _counts_to_json(counts),
             "matrix": _matrix_to_json(probs),
         }
+
+    return results
+
+
+def compute_differential_transition_matrices(
+    transition_matrices: dict[str, dict[str, Any]],
+    group_order: list[str] | None = None,
+    *,
+    exclude_groups: set[str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Pairwise difference matrices (A − B) for all upper-triangular condition pairs."""
+    if not transition_matrices:
+        return {}
+
+    exclude = exclude_groups or set()
+    ordered: list[str] = list(group_order or [])
+    for key in transition_matrices:
+        if key not in ordered:
+            ordered.append(key)
+    present = [k for k in ordered if k in transition_matrices and k not in exclude]
+
+    results: dict[str, dict[str, Any]] = {}
+    for ga, gb in combinations(present, 2):
+        info_a = transition_matrices[ga]
+        info_b = transition_matrices[gb]
+        mat_a = np.array(info_a["matrix"], dtype=np.float64)
+        mat_b = np.array(info_b["matrix"], dtype=np.float64)
+
+        pair_key = f"{ga}_vs_{gb}"
+        entry: dict[str, Any] = {
+            "group_a": ga,
+            "group_b": gb,
+            "label_a": info_a.get("label", ga),
+            "label_b": info_b.get("label", gb),
+            "n_transitions_a": info_a.get("n_transitions", 0),
+            "n_transitions_b": info_b.get("n_transitions", 0),
+        }
+        for include_self_loops, suffix in (
+            (True, "with_self_loops"),
+            (False, "no_self_loops"),
+        ):
+            diff = differential_transition_matrix(
+                mat_a, mat_b, include_self_loops=include_self_loops,
+            )
+            entry[f"matrix_{suffix}"] = _matrix_to_json(diff)
+            entry[f"max_abs_{suffix}"] = float(np.max(np.abs(diff))) if diff.size else 0.0
+
+        results[pair_key] = entry
 
     return results

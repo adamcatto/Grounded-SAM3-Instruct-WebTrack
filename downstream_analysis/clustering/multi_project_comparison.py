@@ -483,13 +483,21 @@ def compare_experiments(result: ClusteringResult) -> dict[str, Any]:
             "cluster_labels": [int(labels[i]) for i in indices_sorted],
         }
 
-    from .transition_analysis import compute_transition_matrices_by_group
+    from .transition_analysis import (
+        compute_differential_transition_matrices,
+        compute_transition_matrices_by_group,
+    )
 
     transition_matrices = compute_transition_matrices_by_group(
         ethograms,
         result.n_clusters,
         group_field="condition_group",
         group_labels=CONDITION_GROUP_LABELS,
+        exclude_groups={"unknown"},
+    )
+    differential_transition_matrices = compute_differential_transition_matrices(
+        transition_matrices,
+        CONDITION_GROUP_ORDER,
         exclude_groups={"unknown"},
     )
 
@@ -507,4 +515,5 @@ def compare_experiments(result: ClusteringResult) -> dict[str, Any]:
         "per_cluster_by_experiment": per_cluster_by_exp,
         "ethograms": ethograms,
         "transition_matrices": transition_matrices,
+        "differential_transition_matrices": differential_transition_matrices,
     }

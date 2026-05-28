@@ -337,12 +337,21 @@ def compare_housing_conditions(result: ClusteringResult) -> dict[str, Any]:
     overall_enrichment["total_windows_group_only"] = total_grp
     overall_enrichment["interaction_type_counts"] = dict(Counter(interaction_types))
 
-    from .transition_analysis import compute_transition_matrices_by_group
+    from .transition_analysis import (
+        compute_differential_transition_matrices,
+        compute_transition_matrices_by_group,
+    )
 
     transition_matrices = compute_transition_matrices_by_group(
         ethograms,
         n_clusters,
         group_field="interaction_type",
+        exclude_groups={"unknown", "single_animal"},
+    )
+    transition_group_order = sorted(transition_matrices.keys())
+    differential_transition_matrices = compute_differential_transition_matrices(
+        transition_matrices,
+        transition_group_order,
         exclude_groups={"unknown", "single_animal"},
     )
 
@@ -362,4 +371,5 @@ def compare_housing_conditions(result: ClusteringResult) -> dict[str, Any]:
         "interaction_type_distribution": itype_dist,
         "ethograms": ethograms,
         "transition_matrices": transition_matrices,
+        "differential_transition_matrices": differential_transition_matrices,
     }
