@@ -602,12 +602,7 @@ class MultiProjectPipeline:
         except Exception as e:
             logger.warning("Condition boxplots failed: %s", e)
 
-        # Role condition boxplots
-        try:
-            from .condition_boxplots import plot_role_condition_boxplots
-            plot_role_condition_boxplots(result, plots_dir)
-        except Exception as e:
-            logger.warning("Role condition boxplots failed: %s", e)
+        # Role condition boxplots belong in single-animal (see below)
 
         # Consolidated UMAP plots (into plots/umap/ subfolder)
         try:
@@ -664,6 +659,17 @@ class MultiProjectPipeline:
                 _gen_pw(sa_comparison, sa_plots_dir, result=sa_result)
             except Exception as e:
                 logger.warning("Single-animal pairwise plots failed: %s", e)
+
+            # Role condition boxplots (uses SA mask builders for focal-animal roles)
+            try:
+                from .condition_boxplots import plot_role_condition_boxplots
+                from .multi_project_comparison import SA_ROLE_MASK_BUILDERS
+                plot_role_condition_boxplots(
+                    sa_result, sa_plots_dir,
+                    mask_builders=SA_ROLE_MASK_BUILDERS,
+                )
+            except Exception as e:
+                logger.warning("Single-animal role boxplots failed: %s", e)
 
     # ------------------------------------------------------------------
     # Save results

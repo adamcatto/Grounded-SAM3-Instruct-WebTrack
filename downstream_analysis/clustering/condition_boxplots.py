@@ -58,6 +58,18 @@ _KEY_FEATURES = [
     "parallel_movement_score",
 ]
 
+# Single-animal key features (no a_/b_ prefix)
+_SA_KEY_FEATURES = [
+    "speed_mean", "speed_std", "speed_max",
+    "energy", "frac_time_moving",
+    "area_mean", "mean_eccentricity",
+    "min_distance_mean", "min_distance_std",
+    "frac_close_proximity",
+    "chase_metric",
+    "mean_relative_heading",
+    "parallel_movement_score",
+]
+
 
 # ---------------------------------------------------------------------------
 # Per-feature boxplots across conditions
@@ -472,13 +484,23 @@ _ROLE_COLORS = {
 def plot_role_condition_boxplots(
     result: ClusteringResult,
     plots_dir: Path,
+    *,
+    mask_builders: dict | None = None,
 ) -> None:
-    """Per-feature boxplots across role conditions (5 roles on x-axis)."""
+    """Per-feature boxplots across role conditions (5 roles on x-axis).
+
+    Parameters
+    ----------
+    mask_builders : optional override for role mask builders (e.g.
+        SA_ROLE_MASK_BUILDERS for single-animal mode).  Defaults to
+        pair-level ROLE_MASK_BUILDERS.
+    """
     if result.features_normalized.shape[0] == 0:
         return
 
+    builders = mask_builders if mask_builders is not None else ROLE_MASK_BUILDERS
     meta = result.metadata
-    role_masks = {r: ROLE_MASK_BUILDERS[r](meta) for r in ROLE_CONDITION_ORDER}
+    role_masks = {r: builders[r](meta) for r in ROLE_CONDITION_ORDER if r in builders}
     present_roles = [r for r in ROLE_CONDITION_ORDER if role_masks[r].any()]
 
     if len(present_roles) < 2:
@@ -486,7 +508,10 @@ def plot_role_condition_boxplots(
         return
 
     feature_names = list(result.feature_names)
+    # Try pair-level key features first, then single-animal key features
     features_to_plot = [f for f in _KEY_FEATURES if f in feature_names]
+    if not features_to_plot:
+        features_to_plot = [f for f in _SA_KEY_FEATURES if f in feature_names]
     if not features_to_plot:
         features_to_plot = feature_names[:12]
 
