@@ -517,3 +517,126 @@ def compare_experiments(result: ClusteringResult) -> dict[str, Any]:
         "transition_matrices": transition_matrices,
         "differential_transition_matrices": differential_transition_matrices,
     }
+
+
+# ---------------------------------------------------------------------------
+# Single-animal role masks (focal always in mouse_a_* fields)
+# ---------------------------------------------------------------------------
+
+def _sa_mask_sh_resident(meta: list[WindowMetadata]) -> np.ndarray:
+    return np.array([
+        m.experiment_name == "test_day"
+        and m.mouse_a_role == "resident"
+        and m.mouse_a_housing == "SH"
+        for m in meta
+    ])
+
+
+def _sa_mask_sh_intruder(meta: list[WindowMetadata]) -> np.ndarray:
+    return np.array([
+        m.experiment_name == "sh_intruder"
+        and m.mouse_a_housing == "SH"
+        for m in meta
+    ])
+
+
+def _sa_mask_gh_resident(meta: list[WindowMetadata]) -> np.ndarray:
+    return np.array([
+        m.experiment_name in ("test_day", "sh_intruder")
+        and m.mouse_a_role == "resident"
+        and m.mouse_a_housing == "GH"
+        for m in meta
+    ])
+
+
+def _sa_mask_gh_intruder(meta: list[WindowMetadata]) -> np.ndarray:
+    return np.array([
+        m.experiment_name == "test_day"
+        and m.mouse_a_role == "intruder"
+        and m.mouse_a_housing == "GH"
+        for m in meta
+    ])
+
+
+def _sa_mask_gh_littermate(meta: list[WindowMetadata]) -> np.ndarray:
+    return np.array([m.experiment_name == "hab" for m in meta])
+
+
+SA_ROLE_MASK_BUILDERS: dict[str, Callable[[list[WindowMetadata]], np.ndarray]] = {
+    "SH_resident": _sa_mask_sh_resident,
+    "SH_intruder": _sa_mask_sh_intruder,
+    "GH_resident": _sa_mask_gh_resident,
+    "GH_intruder": _sa_mask_gh_intruder,
+    "GH_littermate": _sa_mask_gh_littermate,
+}
+
+
+# ---------------------------------------------------------------------------
+# Single-animal comparison
+# ---------------------------------------------------------------------------
+
+def compare_single_animal_experiments(result: ClusteringResult) -> dict[str, Any]:
+    """Run single-animal comparisons using focal-animal role masks.
+
+    In single-animal mode, each sample represents ONE focal animal whose
+    identity is always in mouse_a_* fields. Role masks check only mouse_a_*.
+
+    Returns same structure as compare_experiments() but without condition-group
+    comparisons (those are pair-level concepts).
+    """
+    if len(result.metadata) == 0:
+        return {"note": "no data"}
+
+    t0 = time.monotonic()
+    meta = result.metadata
+    labels = result.cluster_labels
+    n_total = len(labels)
+
+    logger.info(
+        "Single-animal comparison: %d samples, %d clusters",
+        n_total, result.n_clusters,
+    )
+
+    # Role-condition pairwise comparisons
+    logger.info("Pairwise single-animal role comparisons:")
+    role_masks = {r: SA_ROLE_MASK_BUILDERS[r](meta) for r in ROLE_CONDITION_ORDER}
+    for r, mask in role_masks.items():
+        n = int(mask.sum())
+        logger.info("  %s: %d samples", ROLE_CONDITION_LABELS.get(r, r), n)
+
+    pairwise_role_conditions = _run_pairwise_matrix(
+        result,
+        ROLE_CONDITION_ORDER,
+        role_masks,
+        ROLE_CONDITION_LABELS,
+    )
+
+    # Ethograms
+    ethograms: dict[str, dict[str, Any]] = {}
+    vid_groups: defaultdict[str, list[int]] = defaultdict(list)
+    for i, m in enumerate(meta):
+        vid_groups[m.video_id].append(i)
+
+    for vid_id, indices in vid_groups.items():
+        indices_sorted = sorted(indices, key=lambda i: meta[i].start_frame)
+        m0 = meta[indices_sorted[0]]
+        ethograms[vid_id] = {
+            "video_name": m0.video_name,
+            "experiment_name": m0.experiment_name,
+            "session": m0.session,
+            "n_windows": len(indices_sorted),
+            "start_frames": [meta[i].start_frame for i in indices_sorted],
+            "cluster_labels": [int(labels[i]) for i in indices_sorted],
+        }
+
+    elapsed = time.monotonic() - t0
+    logger.info(
+        "Single-animal comparison done in %.1fs (%d role pairs)",
+        elapsed, len(pairwise_role_conditions),
+    )
+
+    return {
+        "pairwise_role_conditions": pairwise_role_conditions,
+        "comparisons": pairwise_role_conditions,
+        "ethograms": ethograms,
+    }
