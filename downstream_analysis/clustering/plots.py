@@ -58,6 +58,92 @@ def _add_legend_right_of_axes(
     ax.figure.tight_layout(rect=[0, 0, rect_right, 1])
 
 
+def _add_legend_on_plot(
+    ax: plt.Axes,
+    *,
+    fontsize: float = 8,
+    markerscale: float = 3,
+    alpha: float = 0.85,
+    min_fontsize: float = 5,
+) -> None:
+    """Place legend ON the plot in the corner with fewest data points.
+
+    Tries all 4 corners, estimates the legend bounding box in data space,
+    picks the corner overlapping the fewest scatter points.  If the best
+    corner still covers >5 % of points, shrinks the font.
+    """
+    handles, labels = ax.get_legend_handles_labels()
+    if not handles:
+        return
+
+    n_items = len(handles)
+
+    # Collect all plotted data points
+    all_x, all_y = [], []
+    for coll in ax.collections:
+        offsets = coll.get_offsets()
+        if offsets is not None and len(offsets) > 0:
+            arr = np.asarray(offsets)
+            all_x.append(arr[:, 0])
+            all_y.append(arr[:, 1])
+    if not all_x:
+        ax.legend(fontsize=fontsize, markerscale=markerscale, loc="upper right",
+                  framealpha=alpha)
+        return
+
+    all_x = np.concatenate(all_x)
+    all_y = np.concatenate(all_y)
+    n_points = len(all_x)
+
+    xlim = ax.get_xlim()
+    ylim = ax.get_ylim()
+    x_range = xlim[1] - xlim[0]
+    y_range = ylim[1] - ylim[0]
+
+    # Heuristic legend size as fraction of axes
+    legend_w_frac = 0.30
+    legend_h_frac = min(0.04 * n_items, 0.50)
+    legend_w = legend_w_frac * x_range
+    legend_h = legend_h_frac * y_range
+
+    corners = {
+        "upper right": (1, 1),
+        "upper left": (0, 1),
+        "lower left": (0, 0),
+        "lower right": (1, 0),
+    }
+
+    best_corner = "upper right"
+    best_count = n_points + 1
+
+    for loc_name, (fx, fy) in corners.items():
+        x_min = xlim[0] if fx == 0 else xlim[1] - legend_w
+        x_max = xlim[0] + legend_w if fx == 0 else xlim[1]
+        y_min = ylim[0] if fy == 0 else ylim[1] - legend_h
+        y_max = ylim[0] + legend_h if fy == 0 else ylim[1]
+
+        count = int(np.sum(
+            (all_x >= x_min) & (all_x <= x_max)
+            & (all_y >= y_min) & (all_y <= y_max)
+        ))
+        if count < best_count:
+            best_count = count
+            best_corner = loc_name
+
+    # Shrink font if still covering >5% of points
+    final_fontsize = fontsize
+    if best_count > 0.05 * n_points and fontsize > min_fontsize:
+        final_fontsize = max(min_fontsize, fontsize * 0.6)
+
+    ax.legend(
+        fontsize=final_fontsize,
+        markerscale=markerscale,
+        loc=best_corner,
+        framealpha=alpha,
+        edgecolor="gray",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Color helpers
 # ---------------------------------------------------------------------------
@@ -111,10 +197,8 @@ def plot_umap_by_cluster(result: ClusteringResult, outfile: Path) -> None:
     ax.set_xlabel(f"{result.embedding_method.upper()} 1")
     ax.set_ylabel(f"{result.embedding_method.upper()} 2")
     ax.set_title("Behavioral clusters")
-    ncol = max(1, result.n_clusters // 8)
-    _add_legend_right_of_axes(
-        ax, ncol=ncol, fontsize=7, markerscale=3, n_items=result.n_clusters,
-    )
+    _add_legend_on_plot(ax, fontsize=6, markerscale=3)
+    fig.tight_layout()
     fig.savefig(outfile, dpi=_DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("Saved %s", outfile)
@@ -142,9 +226,8 @@ def plot_umap_by_housing(result: ClusteringResult, outfile: Path) -> None:
     ax.set_xlabel(f"{result.embedding_method.upper()} 1")
     ax.set_ylabel(f"{result.embedding_method.upper()} 2")
     ax.set_title("Interaction types")
-    _add_legend_right_of_axes(
-        ax, fontsize=8, markerscale=3, n_items=len(unique_types),
-    )
+    _add_legend_on_plot(ax, fontsize=7, markerscale=3)
+    fig.tight_layout()
     fig.savefig(outfile, dpi=_DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("Saved %s", outfile)
@@ -417,8 +500,13 @@ def generate_all_plots(
     """Generate all clustering plots."""
     plots_dir.mkdir(parents=True, exist_ok=True)
 
-    plot_umap_by_cluster(result, plots_dir / "umap_by_cluster.png")
-    plot_umap_by_housing(result, plots_dir / "umap_by_housing.png")
+    # Basic UMAP plots (multi-project pipeline generates enhanced versions via
+    # plots_umap.generate_all_umap_plots, but single-project still needs these)
+    umap_dir = plots_dir / "umap"
+    umap_dir.mkdir(parents=True, exist_ok=True)
+    plot_umap_by_cluster(result, umap_dir / "umap_by_cluster.png")
+    plot_umap_by_housing(result, umap_dir / "umap_by_housing.png")
+
     plot_cluster_composition(result, comparison, plots_dir / "cluster_composition.png")
     plot_feature_heatmap(result, plots_dir / "feature_heatmap.png")
     plot_enrichment_bars(result, comparison, plots_dir / "enrichment_bars.png")

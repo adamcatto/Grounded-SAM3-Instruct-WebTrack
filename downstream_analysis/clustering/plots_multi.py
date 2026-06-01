@@ -18,7 +18,7 @@ import numpy as np  # noqa: E402
 from .clustering_pipeline import ClusteringResult
 from .dataset import WindowMetadata
 from .multi_project_comparison import _assign_condition_group, CONDITION_GROUP_LABELS
-from .plots import _add_legend_right_of_axes
+from .plots import _add_legend_on_plot, _add_legend_right_of_axes
 
 logger = logging.getLogger(__name__)
 
@@ -74,9 +74,8 @@ def plot_umap_by_experiment(result: ClusteringResult, outfile: Path) -> None:
     ax.set_xlabel(f"{result.embedding_method.upper()} 1")
     ax.set_ylabel(f"{result.embedding_method.upper()} 2")
     ax.set_title("UMAP by Experiment")
-    _add_legend_right_of_axes(
-        ax, fontsize=8, markerscale=4, n_items=len(experiments),
-    )
+    _add_legend_on_plot(ax, fontsize=7, markerscale=4)
+    fig.tight_layout()
     fig.savefig(outfile, dpi=_DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("Saved %s", outfile)
@@ -112,9 +111,8 @@ def plot_umap_by_condition_group(result: ClusteringResult, outfile: Path) -> Non
     ax.set_xlabel(f"{result.embedding_method.upper()} 1")
     ax.set_ylabel(f"{result.embedding_method.upper()} 2")
     ax.set_title("UMAP by Condition Group")
-    _add_legend_right_of_axes(
-        ax, fontsize=7, markerscale=4, n_items=len(unique_groups),
-    )
+    _add_legend_on_plot(ax, fontsize=7, markerscale=4)
+    fig.tight_layout()
     fig.savefig(outfile, dpi=_DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("Saved %s", outfile)
