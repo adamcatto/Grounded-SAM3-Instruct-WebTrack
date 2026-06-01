@@ -40,6 +40,28 @@ def _assign_condition_group(m: WindowMetadata) -> str:
     return "unknown"
 
 
+def _assign_sa_role(m: WindowMetadata) -> str:
+    """Assign a single-animal sample to one of the 5 role categories.
+
+    In SA mode the focal animal's identity is always in mouse_a_* fields.
+    """
+    if m.experiment_name == "hab":
+        return "GH_littermate"
+    if m.experiment_name == "test_day":
+        if m.mouse_a_housing == "SH" and m.mouse_a_role == "resident":
+            return "SH_resident"
+        if m.mouse_a_housing == "GH" and m.mouse_a_role == "resident":
+            return "GH_resident"
+        if m.mouse_a_housing == "GH" and m.mouse_a_role == "intruder":
+            return "GH_intruder"
+    if m.experiment_name == "sh_intruder":
+        if m.mouse_a_housing == "SH":
+            return "SH_intruder"
+        if m.mouse_a_housing == "GH" and m.mouse_a_role == "resident":
+            return "GH_resident"
+    return "unknown"
+
+
 CONDITION_GROUP_ORDER = [
     "GH_littermate",
     "SH_res_GH_int",
@@ -379,9 +401,10 @@ def compare_experiments(result: ClusteringResult) -> dict[str, Any]:
     Returns:
       - condition_groups: per-group cluster composition
       - pairwise_condition_groups: all C(4,2)=6 condition-group pairs
-      - pairwise_role_conditions: all C(5,2)=10 role-condition pairs
-      - comparisons: union of both pairwise dicts (backward compatible)
+      - comparisons: alias for pairwise_condition_groups
       - per_cluster_by_experiment, ethograms, transition_matrices
+
+    Role-condition pairwise comparisons live in compare_single_animal_experiments().
     """
     if len(result.metadata) == 0:
         return {"note": "no data"}
@@ -430,20 +453,10 @@ def compare_experiments(result: ClusteringResult) -> dict[str, Any]:
         CONDITION_GROUP_LABELS,
     )
 
-    # ---------------------------------------------------------------------------
-    # 3. All pairwise role-condition comparisons (upper triangle)
-    # ---------------------------------------------------------------------------
-    logger.info("Pairwise role-condition comparisons (N choose 2):")
-    role_masks = {r: ROLE_MASK_BUILDERS[r](meta) for r in ROLE_CONDITION_ORDER}
-    pairwise_role_conditions = _run_pairwise_matrix(
-        result,
-        ROLE_CONDITION_ORDER,
-        role_masks,
-        ROLE_CONDITION_LABELS,
-    )
-
-    # Union for backward compatibility
-    comparisons = {**pairwise_condition_groups, **pairwise_role_conditions}
+    # Role-condition comparisons are only meaningful at the single-animal
+    # level (pair-level role masks overlap: a SH_res_GH_int pair matches
+    # both SH_resident and GH_intruder).  See compare_single_animal_experiments().
+    comparisons = dict(pairwise_condition_groups)
 
     # ---------------------------------------------------------------------------
     # 4. Per-cluster enrichment by experiment
@@ -503,14 +516,13 @@ def compare_experiments(result: ClusteringResult) -> dict[str, Any]:
 
     elapsed = time.monotonic() - t0
     logger.info(
-        "Multi-project comparison done in %.1fs (%d condition pairs, %d role pairs)",
-        elapsed, len(pairwise_condition_groups), len(pairwise_role_conditions),
+        "Multi-project comparison done in %.1fs (%d condition-group pairs)",
+        elapsed, len(pairwise_condition_groups),
     )
 
     return {
         "condition_groups": condition_group_info,
         "pairwise_condition_groups": pairwise_condition_groups,
-        "pairwise_role_conditions": pairwise_role_conditions,
         "comparisons": comparisons,
         "per_cluster_by_experiment": per_cluster_by_exp,
         "ethograms": ethograms,
