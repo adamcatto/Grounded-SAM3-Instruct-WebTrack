@@ -46,6 +46,7 @@ def main(argv: list[str] | None = None) -> int:
         write_multi_project_excel_report,
         write_single_project_excel_report,
     )
+    from downstream_analysis.clustering.sequence_features import subset_features_for_analysis
 
     summary_path = out_dir / "summary.json"
     summary = json.loads(summary_path.read_text()) if summary_path.is_file() else {}
@@ -82,6 +83,9 @@ def main(argv: list[str] | None = None) -> int:
         if col_mask.any():
             median = np.nanmedian(features[:, col])
             features[col_mask, col] = median if np.isfinite(median) else 0.0
+    features, analysis_names = subset_features_for_analysis(
+        features, list(dataset.feature_names),
+    )
     features_norm = StandardScaler().fit_transform(features)
 
     result = ClusteringResult(
@@ -90,7 +94,7 @@ def main(argv: list[str] | None = None) -> int:
         n_clusters=int(labels.max()) + 1,
         embedding_2d=embedding,
         metadata=dataset.metadata,
-        feature_names=dataset.feature_names,
+        feature_names=analysis_names,
         method=summary.get("clustering_method", "leiden"),
         embedding_method=summary.get("embedding_method", "umap"),
     )

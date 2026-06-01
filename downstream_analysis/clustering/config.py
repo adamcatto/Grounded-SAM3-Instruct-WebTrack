@@ -24,6 +24,7 @@ class ClusteringConfig:
     # Feature group toggles
     use_position_features: bool = True  # absolute centroid xy
     use_invariant_features: bool = True  # relative / normalized features
+    # overlap_frac_mean is still extracted; see EXCLUDED_FROM_ANALYSIS in sequence_features.py
 
     # Clustering
     n_neighbors: int = 30

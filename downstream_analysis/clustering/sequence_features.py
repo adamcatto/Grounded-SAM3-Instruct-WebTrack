@@ -62,6 +62,84 @@ SEQUENCE_FEATURE_NAMES: list[str] = (
     + _INTERACTION_SEQ_NAMES
 )
 
+# Still computed in the 33-dim extraction vector, but omitted from clustering/stats.
+EXCLUDED_FROM_ANALYSIS: frozenset[str] = frozenset({"overlap_frac_mean"})
+
+ANALYSIS_FEATURE_NAMES: list[str] = [
+    n for n in SEQUENCE_FEATURE_NAMES if n not in EXCLUDED_FROM_ANALYSIS
+]
+
+
+def analysis_feature_indices(feature_names: list[str] | None = None) -> list[int]:
+    """Column indices to use for clustering and downstream comparisons."""
+    names = feature_names if feature_names is not None else SEQUENCE_FEATURE_NAMES
+    return [i for i, n in enumerate(names) if n not in EXCLUDED_FROM_ANALYSIS]
+
+
+def analysis_feature_names(feature_names: list[str] | None = None) -> list[str]:
+    """Feature names used for clustering and downstream comparisons."""
+    names = feature_names if feature_names is not None else SEQUENCE_FEATURE_NAMES
+    return [n for n in names if n not in EXCLUDED_FROM_ANALYSIS]
+
+
+# ---------------------------------------------------------------------------
+# Single-animal feature names
+# ---------------------------------------------------------------------------
+
+# Generic per-object names (a_/b_ prefix stripped)
+SINGLE_ANIMAL_PER_OBJECT_NAMES: list[str] = list(_PER_OBJECT_NAMES)  # 12
+
+# Interaction features included in single-animal mode (excluding overlap_frac_mean)
+SINGLE_ANIMAL_INTERACTION_NAMES: list[str] = [
+    n for n in _INTERACTION_SEQ_NAMES if n not in EXCLUDED_FROM_ANALYSIS
+]
+
+# Full 20-feature single-animal feature set
+SINGLE_ANIMAL_FEATURE_NAMES: list[str] = (
+    SINGLE_ANIMAL_PER_OBJECT_NAMES + SINGLE_ANIMAL_INTERACTION_NAMES
+)
+
+N_SINGLE_ANIMAL_FEATURES = len(SINGLE_ANIMAL_FEATURE_NAMES)  # 20
+
+
+def per_object_column_indices(
+    side: str,
+    feature_names: list[str] | None = None,
+) -> list[int]:
+    """Return column indices for the 12 per-object features of side 'a' or 'b'."""
+    names = feature_names if feature_names is not None else SEQUENCE_FEATURE_NAMES
+    prefix = f"{side}_"
+    return [i for i, n in enumerate(names) if n.startswith(prefix)]
+
+
+def interaction_column_indices(
+    feature_names: list[str] | None = None,
+    *,
+    exclude_analysis_excluded: bool = True,
+) -> list[int]:
+    """Return column indices for interaction features (no a_/b_ prefix).
+
+    Parameters
+    ----------
+    exclude_analysis_excluded : if True, also drop features in EXCLUDED_FROM_ANALYSIS
+    """
+    names = feature_names if feature_names is not None else SEQUENCE_FEATURE_NAMES
+    prefixes = ("a_", "b_")
+    indices = [i for i, n in enumerate(names) if not n.startswith(prefixes)]
+    if exclude_analysis_excluded:
+        indices = [i for i in indices if names[i] not in EXCLUDED_FROM_ANALYSIS]
+    return indices
+
+
+def subset_features_for_analysis(
+    features: np.ndarray,
+    feature_names: list[str] | None = None,
+) -> tuple[np.ndarray, list[str]]:
+    """Drop analysis-excluded columns; keeps full vector in caches unchanged."""
+    names = feature_names if feature_names is not None else SEQUENCE_FEATURE_NAMES
+    idx = analysis_feature_indices(names)
+    return features[:, idx], [names[i] for i in idx]
+
 
 # ---------------------------------------------------------------------------
 # Frame-level column indices (into the 21-element frame vector)

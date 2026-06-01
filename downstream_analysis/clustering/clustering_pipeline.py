@@ -23,7 +23,12 @@ from ..tqdm_optional import try_tqdm
 from .config import ClusteringConfig
 from .dataset import BehaviorDataset, WindowMetadata
 from .feature_extraction import extract_all_features, _fmt_duration, _fmt_size
-from .sequence_features import SEQUENCE_FEATURE_NAMES
+from .sequence_features import (
+    ANALYSIS_FEATURE_NAMES,
+    EXCLUDED_FROM_ANALYSIS,
+    SEQUENCE_FEATURE_NAMES,
+    subset_features_for_analysis,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -284,15 +289,25 @@ def run_clustering(
     logger.info("  Normalization: %s", cfg.normalize_method)
     logger.info("=" * 70)
 
+    X_raw, analysis_names = subset_features_for_analysis(
+        dataset.features, list(dataset.feature_names),
+    )
+    excluded = sorted(EXCLUDED_FROM_ANALYSIS & set(dataset.feature_names))
+    if excluded:
+        logger.info(
+            "  Analysis features: %d/%d (excluded from clustering: %s)",
+            len(analysis_names), dataset.n_features, ", ".join(excluded),
+        )
+
     if n_samples == 0:
         logger.warning("No samples to cluster.")
         return ClusteringResult(
-            features_normalized=dataset.features,
+            features_normalized=X_raw,
             cluster_labels=np.array([], dtype=np.int32),
             n_clusters=0,
             embedding_2d=np.empty((0, 2), dtype=np.float64),
             metadata=dataset.metadata,
-            feature_names=dataset.feature_names,
+            feature_names=analysis_names,
             method="none",
             embedding_method="none",
         )
@@ -302,7 +317,7 @@ def run_clustering(
     # 1. Normalize
     logger.info("Step 1/4: Normalizing features (%s)...", cfg.normalize_method)
     t0 = time.monotonic()
-    X_norm, norm_stats = _normalize_features(dataset.features, cfg.normalize_method)
+    X_norm, norm_stats = _normalize_features(X_raw, cfg.normalize_method)
     logger.info(
         "  Normalization done in %s. Shape: %s",
         _fmt_duration(time.monotonic() - t0), X_norm.shape,
@@ -371,7 +386,7 @@ def run_clustering(
         n_clusters=n_clusters,
         embedding_2d=embedding,
         metadata=dataset.metadata,
-        feature_names=dataset.feature_names,
+        feature_names=analysis_names,
         method=method,
         embedding_method=emb_method,
     )

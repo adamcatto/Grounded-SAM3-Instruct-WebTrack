@@ -246,6 +246,7 @@ def _extract_video_frame_features(
             num_frames=n,
             width=w,
             height=h,
+            video_diagonal=float(np.hypot(w, h)),
         )
         cache_size = _fmt_size(cache_path.stat().st_size)
         logger.info('%s Cached frame features to %s (%s)', tag, cache_path.name, cache_size)

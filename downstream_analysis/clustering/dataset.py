@@ -47,6 +47,7 @@ class WindowMetadata:
     mouse_a_housing: str = ""       # "SH" or "GH"
     mouse_b_housing: str = ""
     batch_id: str = ""              # "{experiment_name}_{camera_view}"
+    focal_side: str = ""            # "" for pair-level, "a" or "b" for single-animal
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
