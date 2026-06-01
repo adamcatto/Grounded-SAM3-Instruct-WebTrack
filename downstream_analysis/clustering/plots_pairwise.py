@@ -107,9 +107,95 @@ def plot_pairwise_feature_enrichment(
     logger.info("Saved %s", outfile)
 
 
+def plot_pairwise_feature_boxplots(
+    pair_result: dict[str, Any],
+    result: ClusteringResult,
+    mask_a: np.ndarray,
+    mask_b: np.ndarray,
+    outfile: Path,
+) -> None:
+    """Side-by-side boxplots for each feature in a pairwise comparison.
+
+    For each feature, shows group A and group B distributions as boxplots
+    with significance markers from per_feature_tests.
+    """
+    disp_a = pair_result.get("display_a", pair_result.get("label_a", "A"))
+    disp_b = pair_result.get("display_b", pair_result.get("label_b", "B"))
+
+    feature_names = list(result.feature_names)
+    n_features = len(feature_names)
+    if n_features == 0:
+        return
+
+    per_feature_tests = pair_result.get("per_feature_tests", {})
+
+    n_cols = 4
+    n_rows = max(1, (n_features + n_cols - 1) // n_cols)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4.5 * n_cols, 3.5 * n_rows))
+    axes = np.array(axes).flatten()
+
+    color_a = "#E05555"
+    color_b = "#5588DD"
+
+    for fi, fname in enumerate(feature_names):
+        ax = axes[fi]
+        vals_a = result.features_normalized[mask_a, fi]
+        vals_b = result.features_normalized[mask_b, fi]
+        vals_a = vals_a[np.isfinite(vals_a)]
+        vals_b = vals_b[np.isfinite(vals_b)]
+
+        bp = ax.boxplot(
+            [vals_a, vals_b],
+            labels=None,
+            patch_artist=True,
+            widths=0.6,
+            showfliers=False,
+            medianprops=dict(color="black", linewidth=1.5),
+        )
+        bp["boxes"][0].set_facecolor(color_a)
+        bp["boxes"][0].set_alpha(0.7)
+        bp["boxes"][1].set_facecolor(color_b)
+        bp["boxes"][1].set_alpha(0.7)
+
+        ax.set_xticks([1, 2])
+        ax.set_xticklabels([disp_a, disp_b], fontsize=6, rotation=20, ha="right")
+        ax.set_title(fname, fontsize=8)
+        ax.tick_params(axis="y", labelsize=6)
+
+        # Add significance marker
+        ft = per_feature_tests.get(fname, {})
+        p = ft.get("p_value", float("nan"))
+        if np.isfinite(p) and p < 0.05:
+            marker = "***" if p < 0.001 else "**" if p < 0.01 else "*"
+            y_max = max(
+                np.percentile(vals_a, 95) if len(vals_a) > 0 else 0,
+                np.percentile(vals_b, 95) if len(vals_b) > 0 else 0,
+            )
+            ax.text(1.5, y_max, marker, ha="center", fontsize=10, fontweight="bold")
+
+    for i in range(n_features, len(axes)):
+        axes[i].set_visible(False)
+
+    from matplotlib.patches import Patch
+    fig.legend(
+        handles=[
+            Patch(facecolor=color_a, alpha=0.7, label=disp_a),
+            Patch(facecolor=color_b, alpha=0.7, label=disp_b),
+        ],
+        fontsize=8,
+        loc="upper right",
+    )
+    fig.suptitle(f"Feature Distributions: {disp_a} vs {disp_b}", fontsize=11, y=1.01)
+    fig.tight_layout()
+    fig.savefig(outfile, dpi=_DPI, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Saved %s", outfile)
+
+
 def generate_pairwise_comparison_plots(
     comparison: dict[str, Any],
     plots_dir: Path,
+    result: ClusteringResult | None = None,
 ) -> None:
     """Generate cluster + feature enrichment plots for every pairwise comparison."""
     plots_dir.mkdir(parents=True, exist_ok=True)
@@ -137,6 +223,45 @@ def generate_pairwise_comparison_plots(
                 section_dir / f"{pair_key}_feature_enrichment.png",
             )
 
+            # Per-feature boxplots (requires ClusteringResult + role masks)
+            if result is not None:
+                try:
+                    label_a = pair_result.get("label_a", "")
+                    label_b = pair_result.get("label_b", "")
+                    # Detect single-animal mode (focal_side set on metadata)
+                    is_single_animal = (
+                        result.metadata
+                        and getattr(result.metadata[0], "focal_side", "") != ""
+                    )
+                    # Determine which mask builders to use
+                    if section_name == "role_conditions":
+                        if is_single_animal:
+                            from .multi_project_comparison import SA_ROLE_MASK_BUILDERS
+                            builders = SA_ROLE_MASK_BUILDERS
+                        else:
+                            from .multi_project_comparison import ROLE_MASK_BUILDERS
+                            builders = ROLE_MASK_BUILDERS
+                    else:
+                        from .multi_project_comparison import (
+                            _assign_condition_group,
+                            CONDITION_GROUP_ORDER,
+                        )
+                        builders = {
+                            g: lambda meta, _g=g: np.array([
+                                _assign_condition_group(m) == _g for m in meta
+                            ])
+                            for g in CONDITION_GROUP_ORDER
+                        }
+                    if label_a in builders and label_b in builders:
+                        mask_a = builders[label_a](result.metadata)
+                        mask_b = builders[label_b](result.metadata)
+                        plot_pairwise_feature_boxplots(
+                            pair_result, result, mask_a, mask_b,
+                            section_dir / f"{pair_key}_feature_boxplots.png",
+                        )
+                except Exception as e:
+                    logger.warning("Feature boxplots for %s failed: %s", pair_key, e)
+
     logger.info("Pairwise comparison plots saved under %s/pairwise/", plots_dir)
 
 
@@ -153,7 +278,7 @@ def save_pairwise_comparison_results(
         ("role_conditions", comparison.get("pairwise_role_conditions", {})),
     ]
 
-    for section_name, pairs in sections.items():
+    for section_name, pairs in sections:
         section_dir = base / section_name
         section_dir.mkdir(parents=True, exist_ok=True)
 
