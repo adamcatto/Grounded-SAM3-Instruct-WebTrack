@@ -505,7 +505,13 @@ def generate_all_plots(
     umap_dir = plots_dir / "umap"
     umap_dir.mkdir(parents=True, exist_ok=True)
     plot_umap_by_cluster(result, umap_dir / "umap_by_cluster.png")
-    plot_umap_by_housing(result, umap_dir / "umap_by_housing.png")
+    # Skip housing UMAP in single-animal mode (housing is per-pair concept)
+    is_single_animal = (
+        result.metadata
+        and getattr(result.metadata[0], "focal_side", "") != ""
+    )
+    if not is_single_animal:
+        plot_umap_by_housing(result, umap_dir / "umap_by_housing.png")
 
     plot_cluster_composition(result, comparison, plots_dir / "cluster_composition.png")
     plot_feature_heatmap(result, plots_dir / "feature_heatmap.png")

@@ -358,21 +358,27 @@ def _run_pairwise_matrix(
     comparisons: dict[str, dict[str, Any]] = {}
     for ga, gb in combinations(groups, 2):
         mask_a, mask_b = masks[ga], masks[gb]
-        if int(mask_a.sum()) < min_windows or int(mask_b.sum()) < min_windows:
+        n_a, n_b = int(mask_a.sum()), int(mask_b.sum())
+        if n_a == 0 or n_b == 0:
+            logger.info(
+                "  Skip %s vs %s: n=%d vs %d (one group empty)",
+                labels.get(ga, ga), labels.get(gb, gb), n_a, n_b,
+            )
+            continue
+        if n_a < min_windows or n_b < min_windows:
             key = _pairwise_key(ga, gb)
             comparisons[key] = {
                 "label_a": ga,
                 "label_b": gb,
                 "display_a": labels.get(ga, ga),
                 "display_b": labels.get(gb, gb),
-                "n_a": int(mask_a.sum()),
-                "n_b": int(mask_b.sum()),
+                "n_a": n_a,
+                "n_b": n_b,
                 "note": "too few samples for statistical testing",
             }
             logger.info(
                 "  Skip %s vs %s: n=%d vs %d (< %d)",
-                labels.get(ga, ga), labels.get(gb, gb),
-                int(mask_a.sum()), int(mask_b.sum()), min_windows,
+                labels.get(ga, ga), labels.get(gb, gb), n_a, n_b, min_windows,
             )
             continue
 
