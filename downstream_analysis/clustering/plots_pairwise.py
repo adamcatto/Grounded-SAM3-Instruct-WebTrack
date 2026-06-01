@@ -192,13 +192,44 @@ def plot_pairwise_feature_boxplots(
     logger.info("Saved %s", outfile)
 
 
+def _build_mask(
+    label: str,
+    section_name: str,
+    result: ClusteringResult,
+    is_single_animal: bool,
+) -> np.ndarray | None:
+    """Build a boolean mask for *label* using the appropriate mask builders."""
+    if section_name == "role_conditions":
+        if is_single_animal:
+            from .multi_project_comparison import SA_ROLE_MASK_BUILDERS as builders
+        else:
+            from .multi_project_comparison import ROLE_MASK_BUILDERS as builders
+        fn = builders.get(label)
+        return fn(result.metadata) if fn is not None else None
+
+    # condition_groups (or any other section)
+    from .multi_project_comparison import _assign_condition_group
+    return np.array([_assign_condition_group(m) == label for m in result.metadata])
+
+
 def generate_pairwise_comparison_plots(
     comparison: dict[str, Any],
     plots_dir: Path,
     result: ClusteringResult | None = None,
 ) -> None:
-    """Generate cluster + feature enrichment plots for every pairwise comparison."""
+    """Generate plots for every pairwise comparison present in *comparison*.
+
+    Generates cluster enrichment, feature enrichment, and feature boxplots
+    for each pair.  Pairs with too few samples for statistical testing still
+    get boxplots (raw distributions).
+    """
     plots_dir.mkdir(parents=True, exist_ok=True)
+
+    is_single_animal = (
+        result is not None
+        and result.metadata
+        and getattr(result.metadata[0], "focal_side", "") != ""
+    )
 
     sections = [
         ("condition_groups", comparison.get("pairwise_condition_groups", {})),
@@ -208,69 +239,53 @@ def generate_pairwise_comparison_plots(
     for section_name, pairs in sections:
         if not pairs:
             continue
-        section_dir = plots_dir / "pairwise" / section_name
+        section_dir = plots_dir / "paired_animals" / section_name
         section_dir.mkdir(parents=True, exist_ok=True)
 
         for pair_key, pair_result in pairs.items():
-            if pair_result.get("note") and "per_cluster" not in pair_result:
-                continue
-            plot_pairwise_cluster_enrichment(
-                pair_result,
-                section_dir / f"{pair_key}_cluster_enrichment.png",
-            )
-            plot_pairwise_feature_enrichment(
-                pair_result,
-                section_dir / f"{pair_key}_feature_enrichment.png",
-            )
+            # Cluster enrichment (uses pre-computed per_cluster data)
+            try:
+                plot_pairwise_cluster_enrichment(
+                    pair_result,
+                    section_dir / f"{pair_key}_cluster_enrichment.png",
+                )
+            except Exception as e:
+                logger.warning("Cluster enrichment plot for %s failed: %s", pair_key, e)
 
-            # Per-feature boxplots (requires ClusteringResult + role masks)
+            # Feature enrichment (uses pre-computed feature_enrichment data)
+            try:
+                plot_pairwise_feature_enrichment(
+                    pair_result,
+                    section_dir / f"{pair_key}_feature_enrichment.png",
+                )
+            except Exception as e:
+                logger.warning("Feature enrichment plot for %s failed: %s", pair_key, e)
+
+            # Feature boxplots (needs ClusteringResult to access raw values)
             if result is not None:
                 try:
                     label_a = pair_result.get("label_a", "")
                     label_b = pair_result.get("label_b", "")
-                    # Detect single-animal mode (focal_side set on metadata)
-                    is_single_animal = (
-                        result.metadata
-                        and getattr(result.metadata[0], "focal_side", "") != ""
-                    )
-                    # Determine which mask builders to use
-                    if section_name == "role_conditions":
-                        if is_single_animal:
-                            from .multi_project_comparison import SA_ROLE_MASK_BUILDERS
-                            builders = SA_ROLE_MASK_BUILDERS
-                        else:
-                            from .multi_project_comparison import ROLE_MASK_BUILDERS
-                            builders = ROLE_MASK_BUILDERS
-                    else:
-                        from .multi_project_comparison import (
-                            _assign_condition_group,
-                            CONDITION_GROUP_ORDER,
-                        )
-                        builders = {
-                            g: lambda meta, _g=g: np.array([
-                                _assign_condition_group(m) == _g for m in meta
-                            ])
-                            for g in CONDITION_GROUP_ORDER
-                        }
-                    if label_a in builders and label_b in builders:
-                        mask_a = builders[label_a](result.metadata)
-                        mask_b = builders[label_b](result.metadata)
-                        plot_pairwise_feature_boxplots(
-                            pair_result, result, mask_a, mask_b,
-                            section_dir / f"{pair_key}_feature_boxplots.png",
-                        )
+                    mask_a = _build_mask(label_a, section_name, result, is_single_animal)
+                    mask_b = _build_mask(label_b, section_name, result, is_single_animal)
+                    if mask_a is not None and mask_b is not None:
+                        if mask_a.any() and mask_b.any():
+                            plot_pairwise_feature_boxplots(
+                                pair_result, result, mask_a, mask_b,
+                                section_dir / f"{pair_key}_feature_boxplots.png",
+                            )
                 except Exception as e:
                     logger.warning("Feature boxplots for %s failed: %s", pair_key, e)
 
-    logger.info("Pairwise comparison plots saved under %s/pairwise/", plots_dir)
+    logger.info("Paired-animal comparison plots saved under %s/paired_animals/", plots_dir)
 
 
 def save_pairwise_comparison_results(
     comparison: dict[str, Any],
     results_dir: Path,
 ) -> None:
-    """Write per-pair JSON and CSV tables under results/pairwise_comparisons/."""
-    base = results_dir / "pairwise_comparisons"
+    """Write per-pair JSON and CSV tables under results/paired_animals/."""
+    base = results_dir / "paired_animals"
     base.mkdir(parents=True, exist_ok=True)
 
     sections = [
