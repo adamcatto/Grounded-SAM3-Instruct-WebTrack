@@ -19,7 +19,13 @@ import matplotlib.patches as mpatches  # noqa: E402
 import numpy as np  # noqa: E402
 
 from .clustering_pipeline import ClusteringResult
-from .multi_project_comparison import _assign_condition_group, CONDITION_GROUP_LABELS
+from .multi_project_comparison import (
+    _assign_condition_group,
+    CONDITION_GROUP_LABELS,
+    ROLE_CONDITION_LABELS,
+    ROLE_CONDITION_ORDER,
+    ROLE_MASK_BUILDERS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,12 +51,11 @@ _KEY_FEATURES = [
     "a_speed_mean", "b_speed_mean",
     "a_area_mean", "b_area_mean",
     "a_eccentricity_mean", "b_eccentricity_mean",
-    "distance_mean", "distance_std",
-    "overlap_fraction",
-    "close_proximity_fraction",
-    "chase_score",
-    "heading_alignment_mean",
-    "relative_speed_mean",
+    "min_distance_mean", "min_distance_std",
+    "frac_close_proximity",
+    "chase_metric",
+    "mean_relative_heading",
+    "parallel_movement_score",
 ]
 
 
@@ -449,3 +454,88 @@ def _plot_locomotion_group_boxplots(
         fig.savefig(outfile, dpi=_DPI, bbox_inches="tight")
         plt.close(fig)
         logger.info("Saved %s", outfile)
+
+
+# ---------------------------------------------------------------------------
+# Role condition boxplots (5 roles on x-axis)
+# ---------------------------------------------------------------------------
+
+_ROLE_COLORS = {
+    "SH_resident": "#E05555",
+    "SH_intruder": "#FF6B6B",
+    "GH_resident": "#2196F3",
+    "GH_intruder": "#64B5F6",
+    "GH_littermate": "#4CAF50",
+}
+
+
+def plot_role_condition_boxplots(
+    result: ClusteringResult,
+    plots_dir: Path,
+) -> None:
+    """Per-feature boxplots across role conditions (5 roles on x-axis)."""
+    if result.features_normalized.shape[0] == 0:
+        return
+
+    meta = result.metadata
+    role_masks = {r: ROLE_MASK_BUILDERS[r](meta) for r in ROLE_CONDITION_ORDER}
+    present_roles = [r for r in ROLE_CONDITION_ORDER if role_masks[r].any()]
+
+    if len(present_roles) < 2:
+        logger.warning("Fewer than 2 role conditions present -- skipping role boxplots")
+        return
+
+    feature_names = list(result.feature_names)
+    features_to_plot = [f for f in _KEY_FEATURES if f in feature_names]
+    if not features_to_plot:
+        features_to_plot = feature_names[:12]
+
+    n_features = len(features_to_plot)
+    n_cols = 3
+    n_rows = max(1, (n_features + n_cols - 1) // n_cols)
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4 * n_rows))
+    axes = np.array(axes).flatten()
+
+    for fi, fname in enumerate(features_to_plot):
+        ax = axes[fi]
+        col_idx = feature_names.index(fname)
+        data = []
+        colors = []
+
+        for r in present_roles:
+            mask = role_masks[r]
+            vals = result.features_normalized[mask, col_idx]
+            vals = vals[np.isfinite(vals)]
+            data.append(vals)
+            colors.append(_ROLE_COLORS.get(r, "#888888"))
+
+        bp = ax.boxplot(
+            data,
+            labels=None,
+            patch_artist=True,
+            widths=0.6,
+            showfliers=False,
+            medianprops=dict(color="black", linewidth=1.5),
+        )
+        for patch, color in zip(bp["boxes"], colors):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.7)
+
+        ax.set_title(fname, fontsize=9)
+        ax.set_xticks(range(1, len(present_roles) + 1))
+        ax.set_xticklabels(
+            [ROLE_CONDITION_LABELS.get(r, r) for r in present_roles],
+            rotation=30, ha="right", fontsize=6,
+        )
+        ax.tick_params(axis="y", labelsize=7)
+
+    for i in range(n_features, len(axes)):
+        axes[i].set_visible(False)
+
+    fig.suptitle("Feature Distributions by Role Condition", fontsize=13, y=1.01)
+    fig.tight_layout()
+    outfile = plots_dir / "role_condition_boxplots.png"
+    fig.savefig(outfile, dpi=_DPI, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Saved %s", outfile)
