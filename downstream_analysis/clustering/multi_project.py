@@ -30,7 +30,12 @@ from .experiment_registry import (
 )
 from .feature_extraction import extract_all_features, _fmt_duration, _fmt_size
 from .multi_project_comparison import compare_experiments
-from .sequence_features import SEQUENCE_FEATURE_NAMES
+from .sequence_features import (
+    ANALYSIS_FEATURE_NAMES,
+    SEQUENCE_FEATURE_NAMES,
+    analysis_feature_indices,
+    analysis_feature_names,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -224,12 +229,12 @@ class MultiProjectPipeline:
         if not all_features:
             logger.error("No features extracted from any project.")
             return ClusteringResult(
-                features_normalized=np.empty((0, len(SEQUENCE_FEATURE_NAMES))),
+                features_normalized=np.empty((0, len(ANALYSIS_FEATURE_NAMES))),
                 cluster_labels=np.array([], dtype=np.int32),
                 n_clusters=0,
                 embedding_2d=np.empty((0, 2)),
                 metadata=[],
-                feature_names=list(SEQUENCE_FEATURE_NAMES),
+                feature_names=list(ANALYSIS_FEATURE_NAMES),
                 method="none",
                 embedding_method="none",
             )
@@ -298,11 +303,13 @@ class MultiProjectPipeline:
         batch_diag_dir = self.output_dir / "batch_diagnostics"
         try:
             from .batch_diagnostics import run_batch_diagnostics
+            _feat_names = list(combined_dataset.feature_names)
+            _a_idx = analysis_feature_indices(_feat_names)
             run_batch_diagnostics(
-                pre_correction_features,
-                corrected,
+                pre_correction_features[:, _a_idx],
+                corrected[:, _a_idx],
                 batch_labels,
-                list(combined_dataset.feature_names),
+                analysis_feature_names(_feat_names),
                 all_metadata,
                 batch_diag_dir,
                 batch_info,
@@ -325,6 +332,47 @@ class MultiProjectPipeline:
 
         phase4_time = time.monotonic() - t0
         logger.info("Phase 4 done in %s", _fmt_duration(phase4_time))
+        logger.info("")
+
+        # ------------------------------------------------------------------
+        # Phase 4.5: Single-animal analysis
+        # ------------------------------------------------------------------
+        logger.info("PHASE 4.5: Single-animal analysis")
+        logger.info("-" * 40)
+        t0 = time.monotonic()
+
+        from .single_animal import split_to_single_animal
+        from .multi_project_comparison import compare_single_animal_experiments
+
+        sa_dataset = split_to_single_animal(combined_dataset)
+        logger.info(
+            "  Split to single-animal: %d pair windows -> %d single-animal samples",
+            len(combined_dataset), len(sa_dataset),
+        )
+
+        # Batch correct single-animal dataset
+        sa_batch_labels = np.array([m.batch_id for m in sa_dataset.metadata])
+        sa_X = sa_dataset.features.copy()
+        for col in range(sa_X.shape[1]):
+            mask = np.isfinite(sa_X[:, col])
+            if not np.all(mask):
+                median_val = float(np.nanmedian(sa_X[:, col])) if np.any(mask) else 0.0
+                sa_X[~mask, col] = median_val
+
+        sa_unique_batches = np.unique(sa_batch_labels)
+        if self.batch_correction_method == "combat" and len(sa_unique_batches) >= 2:
+            sa_corrected, _ = combat_correct(sa_X, sa_batch_labels)
+        elif self.batch_correction_method == "zscore_per_batch" and len(sa_unique_batches) >= 2:
+            sa_corrected, _ = zscore_per_batch(sa_X, sa_batch_labels)
+        else:
+            sa_corrected = sa_X
+        sa_dataset.features = sa_corrected
+
+        sa_result = run_clustering(sa_dataset, self.cfg)
+        sa_comparison = compare_single_animal_experiments(sa_result)
+
+        phase45_time = time.monotonic() - t0
+        logger.info("Phase 4.5 done in %s", _fmt_duration(phase45_time))
         logger.info("")
 
         # ------------------------------------------------------------------
@@ -355,6 +403,27 @@ class MultiProjectPipeline:
             logger.info("")
 
         # ------------------------------------------------------------------
+        # Phase 6.5: Social interaction time
+        # ------------------------------------------------------------------
+        logger.info("PHASE 6.5: Social interaction time")
+        logger.info("-" * 40)
+        t0 = time.monotonic()
+        social_data: dict[str, Any] | None = None
+
+        try:
+            from .social_interaction import compute_social_interaction_time
+            social_data = compute_social_interaction_time(
+                self.project_dirs,
+                all_metadata,
+            )
+        except Exception as e:
+            logger.warning("Social interaction time computation failed: %s", e)
+
+        phase65_time = time.monotonic() - t0
+        logger.info("Phase 6.5 done in %s", _fmt_duration(phase65_time))
+        logger.info("")
+
+        # ------------------------------------------------------------------
         # Phase 7: Plots
         # ------------------------------------------------------------------
         logger.info("PHASE 7: Generating plots")
@@ -368,6 +437,9 @@ class MultiProjectPipeline:
             result, comparison, plots_dir,
             pre_correction_features=pre_correction_features,
             locomotion_results=locomotion_results,
+            sa_result=sa_result,
+            sa_comparison=sa_comparison,
+            social_data=social_data,
         )
 
         phase7_time = time.monotonic() - t0
@@ -384,6 +456,20 @@ class MultiProjectPipeline:
         results_dir.mkdir(parents=True, exist_ok=True)
 
         self._save_results(results_dir, result, comparison, batch_info, locomotion_results)
+
+        # Single-animal results
+        if sa_result is not None:
+            sa_results_dir = results_dir / "single_animal"
+            sa_results_dir.mkdir(parents=True, exist_ok=True)
+            self._save_results(sa_results_dir, sa_result, sa_comparison, batch_info)
+            logger.info("  Wrote single-animal results to %s", sa_results_dir)
+
+        # Social interaction data
+        if social_data is not None:
+            import json as _json
+            p = results_dir / "social_interaction_time.json"
+            p.write_text(_json.dumps(social_data, indent=2, default=str))
+            logger.info("  Wrote %s", p.name)
 
         from .report_outputs import (
             build_multi_project_summary,
@@ -416,16 +502,20 @@ class MultiProjectPipeline:
         logger.info("# MULTI-PROJECT PIPELINE COMPLETE")
         logger.info("#   Clusters: %d", result.n_clusters)
         logger.info("#   Windows:  %d", len(result.metadata))
+        logger.info("#   Single-animal clusters: %d (%d samples)",
+                     sa_result.n_clusters, len(sa_result.metadata))
         logger.info("#   Time breakdown:")
-        logger.info("#     Feature extraction:    %s", _fmt_duration(phase1_time))
-        logger.info("#     Batch correction:      %s", _fmt_duration(phase3_time))
-        logger.info("#     Batch diagnostics:     %s", _fmt_duration(phase35_time))
+        logger.info("#     Feature extraction:     %s", _fmt_duration(phase1_time))
+        logger.info("#     Batch correction:       %s", _fmt_duration(phase3_time))
+        logger.info("#     Batch diagnostics:      %s", _fmt_duration(phase35_time))
         logger.info("#     Clustering + embedding: %s", _fmt_duration(phase4_time))
-        logger.info("#     Condition comparison:  %s", _fmt_duration(phase5_time))
+        logger.info("#     Single-animal analysis: %s", _fmt_duration(phase45_time))
+        logger.info("#     Condition comparison:   %s", _fmt_duration(phase5_time))
         if locomotion_results is not None:
-            logger.info("#     Locomotion comparison: %s", _fmt_duration(phase6_time))
-        logger.info("#     Plots:                 %s", _fmt_duration(phase7_time))
-        logger.info("#     Total:                 %s", _fmt_duration(overall_elapsed))
+            logger.info("#     Locomotion comparison:  %s", _fmt_duration(phase6_time))
+        logger.info("#     Social interaction:     %s", _fmt_duration(phase65_time))
+        logger.info("#     Plots:                  %s", _fmt_duration(phase7_time))
+        logger.info("#     Total:                  %s", _fmt_duration(overall_elapsed))
         logger.info("#   Output: %s", self.output_dir)
         logger.info("#" * 70)
 
@@ -486,14 +576,19 @@ class MultiProjectPipeline:
         *,
         pre_correction_features: np.ndarray | None = None,
         locomotion_results: dict[str, Any] | None = None,
+        sa_result: ClusteringResult | None = None,
+        sa_comparison: dict[str, Any] | None = None,
+        social_data: dict[str, Any] | None = None,
     ) -> None:
         """Generate all multi-project plots."""
+        # Standard plots (heatmap, composition, enrichment, ethograms, violins)
         try:
             from .plots import generate_all_plots
             generate_all_plots(result, comparison, plots_dir)
         except Exception as e:
             logger.warning("Standard plots failed: %s", e)
 
+        # Condition group + locomotion boxplots
         try:
             from .condition_boxplots import (
                 plot_condition_boxplots,
@@ -507,33 +602,31 @@ class MultiProjectPipeline:
         except Exception as e:
             logger.warning("Condition boxplots failed: %s", e)
 
-        # Multi-project UMAP variants
+        # Role condition boxplots
         try:
-            from .plots_multi import (
-                plot_umap_by_experiment,
-                plot_umap_by_condition_group,
-                plot_umap_by_batch,
-                plot_batch_correction_before_after,
-            )
-            plot_umap_by_experiment(result, plots_dir / "umap_by_experiment.png")
-            plot_umap_by_condition_group(result, plots_dir / "umap_by_condition_group.png")
-            plot_umap_by_batch(result, plots_dir / "umap_by_batch.png")
-            if pre_correction_features is not None:
-                plot_batch_correction_before_after(
-                    pre_correction_features,
-                    result.features_normalized,
-                    result.metadata,
-                    plots_dir / "batch_correction_before_after.png",
-                )
+            from .condition_boxplots import plot_role_condition_boxplots
+            plot_role_condition_boxplots(result, plots_dir)
         except Exception as e:
-            logger.warning("Multi-project UMAP plots failed: %s", e)
+            logger.warning("Role condition boxplots failed: %s", e)
 
+        # Consolidated UMAP plots (into plots/umap/ subfolder)
+        try:
+            from .plots_umap import generate_all_umap_plots
+            generate_all_umap_plots(
+                result, comparison, plots_dir,
+                pre_correction_features=pre_correction_features,
+            )
+        except Exception as e:
+            logger.warning("UMAP plots failed: %s", e)
+
+        # Pairwise comparison plots (with feature boxplots)
         try:
             from .plots_pairwise import generate_pairwise_comparison_plots
-            generate_pairwise_comparison_plots(comparison, plots_dir)
+            generate_pairwise_comparison_plots(comparison, plots_dir, result=result)
         except Exception as e:
             logger.warning("Pairwise comparison plots failed: %s", e)
 
+        # Transition plots
         try:
             from .condition_boxplots import _GROUP_ORDER
             from .plots_transitions import generate_transition_plots
@@ -542,6 +635,35 @@ class MultiProjectPipeline:
             )
         except Exception as e:
             logger.warning("Transition network plots failed: %s", e)
+
+        # Social interaction time plots
+        if social_data is not None:
+            try:
+                from .social_interaction import plot_social_interaction_time
+                plot_social_interaction_time(social_data, plots_dir)
+            except Exception as e:
+                logger.warning("Social interaction plots failed: %s", e)
+
+        # Single-animal plots
+        if sa_result is not None and sa_comparison is not None:
+            sa_plots_dir = plots_dir / "single_animal"
+            try:
+                from .plots import generate_all_plots as _gen_plots
+                _gen_plots(sa_result, sa_comparison, sa_plots_dir)
+            except Exception as e:
+                logger.warning("Single-animal standard plots failed: %s", e)
+
+            try:
+                from .plots_umap import generate_all_umap_plots as _gen_umap
+                _gen_umap(sa_result, sa_comparison, sa_plots_dir)
+            except Exception as e:
+                logger.warning("Single-animal UMAP plots failed: %s", e)
+
+            try:
+                from .plots_pairwise import generate_pairwise_comparison_plots as _gen_pw
+                _gen_pw(sa_comparison, sa_plots_dir, result=sa_result)
+            except Exception as e:
+                logger.warning("Single-animal pairwise plots failed: %s", e)
 
     # ------------------------------------------------------------------
     # Save results
