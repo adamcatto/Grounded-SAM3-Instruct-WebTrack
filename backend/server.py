@@ -2300,18 +2300,30 @@ def add_points(pid: str, vid: str, oid: str, req: AddPointsRequest):
             points = points + neg
             labels = labels + [0] * len(neg)
 
+    # When the video has sub-objects, disable SAM3's non-overlap constraint for this
+    # inference: otherwise a child segmented inside its (higher-scoring) parent has all
+    # its pixels reassigned to the parent and comes back empty.  We clip to the parent
+    # ourselves below.
+    hierarchical = any(o.get("parent_id") is not None for o in objects.values())
+
     # Standard single-instance point prompt
     try:
         sam_oid = _to_sam_obj_id_from_npz_key(str(oid))
         logger.info(f"add_points: frame={req.frame_idx}, obj={oid} (sam_oid={sam_oid}), points={req.points}, labels={req.labels}")
-        outputs = sam.add_points(
-            pid, vid,
-            frame_idx=req.frame_idx,
-            obj_id=sam_oid,
-            points=points,
-            labels=labels,
-            text=None,  # SAM3 tracker mode doesn't support text with points
-        )
+        if hierarchical:
+            sam.set_overlap_constraint_enabled(False)
+        try:
+            outputs = sam.add_points(
+                pid, vid,
+                frame_idx=req.frame_idx,
+                obj_id=sam_oid,
+                points=points,
+                labels=labels,
+                text=None,  # SAM3 tracker mode doesn't support text with points
+            )
+        finally:
+            if hierarchical:
+                sam.set_overlap_constraint_enabled(True)
     except Exception as e:
         import traceback
         logger.error(f"SAM add_points error: {e}\n{traceback.format_exc()}")
