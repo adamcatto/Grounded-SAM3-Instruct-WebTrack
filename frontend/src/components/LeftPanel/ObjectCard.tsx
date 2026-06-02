@@ -195,14 +195,10 @@ export default function ObjectCard({ objId, name, color, isActive, onSelect, des
         labelUndo: 'Remove object',
         labelRedo: 'Remove object',
         undo: async () => {
-          await restoreObjectSnapshot(pid, vid, {
-            id: objSnap.id,
-            name: objSnap.name,
-            color: objSnap.color,
-            description: objSnap.description,
-            min_instances: (objSnap as { min_instances?: number }).min_instances,
-            max_instances: (objSnap as { max_instances?: number }).max_instances,
-          }, pointSnap, ig ?? null)
+          // Spread the full snapshot so hierarchy fields (parent_id/kind/
+          // point_blob_frac/visible) survive undo — otherwise a restored
+          // sub-object would lose its parent and become top-level.
+          await restoreObjectSnapshot(pid, vid, { ...objSnap }, pointSnap, ig ?? null)
           const la = JSON.parse(JSON.stringify(useStore.getState().localAnnotations))
           for (const [fk, pr] of Object.entries(pointSnap)) {
             la[objId] = la[objId] ?? {}

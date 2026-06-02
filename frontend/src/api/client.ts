@@ -363,7 +363,11 @@ export const restoreMaskFrames = (pid: string, vid: string, frames: Record<strin
 export const restoreObjectSnapshot = (
   pid: string,
   vid: string,
-  object: { id: string; name: string; color: string; description?: string; min_instances?: number; max_instances?: number },
+  object: {
+    id: string; name: string; color: string; description?: string
+    min_instances?: number; max_instances?: number
+    parent_id?: string | null; kind?: ObjectKind; point_blob_frac?: number; visible?: boolean
+  },
   point_prompts: Record<string, { points: [number, number][]; labels: number[] }>,
   instance_group?: number[] | null,
 ) =>
