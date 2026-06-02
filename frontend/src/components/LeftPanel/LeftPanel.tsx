@@ -11,6 +11,7 @@ import {
   extractFrame,
   restoreMaskFrames,
   predictFrame,
+  replaceFramePromptsData,
   type ClearMasksMode,
 } from '../../api/client'
 import { getObjectColor } from '../../utils/colors'
@@ -1210,9 +1211,25 @@ export default function LeftPanel() {
     const f0 = currentFrame
     const rangeFrom = parseInt(clearRangeFrom)
     const rangeTo = parseInt(clearRangeTo)
+    // For a single-frame clear we also unlabel the frame (drop point prompts); snapshot
+    // those prompts per object so undo can restore them.
+    const promptSnapshot: Record<string, { points: [number, number][]; labels: number[] }> = {}
+    if (mode === 'this_frame') {
+      const pp = video?.point_prompts ?? {}
+      for (const [oid, frames2] of Object.entries(pp)) {
+        const slot = frames2[String(currentFrame)]
+        if (slot) promptSnapshot[oid] = { points: slot.points, labels: slot.labels }
+      }
+    }
     try {
       if (mode === 'this_frame') {
         await clearFrameMasks(pid, vid, currentFrame)
+        // Drop local point markers + live masks for every object on this frame so the
+        // next click starts clean (otherwise old points are re-accumulated/re-sent).
+        for (const oid of Object.keys(video?.objects ?? {})) {
+          useStore.getState().clearLocalPointsForFrame(oid, currentFrame)
+        }
+        setCurrentFrameMasks({}, currentFrame)
         setSavedMask(currentFrame, {})
       } else if (mode === 'from_frame') {
         await clearMasksBulk(pid, vid, 'from_frame', currentFrame)
@@ -1233,8 +1250,26 @@ export default function LeftPanel() {
         labelUndo: 'Clear masks',
         labelRedo: 'Clear masks',
         undo: async () => {
-          if (Object.keys(snapshots).length === 0) return
-          await restoreMaskFrames(pid, vid, snapshots)
+          // Restore prompts that were cleared (this_frame mode) back into config.
+          for (const [oid, pr] of Object.entries(promptSnapshot)) {
+            try {
+              await replaceFramePromptsData(pid, vid, oid, f0, pr.points, pr.labels)
+            } catch { /* ignore */ }
+          }
+          // Restore local point markers so they re-appear on the frame.
+          if (Object.keys(promptSnapshot).length > 0) {
+            const la = JSON.parse(JSON.stringify(useStore.getState().localAnnotations))
+            for (const [oid, pr] of Object.entries(promptSnapshot)) {
+              la[oid] = la[oid] ?? {}
+              la[oid][String(f0)] = {
+                points: pr.points.map(([x, y], i) => ({ x, y, label: pr.labels[i] as 0 | 1 })),
+              }
+            }
+            useStore.setState({ localAnnotations: la })
+          }
+          if (Object.keys(snapshots).length > 0) {
+            await restoreMaskFrames(pid, vid, snapshots)
+          }
           clearMaskCache()
           setProject(await getProject(pid))
         },
@@ -1242,6 +1277,10 @@ export default function LeftPanel() {
           try {
             if (mode === 'this_frame') {
               await clearFrameMasks(pid, vid, f0)
+              for (const oid of Object.keys(useStore.getState().project?.videos[vid]?.objects ?? {})) {
+                useStore.getState().clearLocalPointsForFrame(oid, f0)
+              }
+              setCurrentFrameMasks({}, f0)
               setSavedMask(f0, {})
             } else if (mode === 'from_frame') {
               await clearMasksBulk(pid, vid, 'from_frame', f0)

@@ -2369,19 +2369,25 @@ def clear_object_points(pid: str, vid: str, oid: str):
         sam.clear_object_prompts(pid, vid, int(oid))
     except Exception as e:
         logger.warning(f"SAM clear error: {e}")
+    # Drop the live SAM session so the next annotation rebuilds it from the (now
+    # cleared) config — otherwise the session's retained object state resurfaces.
+    sam.close_session(pid, vid)
     return {"status": "ok"}
 
 
 @app.delete("/api/projects/{pid}/videos/{vid}/objects/{oid}/frames/{frame_idx}/points")
 def clear_object_frame_points(pid: str, vid: str, oid: str, frame_idx: int):
-    """Clear point prompts and saved mask for a single object on a single frame."""
+    """Clear point prompts and saved mask/bbox for a single object on a single frame."""
     pm.clear_object_frame_prompt(pid, vid, oid, frame_idx)
     ms = VideoMaskStorage(pm.video_dir(pid, vid))
     if ms.has_masks(frame_idx):
         existing = ms.load_masks_dense(frame_idx)
         remaining = {k: v for k, v in existing.items() if k != oid}
-        ms.save_frame(frame_idx, remaining, None)
+        ms.save_frame(frame_idx, remaining, None)  # save_frame drops bboxes of absent objects
         _invalidate_mask_cache(pid, vid)
+    # The SAM session still holds this object's prompt on this frame; without a rebuild
+    # a subsequent add_points (no reinit) would re-emit and re-persist its mask.
+    sam.close_session(pid, vid)
     return {"status": "ok"}
 
 
@@ -2482,6 +2488,17 @@ def delete_frame_masks(pid: str, vid: str, fidx: int):
     if had_bbox:
         deleted.append("bboxes")
 
+    # Clearing a frame's masks fully unlabels the frame: also drop its point prompts
+    # from config and rebuild the SAM session, so nothing about this frame is replayed
+    # or resurfaced on the next annotation. (Callers snapshot prompts for undo.)
+    had_prompts = any(
+        str(fidx) in fp for fp in (video.get("point_prompts") or {}).values()
+    )
+    pm.clear_frame_prompts(pid, vid, fidx)
+    if had_prompts:
+        deleted.append("prompts")
+    sam.close_session(pid, vid)
+
     _invalidate_mask_cache(pid, vid)
     return JSONResponse({"status": "ok", "frame_idx": fidx, "deleted": deleted})
 
@@ -2523,6 +2540,10 @@ def bulk_delete_masks(
     else:
         raise HTTPException(422, f"Unknown mode: {mode}")
 
+    # Rebuild the SAM session so stale per-frame object state isn't resurfaced on the
+    # next annotation. (Bulk mask-clears keep point prompts — they are the source for
+    # re-propagation — so only masks/bboxes are removed here.)
+    sam.close_session(pid, vid)
     _invalidate_mask_cache(pid, vid)
     return JSONResponse({"status": "ok", "mode": mode, "deleted_frames": deleted})
 
