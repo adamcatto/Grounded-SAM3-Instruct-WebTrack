@@ -46,6 +46,21 @@ export default function FrameViewer() {
     currentFrameMasks, currentFrameMasksFrame, savedMaskCache,
   } = store
 
+  const redoModGlyph = /^Mac|^iPod|^iPhone/i.test(
+    typeof navigator !== 'undefined' ? navigator.platform : '',
+  )
+    ? '⌘'
+    : 'Ctrl'
+
+  const containerRef = useRef<HTMLDivElement>(null)
+  const frameStackRef = useRef<HTMLDivElement>(null)
+  const anchorReturnPanelRef = useRef<HTMLDivElement>(null)
+  const videoRef = useRef<HTMLVideoElement>(null)
+  const pendingShiftToggleRef = useRef(false)
+  const [dimensions, setDimensions] = useState({ width: 0, height: 0 })
+  const [anchorReturnOffsets, setAnchorReturnOffsets] = useState({ right: 12, bottom: 12 })
+  const [showTip, setShowTip] = useState(true)
+
   // ── Zoom-to-object viewport ───────────────────────────────────────────────
   // CSS transform on the frame stack; the canvas click math reads
   // getBoundingClientRect (which includes ancestor transforms), so coordinates
@@ -81,21 +96,6 @@ export default function FrameViewer() {
     }).catch(() => { if (!cancelled) setZoomTransform(null) })
     return () => { cancelled = true }
   }, [zoomToObjectId, zoomTargetB64, dimensions.width, dimensions.height, currentFrame])
-
-  const redoModGlyph = /^Mac|^iPod|^iPhone/i.test(
-    typeof navigator !== 'undefined' ? navigator.platform : '',
-  )
-    ? '⌘'
-    : 'Ctrl'
-
-  const containerRef = useRef<HTMLDivElement>(null)
-  const frameStackRef = useRef<HTMLDivElement>(null)
-  const anchorReturnPanelRef = useRef<HTMLDivElement>(null)
-  const videoRef = useRef<HTMLVideoElement>(null)
-  const pendingShiftToggleRef = useRef(false)
-  const [dimensions, setDimensions] = useState({ width: 0, height: 0 })
-  const [anchorReturnOffsets, setAnchorReturnOffsets] = useState({ right: 12, bottom: 12 })
-  const [showTip, setShowTip] = useState(true)
 
   // Prevent feedback loop: video timeupdate -> setCurrentFrame -> seek effect
   const videoIsDriving = useRef(false)
@@ -338,6 +338,7 @@ export default function FrameViewer() {
     const ch = stack.clientHeight
     const pad = 6
     function move(ev: MouseEvent) {
+      if (!panel) return
       const pw = panel.offsetWidth
       const ph = panel.offsetHeight
       const dx = ev.clientX - startX
