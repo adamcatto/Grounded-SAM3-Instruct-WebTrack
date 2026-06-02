@@ -2533,6 +2533,14 @@ async def _run_propagation_bg(
         for fidx_str in frame_prompts.keys()
     })
 
+    # SAM object ids of "point" sub-objects (seeded from tiny blob masks; their
+    # binarization threshold is lowered on the SAM2 path to resist collapse).
+    point_sam_ids: set[int] = {
+        _to_sam_obj_id_from_npz_key(oid)
+        for oid, meta in objects.items()
+        if meta.get("kind") == "point"
+    }
+
     # Compute simple sequential batches
     effective_end = end_frame if (end_frame >= 0 and end_frame < num_frames) else num_frames - 1
     batches: list[tuple[int, int]] = []
@@ -2735,6 +2743,9 @@ async def _run_propagation_bg(
                 })
 
                 await loop.run_in_executor(None, sam.init_session, pid, vid, tmp_dir)
+                # init_session clears any prior registration, so re-register each batch.
+                if point_sam_ids:
+                    sam.register_point_objects(pid, vid, point_sam_ids)
 
                 seeded_frames: list[int] = []
 
@@ -2751,7 +2762,8 @@ async def _run_propagation_bg(
                 # pushing the propagation start point backwards.
                 def _seed_labeled_frames() -> tuple[list[int], list[int]]:
                     frame_map = sam._frame_maps.get((pid, vid), [])
-                    items: list[tuple[int, int, dict]] = []
+                    ms_seed = VideoMaskStorage(video_dir)
+                    items: list[tuple[int, int, str, dict]] = []
                     for obj_id_str, frame_prompts in all_prompts.items():
                         obj_id_int = (
                             int(obj_id_str.split("_")[0]) if "_" in obj_id_str
@@ -2760,16 +2772,30 @@ async def _run_propagation_bg(
                         for fidx_str, prompt in frame_prompts.items():
                             fidx = int(fidx_str)
                             if fidx in frame_map:
-                                items.append((fidx, obj_id_int, prompt))
+                                items.append((fidx, obj_id_int, obj_id_str, prompt))
                     items.sort(key=lambda x: x[0])
                     in_batch: list[int] = []
                     context_only: list[int] = []
-                    for fidx, obj_id_int, prompt in items:
+                    for fidx, obj_id_int, obj_id_str, prompt in items:
                         try:
-                            sam.add_points(
-                                pid, vid, frame_idx=fidx, obj_id=obj_id_int,
-                                points=prompt["points"], labels=prompt["labels"],
-                            )
+                            meta = objects.get(obj_id_str, {})
+                            seed_blob = None
+                            if meta.get("kind") == "point":
+                                # Seed point sub-objects from their persisted tiny blob
+                                # mask (the "tiny mask" anchor) rather than a bare point.
+                                saved = ms_seed.load_masks_dense(fidx)
+                                cand = saved.get(obj_id_str)
+                                if cand is not None and np.asarray(cand).any():
+                                    seed_blob = np.asarray(cand)
+                            if seed_blob is not None:
+                                sam.add_mask_prompt(
+                                    pid, vid, frame_idx=fidx, obj_id=obj_id_int, mask=seed_blob,
+                                )
+                            else:
+                                sam.add_points(
+                                    pid, vid, frame_idx=fidx, obj_id=obj_id_int,
+                                    points=prompt["points"], labels=prompt["labels"],
+                                )
                             if P1 <= fidx <= P2:
                                 if fidx not in in_batch:
                                     in_batch.append(fidx)

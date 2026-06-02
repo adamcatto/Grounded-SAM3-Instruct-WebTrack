@@ -77,6 +77,14 @@ class SAMPredictor:
         # frame index.  Preview frames are named by real index (e.g. 001902.jpg), so we
         # must translate before every handle_request call.
         self._frame_maps: dict[tuple, list[int]] = {}
+        # Per-session set of SAM object ids that are "point" sub-objects, plus the
+        # logit margin to apply to them.  Point sub-objects are seeded from a tiny
+        # blob mask; without help their mask logits can fall below 0 over time and
+        # the object collapses to empty.  On the SAM2 path we lower the binarization
+        # threshold (mask > -margin) for these ids so the small blob survives — the
+        # server then reshapes the survivor to a fixed-size blob at its centroid.
+        self._point_obj_ids: dict[tuple, set[int]] = {}
+        self._point_logit_margin: dict[tuple, float] = {}
         # Serializes all SAM state mutations.  SAM3 asserts that each (frame, object)
         # pair has exactly one tracker state; two concurrent add_prompt calls for the
         # same object corrupt the session permanently.
@@ -186,10 +194,30 @@ class SAMPredictor:
     def get_session_id(self, pid: str, vid: str) -> Optional[str]:
         return self._sessions.get((pid, vid))
 
+    def register_point_objects(
+        self, pid: str, vid: str, point_obj_ids, logit_margin: float = 6.0
+    ):
+        """Mark which SAM object ids are point sub-objects for this session.
+
+        On the SAM2 propagation path their masks are binarized at ``mask > -margin``
+        instead of ``mask > 0`` so a tiny seed blob does not collapse to empty.
+        (SAM3 binarizes internally with no per-object hook; there the server's
+        centroid-blob reshape provides the same collapse-resistance.)
+        """
+        ids = {int(o) for o in point_obj_ids}
+        if ids:
+            self._point_obj_ids[(pid, vid)] = ids
+            self._point_logit_margin[(pid, vid)] = float(logit_margin)
+        else:
+            self._point_obj_ids.pop((pid, vid), None)
+            self._point_logit_margin.pop((pid, vid), None)
+
     def close_session(self, pid: str, vid: str):
         session_id = self._sessions.pop((pid, vid), None)
         self._sam2_states.pop((pid, vid), None)
         self._frame_maps.pop((pid, vid), None)
+        self._point_obj_ids.pop((pid, vid), None)
+        self._point_logit_margin.pop((pid, vid), None)
         if session_id is not None:
             if _model_name != "sam2":
                 try:
@@ -494,6 +522,9 @@ class SAMPredictor:
 
         predictor = _get_predictor()
 
+        point_ids = self._point_obj_ids.get((pid, vid), set())
+        margin = self._point_logit_margin.get((pid, vid), 0.0)
+
         if _model_name == "sam2":
             import torch
             state = self._sam2_states[(pid, vid)]
@@ -505,7 +536,13 @@ class SAMPredictor:
                     start_frame_idx=sam_start,
                     max_frame_num_to_track=max_frame_num_to_track,
                 ):
-                    masks_np = [(m > 0.0).cpu().numpy() for m in masks]
+                    # Lower the binarization threshold for point sub-objects so their
+                    # tiny seed blobs survive ("logit scaling"); others use mask > 0.
+                    id_list = list(obj_ids) if not isinstance(obj_ids, list) else obj_ids
+                    masks_np = [
+                        (m > (-margin if int(id_list[i]) in point_ids else 0.0)).cpu().numpy()
+                        for i, m in enumerate(masks)
+                    ]
                     yield {
                         "frame_index": frame_idx,
                         "outputs": {
@@ -519,6 +556,13 @@ class SAMPredictor:
                     }
         else:
             import torch
+            # NOTE (point sub-objects): SAM3 binarizes mask logits at a hardcoded
+            # `> 0.0` deep inside the tracker (sam3/model/sam3_video_inference.py),
+            # with no per-object threshold hook reachable here — so the SAM2-style
+            # logit-margin trick above can't be applied on this path.  Collapse-
+            # resistance for point sub-objects instead comes from (a) re-seeding the
+            # tiny blob mask on every labeled frame and (b) the server reshaping the
+            # tracked survivor to a fixed blob at its centroid (_contain_propagation_frame).
             # Translate real frame indices → SAM's internal sequential indices.
             # With temp-dir-per-batch, SAM's internal index 0 is NOT necessarily
             # real frame 0 — it's the first jpg in the temp dir.
