@@ -1,7 +1,8 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react'
-import { GripVertical, Info } from 'lucide-react'
+import { GripVertical, Info, ZoomOut } from 'lucide-react'
 import { useStore, currentVideo as selectCurrentVideo } from '../../store/useStore'
 import { videoSourceUrl, frameUrl } from '../../api/client'
+import { maskBboxNorm } from '../../utils/maskUtils'
 import AnnotationCanvas from './AnnotationCanvas'
 
 function targetIsTypingContext(target: EventTarget | null): boolean {
@@ -41,7 +42,45 @@ export default function FrameViewer() {
     anchorRemainderInferencing,
     anchorRemainderAwaitingCommit,
     currentObjectId,
+    zoomToObjectId, setZoomToObject,
+    currentFrameMasks, currentFrameMasksFrame, savedMaskCache,
   } = store
+
+  // ── Zoom-to-object viewport ───────────────────────────────────────────────
+  // CSS transform on the frame stack; the canvas click math reads
+  // getBoundingClientRect (which includes ancestor transforms), so coordinates
+  // stay correct under zoom with no extra inversion.
+  const [zoomTransform, setZoomTransform] = useState<string | null>(null)
+
+  const zoomTargetB64 = (() => {
+    if (!zoomToObjectId) return null
+    const live = currentFrameMasksFrame === currentFrame ? currentFrameMasks : null
+    return live?.[zoomToObjectId] ?? savedMaskCache[currentFrame]?.[zoomToObjectId] ?? null
+  })()
+
+  useEffect(() => {
+    if (!zoomToObjectId || !zoomTargetB64) {
+      setZoomTransform(null)
+      return
+    }
+    let cancelled = false
+    maskBboxNorm(zoomTargetB64).then(box => {
+      if (cancelled) return
+      if (!box) { setZoomTransform(null); return }
+      const [bx, by, bw, bh] = box
+      const W = dimensions.width
+      const H = dimensions.height
+      if (W === 0 || H === 0 || bw <= 0 || bh <= 0) { setZoomTransform(null); return }
+      const PAD = 0.82  // leave a margin around the bbox
+      const s = Math.min(1 / bw, 1 / bh) * PAD
+      const cx = bx + bw / 2
+      const cy = by + bh / 2
+      const tx = W / 2 - s * cx * W
+      const ty = H / 2 - s * cy * H
+      setZoomTransform(`translate(${tx}px, ${ty}px) scale(${s})`)
+    }).catch(() => { if (!cancelled) setZoomTransform(null) })
+    return () => { cancelled = true }
+  }, [zoomToObjectId, zoomTargetB64, dimensions.width, dimensions.height, currentFrame])
 
   const redoModGlyph = /^Mac|^iPod|^iPhone/i.test(
     typeof navigator !== 'undefined' ? navigator.platform : '',
@@ -356,6 +395,9 @@ export default function FrameViewer() {
             width: dimensions.width,
             height: dimensions.height,
             flexShrink: 0,
+            transform: zoomTransform ?? undefined,
+            transformOrigin: '0 0',
+            transition: 'transform 150ms ease-out',
           }}
         >
           {/* Layer 1: HTML5 video — always visible so it acts as an instant
@@ -432,6 +474,22 @@ export default function FrameViewer() {
             </div>
           )}
         </div>
+      )}
+
+      {/* Zoom-out chip (shown while zoomed into an object) */}
+      {zoomToObjectId && (
+        <button
+          type="button"
+          onClick={() => setZoomToObject(null)}
+          className="absolute top-3 left-3 z-20 flex items-center gap-1.5 rounded-lg border border-blue-600/40 bg-black/70 px-2.5 py-1.5 text-xs text-blue-200 hover:bg-black/90 transition-colors"
+          title="Zoom out to full frame"
+        >
+          <ZoomOut size={13} />
+          {video.objects[zoomToObjectId]?.name
+            ? `Zoomed: ${video.objects[zoomToObjectId].name}`
+            : 'Zoomed'}
+          <span className="text-[#888]">· exit</span>
+        </button>
       )}
 
       {/* Frame info (top-right) */}

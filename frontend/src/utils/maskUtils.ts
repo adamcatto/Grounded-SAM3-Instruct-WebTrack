@@ -43,6 +43,38 @@ export function evictMaskImages(b64s: string[]) {
   }
 }
 
+/**
+ * Compute the normalized [x, y, w, h] bounding box (in [0,1]) of a mask PNG by
+ * scanning its non-transparent pixels.  Returns null for an empty mask.  Used to
+ * drive the zoom-to-object viewport.  Scans at a downscaled resolution for speed.
+ */
+export async function maskBboxNorm(b64: string): Promise<[number, number, number, number] | null> {
+  const bitmap = await loadMaskBitmap(b64)
+  const SCAN = 256
+  const sw = Math.max(1, Math.min(SCAN, bitmap.width))
+  const sh = Math.max(1, Math.min(SCAN, bitmap.height))
+  const c = document.createElement('canvas')
+  c.width = sw
+  c.height = sh
+  const ctx = c.getContext('2d')
+  if (!ctx) return null
+  ctx.drawImage(bitmap, 0, 0, sw, sh)
+  const data = ctx.getImageData(0, 0, sw, sh).data
+  let minX = sw, minY = sh, maxX = -1, maxY = -1
+  for (let y = 0; y < sh; y++) {
+    for (let x = 0; x < sw; x++) {
+      if (data[(y * sw + x) * 4 + 3] > 8) {
+        if (x < minX) minX = x
+        if (x > maxX) maxX = x
+        if (y < minY) minY = y
+        if (y > maxY) maxY = y
+      }
+    }
+  }
+  if (maxX < 0) return null
+  return [minX / sw, minY / sh, (maxX - minX + 1) / sw, (maxY - minY + 1) / sh]
+}
+
 export async function drawMasks(
   ctx: CanvasRenderingContext2D,
   masks: Record<string, string>,  // objId → base64 PNG
