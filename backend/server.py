@@ -1582,27 +1582,14 @@ def predict_frame(pid: str, vid: str, frame_idx: int):
         if not target_jpg.exists():
             raise HTTPException(500, f"Frame {frame_idx} could not be extracted")
 
-    # Rebuild the annotated session (init + replay all saved prompts).
-    try:
-        last_out = _full_ann_session_reinit_and_replay(
-            pid, vid, ann_dir, collect_last_outputs=True
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"predict_frame rebuild failed: {e}", exc_info=True)
-        raise HTTPException(500, f"Session rebuild failed: {e}")
-
-    objects = (pm.get_video(pid, vid) or video)["objects"]
-
-    # Point sub-objects: lower their SAM2 binarization threshold during propagation.
+    objects = video["objects"]
+    hierarchical = any(o.get("parent_id") is not None for o in objects.values())
     point_sam_ids = {
         _to_sam_obj_id_from_npz_key(oid)
         for oid, meta in objects.items()
         if meta.get("kind") == "point"
     }
-    if point_sam_ids:
-        sam.register_point_objects(pid, vid, point_sam_ids)
+    video_dir = pm.video_dir(pid, vid)
 
     def _int_masks_from_fo(fo: dict) -> dict:
         out: dict[int, np.ndarray] = {}
@@ -1617,56 +1604,90 @@ def predict_frame(pid: str, vid: str, frame_idx: int):
             out[int(oid)] = np.squeeze(m).astype(np.uint8)
         return out
 
-    # If the target frame is itself annotated, replay already produced its masks.
-    frame_masks_int: dict = {}
-    fo = last_out.get(frame_idx)
-    if fo:
-        frame_masks_int = _int_masks_from_fo(fo)
-    else:
-        # Propagate from the nearest annotated frame to the target.  SAM's frame
-        # indices are positions in the sparse annotated session, so direction +
-        # max_frame_num_to_track are derived from those positions (mirrors the
-        # anchor-remainder predictor).
+    def _seed_and_predict() -> dict:
+        # Fresh session over the annotated frames (incl. the just-extracted target).
+        session_id = sam.init_session(pid, vid, ann_dir)
+        pm.update_video(pid, vid, {"sam3_session_id": session_id})
+        if point_sam_ids:
+            sam.register_point_objects(pid, vid, point_sam_ids)
+
         frame_map = sam._frame_maps.get((pid, vid), [])
-        annotated_in_session = sorted(
-            int(f) for f in {int(fk) for fp in all_prompts.values() for fk in fp.keys()}
-            if int(f) in frame_map
-        )
+        ms = VideoMaskStorage(video_dir)
+        items: list[tuple[int, str, int, dict]] = []
+        for oid_str, fps in all_prompts.items():
+            oid_int = _to_sam_obj_id_from_npz_key(oid_str)
+            for fk, prompt in fps.items():
+                f = int(fk)
+                if f in frame_map:
+                    items.append((f, oid_str, oid_int, prompt))
+        items.sort(key=lambda x: (x[0], x[1]))
+
+        captured: dict = {}  # masks for the target frame seeded directly (if annotated)
+        for f, oid_str, oid_int, prompt in items:
+            meta = objects.get(oid_str, {})
+            out = None
+            # Point sub-objects: seed the tiny persisted blob (not a bare point, which
+            # would segment the whole parent) so the tracked region stays localized.
+            if meta.get("kind") == "point":
+                saved = ms.load_masks_dense(f).get(oid_str)
+                if saved is not None and np.asarray(saved).any():
+                    out = sam.add_mask_prompt(pid, vid, frame_idx=f, obj_id=oid_int, mask=np.asarray(saved))
+            if out is None:
+                out = sam.add_points(pid, vid, frame_idx=f, obj_id=oid_int,
+                                     points=prompt["points"], labels=prompt["labels"])
+            if f == frame_idx and out:
+                fo = out.get(frame_idx) or out.get(str(frame_idx)) or {}
+                captured.update(_int_masks_from_fo(fo))
+
+        annotated_in_session = sorted({f for f, _, _, _ in items})
         if not annotated_in_session:
-            raise HTTPException(400, "No annotated frames are loaded in the session.")
+            return captured
         start_from = min(annotated_in_session, key=lambda f: abs(f - frame_idx))
-        try:
-            start_sam = frame_map.index(start_from)
-            tgt_sam = frame_map.index(frame_idx)
-        except ValueError as e:
-            raise HTTPException(500, f"Frame map missing start/target: {e}")
+        if start_from == frame_idx:
+            return captured  # target itself annotated — seed outputs are the answer
+        start_sam = frame_map.index(start_from)
+        tgt_sam = frame_map.index(frame_idx)
         direction = "forward" if tgt_sam > start_sam else "backward"
         max_track = abs(tgt_sam - start_sam)
 
-        def _run_predict_pass():
-            # SAM3 may yield the target frame more than once (an initial pass with
-            # unconfirmed/empty masks, then a refined pass).  Keep the LAST non-empty
-            # result instead of breaking on the first occurrence.
-            last_fm: dict = {}
+        # Disable SAM3's non-overlap constraint for hierarchical sessions so nested
+        # children are not zeroed by the parent winning the overlap.
+        sam.set_overlap_constraint_enabled(not hierarchical)
+        last_fm: dict = dict(captured)
+        try:
             for item in sam.propagate_stream(
-                pid, vid,
-                start_frame_idx=start_from,
-                propagation_direction=direction,
-                max_frame_num_to_track=max_track,
+                pid, vid, start_frame_idx=start_from,
+                propagation_direction=direction, max_frame_num_to_track=max_track,
             ):
                 real_frame, fm, _fb = _extract_frame_masks_bboxes(pid, vid, item)
                 if real_frame == frame_idx and fm:
                     last_fm = dict(fm)
-            return last_fm
+        finally:
+            sam.set_overlap_constraint_enabled(True)
+        return last_fm
 
-        try:
-            frame_masks_int = _run_predict_pass()
-        except Exception as e:
-            logger.error(f"predict_frame propagation failed: {e}", exc_info=True)
-            raise HTTPException(500, f"Prediction failed: {e}")
+    try:
+        frame_masks_int = _seed_and_predict()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"predict_frame failed: {e}", exc_info=True)
+        raise HTTPException(500, f"Prediction failed: {e}")
+
+    logger.info(
+        f"predict_frame {frame_idx}: hierarchical={hierarchical}, point_ids={sorted(point_sam_ids)}; "
+        f"raw SAM masks: " + (", ".join(
+            f"obj{oid}={int(np.asarray(m).sum())}px" for oid, m in sorted(frame_masks_int.items())
+        ) or "(none)")
+    )
 
     # Apply sub-object containment, then encode (do NOT persist / mark propagated).
     masks_str, _bboxes = _contain_frame_masks(objects, frame_masks_int)
+    logger.info(
+        f"predict_frame {frame_idx}: after containment: " + (", ".join(
+            f"obj{oid}={int(np.asarray(m).sum())}px" for oid, m in sorted(masks_str.items())
+        ) or "(none)")
+    )
     mask_b64: dict[str, str] = {}
     for oid, m in masks_str.items():
         if np.asarray(m).any():
@@ -2734,6 +2755,11 @@ async def _run_propagation_bg(
         for oid, meta in objects.items()
         if meta.get("kind") == "point"
     }
+    # With nested sub-objects, disable SAM3's non-overlap constraint so children
+    # (which lie inside their parent) are not zeroed by the parent winning overlap.
+    hierarchical = any(o.get("parent_id") is not None for o in objects.values())
+    if hierarchical:
+        sam.set_overlap_constraint_enabled(False)
 
     # Compute simple sequential batches
     effective_end = end_frame if (end_frame >= 0 and end_frame < num_frames) else num_frames - 1
@@ -3036,6 +3062,9 @@ async def _run_propagation_bg(
             logger.warning(f"Could not persist inference failed status: {e2}")
         await publish("error", {"error": str(e)})
     finally:
+        # Restore SAM3's non-overlap constraint (disabled above for hierarchies).
+        if hierarchical:
+            sam.set_overlap_constraint_enabled(True)
         # Each batch calls init_session(pid, vid, …), which closes the previous batch's
         # session for this (pid, vid) only. Nothing closed the final batch's session, and
         # init_session for another video closes only that video's key — leaving every

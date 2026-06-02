@@ -85,6 +85,11 @@ class SAMPredictor:
         # server then reshapes the survivor to a fixed-size blob at its centroid.
         self._point_obj_ids: dict[tuple, set[int]] = {}
         self._point_logit_margin: dict[tuple, float] = {}
+        # When True, SAM3's object-wise non-overlapping-mask constraint is bypassed so
+        # nested sub-objects (a child mask lying inside its parent) are not zeroed out
+        # by the parent winning the overlap.  Toggled around hierarchical propagation.
+        self._overlap_disabled = False
+        self._overlap_wrapper_installed = False
         # Serializes all SAM state mutations.  SAM3 asserts that each (frame, object)
         # pair has exactly one tracker state; two concurrent add_prompt calls for the
         # same object corrupt the session permanently.
@@ -211,6 +216,39 @@ class SAMPredictor:
         else:
             self._point_obj_ids.pop((pid, vid), None)
             self._point_logit_margin.pop((pid, vid), None)
+
+    def set_overlap_constraint_enabled(self, enabled: bool):
+        """Enable/disable SAM3's object-wise non-overlapping-mask constraint.
+
+        Nested sub-objects share pixels with their parent.  SAM3's constraint
+        (applied in _postprocess_output) assigns each overlapping pixel to the single
+        highest-scoring object, which zeroes children that lie inside a higher-scoring
+        parent.  Disabling it lets every object keep its own (overlapping) mask; the
+        server then clips children to parents itself.  No-op on the SAM2 path.
+        """
+        self._overlap_disabled = not enabled
+        if _model_name != "sam3":
+            return
+        if self._overlap_wrapper_installed:
+            return
+        try:
+            predictor = _get_predictor()
+            tracker = getattr(predictor, "tracker", None)
+            if tracker is None:
+                return
+            orig = tracker._apply_object_wise_non_overlapping_constraints
+            sp = self
+
+            def _wrapped(pred_masks, obj_scores, background_value=-10.0):
+                if sp._overlap_disabled:
+                    return pred_masks  # keep raw per-object masks (allow overlap)
+                return orig(pred_masks, obj_scores, background_value=background_value)
+
+            tracker._apply_object_wise_non_overlapping_constraints = _wrapped
+            self._overlap_wrapper_installed = True
+            logger.info("Installed SAM3 non-overlap-constraint toggle wrapper.")
+        except Exception as e:
+            logger.warning(f"Could not install overlap-constraint wrapper: {e}")
 
     def close_session(self, pid: str, vid: str):
         session_id = self._sessions.pop((pid, vid), None)
