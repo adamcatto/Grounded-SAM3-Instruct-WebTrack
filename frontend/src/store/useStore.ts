@@ -403,12 +403,17 @@ export const useStore = create<AppState>((set, get) => ({
   isObjectVisible: oid => {
     const { objectVisibility, project, currentVideoId } = get()
     const objects = currentVideoId ? project?.videos[currentVideoId]?.objects : undefined
-    // Walk up the parent chain: hidden if this object or any ancestor is toggled off.
+    // Walk up the parent chain; the NEAREST explicit setting wins. An explicit
+    // show (true) on the object — or on an ancestor closer than any hidden one —
+    // overrides a hidden ancestor, so re-enabling a child's eye reveals it even
+    // while its parent's mask stays hidden.
     let cur: string | null | undefined = oid
     const guard = new Set<string>()
     while (cur != null && !guard.has(cur)) {
       guard.add(cur)
-      if (objectVisibility[cur] === false) return false
+      const v = objectVisibility[cur]
+      if (v === true) return true
+      if (v === false) return false
       cur = objects?.[cur]?.parent_id ?? null
     }
     return true
