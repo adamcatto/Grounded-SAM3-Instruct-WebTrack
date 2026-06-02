@@ -90,6 +90,7 @@ class SAMPredictor:
         # by the parent winning the overlap.  Toggled around hierarchical propagation.
         self._overlap_disabled = False
         self._overlap_wrapper_installed = False
+        self._orig_non_overlap_flag = None  # tracker.non_overlap_masks_for_output original
         # Serializes all SAM state mutations.  SAM3 asserts that each (frame, object)
         # pair has exactly one tracker state; two concurrent add_prompt calls for the
         # same object corrupt the session permanently.
@@ -229,26 +230,47 @@ class SAMPredictor:
         self._overlap_disabled = not enabled
         if _model_name != "sam3":
             return
-        if self._overlap_wrapper_installed:
-            return
         try:
             predictor = _get_predictor()
-            tracker = getattr(predictor, "tracker", None)
+            # The constraint lives on the inference model's tracker.  Sam3VideoPredictor
+            # wraps the inference object as `.model`, so the tracker is at
+            # predictor.model.tracker (not predictor.tracker).
+            inference = getattr(predictor, "model", predictor)
+            tracker = getattr(inference, "tracker", None) or getattr(predictor, "tracker", None)
             if tracker is None:
+                logger.warning(
+                    "Overlap-constraint toggle: tracker not found "
+                    f"(inference={type(inference).__name__}); sub-object overlap may be lost."
+                )
                 return
-            orig = tracker._apply_object_wise_non_overlapping_constraints
-            sp = self
 
-            def _wrapped(pred_masks, obj_scores, background_value=-10.0):
-                if sp._overlap_disabled:
-                    return pred_masks  # keep raw per-object masks (allow overlap)
-                return orig(pred_masks, obj_scores, background_value=background_value)
+            # (1) Object-wise non-overlap in _postprocess_output — install a guarded
+            #     wrapper once; it returns masks unchanged while disabled.
+            if (not self._overlap_wrapper_installed
+                    and hasattr(tracker, "_apply_object_wise_non_overlapping_constraints")):
+                orig = tracker._apply_object_wise_non_overlapping_constraints
+                sp = self
 
-            tracker._apply_object_wise_non_overlapping_constraints = _wrapped
-            self._overlap_wrapper_installed = True
-            logger.info("Installed SAM3 non-overlap-constraint toggle wrapper.")
+                def _wrapped(pred_masks, obj_scores, background_value=-10.0):
+                    if sp._overlap_disabled:
+                        return pred_masks  # keep raw per-object masks (allow overlap)
+                    return orig(pred_masks, obj_scores, background_value=background_value)
+
+                tracker._apply_object_wise_non_overlapping_constraints = _wrapped
+                self._overlap_wrapper_installed = True
+                logger.info("Installed SAM3 non-overlap-constraint toggle wrapper.")
+
+            # (2) Output-time pixel-level non-overlap flag on the tracker — toggle it
+            #     directly (restoring the original value when re-enabled).
+            if hasattr(tracker, "non_overlap_masks_for_output"):
+                if self._orig_non_overlap_flag is None:
+                    self._orig_non_overlap_flag = bool(tracker.non_overlap_masks_for_output)
+                tracker.non_overlap_masks_for_output = (
+                    self._orig_non_overlap_flag if enabled else False
+                )
+            logger.info(f"SAM3 non-overlap constraint {'ENABLED' if enabled else 'DISABLED'}.")
         except Exception as e:
-            logger.warning(f"Could not install overlap-constraint wrapper: {e}")
+            logger.warning(f"Could not toggle overlap constraint: {e}")
 
     def close_session(self, pid: str, vid: str):
         session_id = self._sessions.pop((pid, vid), None)
