@@ -82,6 +82,10 @@ interface AppState {
   savedMaskCache: Record<number, MaskData>
   pendingInferenceFrame: number | null
 
+  // Sub-object UI: per-object mask visibility override (default true) + zoom target
+  objectVisibility: Record<string, boolean>
+  zoomToObjectId: string | null
+
   // Playback
   isPlaying: boolean
 
@@ -133,6 +137,11 @@ interface AppState {
   setCurrentFrameMasks: (masks: MaskData, frame?: number | null) => void
   setSavedMask: (fidx: number, masks: MaskData) => void
   clearSavedMaskCache: () => void
+  toggleObjectVisibility: (oid: string) => void
+  setObjectVisibility: (oid: string, v: boolean) => void
+  /** Cascade-aware: false if the object or any ancestor is toggled hidden. */
+  isObjectVisible: (oid: string) => boolean
+  setZoomToObject: (oid: string | null) => void
   setPendingInferenceFrame: (f: number | null) => void
   setPlaying: (v: boolean) => void
   setPropagationStatus: (s: PropagationStatus) => void
@@ -180,6 +189,8 @@ export const useStore = create<AppState>((set, get) => ({
   currentFrameMasksFrame: null,
   savedMaskCache: {},
   pendingInferenceFrame: null,
+  objectVisibility: {},
+  zoomToObjectId: null,
   isPlaying: false,
   propagationStatus: 'idle',
   propagationProgress: 0,
@@ -382,6 +393,27 @@ export const useStore = create<AppState>((set, get) => ({
     _savedMaskCacheOrder = []
     set({ savedMaskCache: {} })
   },
+
+  toggleObjectVisibility: oid => {
+    const cur = get().isObjectVisible(oid)
+    set(s => ({ objectVisibility: { ...s.objectVisibility, [oid]: !cur } }))
+  },
+  setObjectVisibility: (oid, v) =>
+    set(s => ({ objectVisibility: { ...s.objectVisibility, [oid]: v } })),
+  isObjectVisible: oid => {
+    const { objectVisibility, project, currentVideoId } = get()
+    const objects = currentVideoId ? project?.videos[currentVideoId]?.objects : undefined
+    // Walk up the parent chain: hidden if this object or any ancestor is toggled off.
+    let cur: string | null | undefined = oid
+    const guard = new Set<string>()
+    while (cur != null && !guard.has(cur)) {
+      guard.add(cur)
+      if (objectVisibility[cur] === false) return false
+      cur = objects?.[cur]?.parent_id ?? null
+    }
+    return true
+  },
+  setZoomToObject: oid => set({ zoomToObjectId: oid }),
 
   setPendingInferenceFrame: f => set({ pendingInferenceFrame: f }),
   setPlaying: v => set({ isPlaying: v }),

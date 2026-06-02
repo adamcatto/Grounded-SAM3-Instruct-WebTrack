@@ -1,5 +1,5 @@
 import axios from 'axios'
-import type { Project, VideoMeta, ObjectDef, MaskData } from '../types'
+import type { Project, VideoMeta, ObjectDef, ObjectKind, MaskData } from '../types'
 
 const api = axios.create({ baseURL: '/api' })
 
@@ -204,18 +204,45 @@ export const addObject = (
   name: string,
   color?: string,
   description?: string,
+  opts?: { parent_id?: string | null; kind?: ObjectKind; point_blob_frac?: number },
 ) =>
   api.post<ObjectDef>(`/projects/${pid}/videos/${vid}/objects`, {
     name,
     color,
     description: description ?? '',
+    ...(opts?.parent_id != null ? { parent_id: opts.parent_id } : {}),
+    ...(opts?.kind ? { kind: opts.kind } : {}),
+    ...(opts?.point_blob_frac != null ? { point_blob_frac: opts.point_blob_frac } : {}),
   }).then(r => r.data)
+
+/** Convenience wrapper: create a sub-object under `parentId`. */
+export const addSubObject = (
+  pid: string,
+  vid: string,
+  parentId: string,
+  name: string,
+  kind: ObjectKind = 'segmentation',
+  opts?: { color?: string; description?: string; point_blob_frac?: number },
+) =>
+  addObject(pid, vid, name, opts?.color, opts?.description, {
+    parent_id: parentId,
+    kind,
+    point_blob_frac: opts?.point_blob_frac,
+  })
 
 export const updateObject = (
   pid: string,
   vid: string,
   oid: string,
-  updates: { name?: string; color?: string; description?: string }
+  updates: {
+    name?: string
+    color?: string
+    description?: string
+    parent_id?: string | null
+    kind?: ObjectKind
+    point_blob_frac?: number
+    visible?: boolean
+  }
 ) =>
   api.patch(`/projects/${pid}/videos/${vid}/objects/${oid}`, updates).then(r => r.data)
 

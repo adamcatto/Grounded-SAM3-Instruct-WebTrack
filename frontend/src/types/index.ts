@@ -1,8 +1,18 @@
+export type ObjectKind = 'segmentation' | 'point'
+
 export interface ObjectDef {
   id: string
   name: string
   color: string
   description?: string     // textual instruction / prompt (uses name if empty)
+  /** null/undefined = top-level object; otherwise the id of this object's parent. */
+  parent_id?: string | null
+  /** 'point' sub-objects emit a small blob; top-level objects are always 'segmentation'. */
+  kind?: ObjectKind
+  /** point-kind only: blob radius as a fraction of the parent bbox's min side. */
+  point_blob_frac?: number
+  /** persisted mask visibility (client also keeps a live override). */
+  visible?: boolean
 }
 
 export interface PointPrompts {
