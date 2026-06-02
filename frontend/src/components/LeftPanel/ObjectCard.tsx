@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react'
-import { Pencil, Trash2, MousePointer, MinusCircle, Check, ChevronDown, ChevronUp, Save, Loader, Eye, EyeOff, ZoomIn, ZoomOut, Plus, Crosshair } from 'lucide-react'
+import { Pencil, Trash2, MousePointer, MinusCircle, Check, ChevronDown, ChevronUp, ChevronRight, Save, Loader, Eye, EyeOff, ZoomIn, ZoomOut, Plus, Crosshair } from 'lucide-react'
 import { useStore } from '../../store/useStore'
 import { renameObject, removeObject, clearObjectFramePoints, updateObject, rebuildFromConfig, replaceFramePromptsData, restoreObjectSnapshot, getSavedMask } from '../../api/client'
 import { applyRebuildMasksToStore, localAnnotationsToPointPrompts } from '../../history/applyRebuild'
@@ -18,9 +18,15 @@ interface Props {
   kind?: ObjectKind
   /** Opens the "add sub-object" form for this object in the parent panel. */
   onAddSub?: () => void
+  /** True when this object has sub-objects (shows a collapse chevron). */
+  hasChildren?: boolean
+  /** Whether this object's sub-objects are collapsed (hidden) in the tree. */
+  collapsed?: boolean
+  /** Toggle collapse/expand of this object's sub-objects. */
+  onToggleCollapse?: () => void
 }
 
-export default function ObjectCard({ objId, name, color, isActive, onSelect, description, depth = 0, kind = 'segmentation', onAddSub }: Props) {
+export default function ObjectCard({ objId, name, color, isActive, onSelect, description, depth = 0, kind = 'segmentation', onAddSub, hasChildren = false, collapsed = false, onToggleCollapse }: Props) {
   const {
     project, currentVideoId, currentFrame,
     pointMode, setPointMode, setCurrentObject,
@@ -336,6 +342,18 @@ export default function ObjectCard({ objId, name, color, isActive, onSelect, des
     >
       {/* Top row: color swatch + name */}
       <div className="flex items-center gap-2.5 px-3 pt-3 pb-2">
+        {/* Collapse/expand sub-objects (only when this object has children) */}
+        {hasChildren ? (
+          <button
+            onClick={e => { e.stopPropagation(); onToggleCollapse?.() }}
+            className="p-0.5 -ml-1.5 text-[#666] hover:text-[#ccc] rounded"
+            title={collapsed ? 'Expand sub-objects' : 'Collapse sub-objects'}
+          >
+            {collapsed ? <ChevronRight size={15} /> : <ChevronDown size={15} />}
+          </button>
+        ) : (
+          depth > 0 && <span className="w-[15px] flex-shrink-0" aria-hidden />
+        )}
         {/* Color thumbnail */}
         <div
           className="w-10 h-10 rounded-lg flex-shrink-0 border border-white/10 relative"

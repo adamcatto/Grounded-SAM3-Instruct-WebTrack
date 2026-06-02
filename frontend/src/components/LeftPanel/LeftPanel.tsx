@@ -80,6 +80,8 @@ export default function LeftPanel() {
   const [subKind, setSubKind] = useState<ObjectKind>('segmentation')
   const [subBlobFrac, setSubBlobFrac] = useState(0.06)
   const [predicting, setPredicting] = useState(false)
+  // Object ids whose sub-objects are collapsed (hidden) in the tree view.
+  const [collapsedIds, setCollapsedIds] = useState<Set<string>>(new Set())
   const [initializingSession, setInitializingSession] = useState(false)
   const [trackingError, setTrackingError] = useState('')
   const [trackingRetryMsg, setTrackingRetryMsg] = useState('')
@@ -234,6 +236,13 @@ export default function LeftPanel() {
     setSubName('')
     setSubKind('segmentation')
     setSubBlobFrac(0.06)
+    // Make sure the parent is expanded so the new sub-object is visible.
+    setCollapsedIds(prev => {
+      if (!prev.has(parentId)) return prev
+      const next = new Set(prev)
+      next.delete(parentId)
+      return next
+    })
   }
 
   async function handlePredictFrame() {
@@ -1378,23 +1387,38 @@ export default function LeftPanel() {
     </div>
   )
 
-  const renderObjectNode = (obj: typeof objsById[string], depth: number): React.ReactNode => (
-    <React.Fragment key={obj.id}>
-      <ObjectCard
-        objId={obj.id}
-        name={obj.name}
-        color={obj.color}
-        isActive={currentObjectId === obj.id}
-        onSelect={() => setCurrentObject(currentObjectId === obj.id ? null : obj.id)}
-        description={obj.description}
-        depth={depth}
-        kind={obj.kind ?? 'segmentation'}
-        onAddSub={!isTracking && !anchorPhase ? () => openSubForm(obj.id) : undefined}
-      />
-      {subParentId === obj.id && subObjectForm(obj.id)}
-      {childrenOfParent(obj.id).map(child => renderObjectNode(child, depth + 1))}
-    </React.Fragment>
-  )
+  const toggleCollapse = (id: string) =>
+    setCollapsedIds(prev => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+
+  const renderObjectNode = (obj: typeof objsById[string], depth: number): React.ReactNode => {
+    const kids = childrenOfParent(obj.id)
+    const isCollapsed = collapsedIds.has(obj.id)
+    return (
+      <React.Fragment key={obj.id}>
+        <ObjectCard
+          objId={obj.id}
+          name={obj.name}
+          color={obj.color}
+          isActive={currentObjectId === obj.id}
+          onSelect={() => setCurrentObject(currentObjectId === obj.id ? null : obj.id)}
+          description={obj.description}
+          depth={depth}
+          kind={obj.kind ?? 'segmentation'}
+          onAddSub={!isTracking && !anchorPhase ? () => openSubForm(obj.id) : undefined}
+          hasChildren={kids.length > 0}
+          collapsed={isCollapsed}
+          onToggleCollapse={() => toggleCollapse(obj.id)}
+        />
+        {subParentId === obj.id && subObjectForm(obj.id)}
+        {!isCollapsed && kids.map(child => renderObjectNode(child, depth + 1))}
+      </React.Fragment>
+    )
+  }
 
   // ── Render ───────────────────────────────────────────────────────────────────
 
