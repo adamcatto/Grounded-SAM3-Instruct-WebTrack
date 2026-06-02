@@ -37,6 +37,7 @@ from anchor_helpers import (
 from project_manager import ProjectManager
 from sam_predictor import SAMPredictor, _get_predictor
 from mask_store import VideoMaskStorage
+import hierarchy
 from video_processor import (
     compute_ds_dims,
     composite_masks_as_png,
@@ -1977,8 +1978,56 @@ def add_points(pid: str, vid: str, oid: str, req: AddPointsRequest):
             except Exception as e:
                 raise HTTPException(500, f"SAM session init failed: {e}")
 
-    # Save prompts to config
+    # Save prompts to config (always the user's raw points — synthetic negative seeds
+    # for segmentation children are regenerated at inference time, never persisted).
     pm.save_point_prompts(pid, vid, oid, req.frame_idx, req.points, req.labels)
+
+    objects = video["objects"]
+    obj_meta = objects.get(str(oid), {})
+    parent_id = obj_meta.get("parent_id")
+    kind = obj_meta.get("kind", "segmentation")
+    blob_frac = float(obj_meta.get("point_blob_frac", 0.06) or 0.06)
+
+    # Parent mask for this frame (used to contain children / size point blobs).
+    parent_mask = None
+    if parent_id is not None:
+        try:
+            parent_mask = VideoMaskStorage(pm.video_dir(pid, vid)).load_masks_dense(
+                req.frame_idx
+            ).get(str(parent_id))
+        except Exception as e:
+            logger.warning(f"add_points: could not load parent {parent_id} mask: {e}")
+
+    # ── point-kind sub-object: no SAM call — emit a fixed blob at the clicked point ──
+    if kind == "point" and parent_id is not None:
+        # Center on the last positive point; fall back to the first point given.
+        center = None
+        for pt, lab in zip(req.points, req.labels):
+            if lab == 1:
+                center = pt
+        if center is None and req.points:
+            center = req.points[0]
+        if center is None:
+            return {"frame_idx": req.frame_idx, "masks": {}}
+        if parent_mask is None:
+            blob = np.zeros((video["height"], video["width"]), dtype=np.uint8)
+        else:
+            blob = hierarchy.point_blob_mask(center, parent_mask, blob_frac).astype(np.uint8)
+        raw_masks = {str(oid): blob}
+        _persist_merged_masks_for_frame(pid, vid, req.frame_idx, raw_masks)
+        mask_b64 = {
+            str(oid): encode_mask_as_png(blob, _get_instance_color(str(oid), objects))
+        }
+        return {"frame_idx": req.frame_idx, "masks": mask_b64}
+
+    # ── segmentation sub-object: augment with negative seeds outside the parent ──
+    points = list(req.points)
+    labels = list(req.labels)
+    if kind == "segmentation" and parent_mask is not None:
+        neg = hierarchy.negative_seed_points(parent_mask)
+        if neg:
+            points = points + neg
+            labels = labels + [0] * len(neg)
 
     # Standard single-instance point prompt
     try:
@@ -1988,8 +2037,8 @@ def add_points(pid: str, vid: str, oid: str, req: AddPointsRequest):
             pid, vid,
             frame_idx=req.frame_idx,
             obj_id=sam_oid,
-            points=req.points,
-            labels=req.labels,
+            points=points,
+            labels=labels,
             text=None,  # SAM3 tracker mode doesn't support text with points
         )
     except Exception as e:
@@ -1997,13 +2046,25 @@ def add_points(pid: str, vid: str, oid: str, req: AddPointsRequest):
         logger.error(f"SAM add_points error: {e}\n{traceback.format_exc()}")
         raise HTTPException(500, f"SAM inference error: {e}")
 
-    objects = video["objects"]
     frame_outputs = outputs.get(req.frame_idx, outputs.get(str(req.frame_idx), {}))
     if not frame_outputs and outputs:
         first_key = next(iter(outputs))
         frame_outputs = outputs[first_key]
 
     mask_b64, raw_masks = _encode_masks_from_sam_frame_output(frame_outputs, objects)
+
+    # Hard-clip this child to its parent (strict containment), then re-encode it.
+    if parent_id is not None and parent_mask is not None and str(oid) in raw_masks:
+        clipped = hierarchy._as_bool(raw_masks[str(oid)]) & hierarchy._as_bool(parent_mask)
+        raw_masks[str(oid)] = clipped.astype(np.uint8)
+        mask_b64[str(oid)] = encode_mask_as_png(
+            raw_masks[str(oid)], _get_instance_color(str(oid), objects)
+        )
+    elif parent_id is not None and str(oid) in raw_masks:
+        # Parent has no mask on this frame → drop the child (strict hierarchy).
+        raw_masks[str(oid)] = np.zeros_like(hierarchy._as_bool(raw_masks[str(oid)]), dtype=np.uint8)
+        mask_b64.pop(str(oid), None)
+
     _persist_merged_masks_for_frame(pid, vid, req.frame_idx, raw_masks)
 
     return {"frame_idx": req.frame_idx, "masks": mask_b64}
