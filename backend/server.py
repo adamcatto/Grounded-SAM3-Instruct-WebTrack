@@ -1612,9 +1612,12 @@ def predict_frame(pid: str, vid: str, frame_idx: int):
             sam.register_point_objects(pid, vid, point_sam_ids)
 
         frame_map = sam._frame_maps.get((pid, vid), [])
-        ms = VideoMaskStorage(video_dir)
+        # Point sub-objects are placed geometrically afterward (not tracked by SAM),
+        # so only seed segmentation objects here.
         items: list[tuple[int, str, int, dict]] = []
         for oid_str, fps in all_prompts.items():
+            if objects.get(oid_str, {}).get("kind") == "point":
+                continue
             oid_int = _to_sam_obj_id_from_npz_key(oid_str)
             for fk, prompt in fps.items():
                 f = int(fk)
@@ -1624,17 +1627,8 @@ def predict_frame(pid: str, vid: str, frame_idx: int):
 
         captured: dict = {}  # masks for the target frame seeded directly (if annotated)
         for f, oid_str, oid_int, prompt in items:
-            meta = objects.get(oid_str, {})
-            out = None
-            # Point sub-objects: seed the tiny persisted blob (not a bare point, which
-            # would segment the whole parent) so the tracked region stays localized.
-            if meta.get("kind") == "point":
-                saved = ms.load_masks_dense(f).get(oid_str)
-                if saved is not None and np.asarray(saved).any():
-                    out = sam.add_mask_prompt(pid, vid, frame_idx=f, obj_id=oid_int, mask=np.asarray(saved))
-            if out is None:
-                out = sam.add_points(pid, vid, frame_idx=f, obj_id=oid_int,
-                                     points=prompt["points"], labels=prompt["labels"])
+            out = sam.add_points(pid, vid, frame_idx=f, obj_id=oid_int,
+                                 points=prompt["points"], labels=prompt["labels"])
             if f == frame_idx and out:
                 fo = out.get(frame_idx) or out.get(str(frame_idx)) or {}
                 captured.update(_int_masks_from_fo(fo))
@@ -1681,10 +1675,12 @@ def predict_frame(pid: str, vid: str, frame_idx: int):
         ) or "(none)")
     )
 
-    # Apply sub-object containment, then encode (do NOT persist / mark propagated).
+    # Apply sub-object containment, place point sub-objects geometrically, then encode
+    # (do NOT persist / mark propagated).
     masks_str, _bboxes = _contain_frame_masks(objects, frame_masks_int)
+    _place_point_children(masks_str, None, objects, all_prompts, video_dir, frame_idx)
     logger.info(
-        f"predict_frame {frame_idx}: after containment: " + (", ".join(
+        f"predict_frame {frame_idx}: after containment+placement: " + (", ".join(
             f"obj{oid}={int(np.asarray(m).sum())}px" for oid, m in sorted(masks_str.items())
         ) or "(none)")
     )
@@ -2007,6 +2003,73 @@ def _contain_frame_masks(objects: dict, frame_masks_int: dict) -> tuple[dict, di
             box, score = bbox_norm_xywh_score_from_mask(v)
             bboxes[k] = box + [score]
     return masks_u8, bboxes
+
+
+def _place_point_children(
+    masks: dict, bboxes: dict | None, objects: dict, all_prompts: dict,
+    video_dir, target_frame: int,
+) -> None:
+    """Position 'point' sub-objects geometrically rather than via SAM tracking.
+
+    A keypoint (e.g. an eye) is placed at the same position RELATIVE to its parent's
+    bounding box that it had on the nearest frame where it was labeled, using the
+    parent's predicted mask on *target_frame*.  This is far more robust than tracking
+    a keypoint as its own SAM object (which tends to grab the whole parent or drift),
+    and needs no SAM state for the child at all.  Mutates *masks* (str-keyed uint8)
+    and, if given, *bboxes* in place.
+    """
+    ms = VideoMaskStorage(video_dir)
+    for oid in iter_objects_topdown(objects):  # parents before children
+        meta = objects.get(oid, {})
+        if meta.get("kind") != "point":
+            continue
+        # Default: remove any SAM-derived mask for this point child; re-add if placeable.
+        masks.pop(oid, None)
+        if bboxes is not None:
+            bboxes.pop(oid, None)
+        parent_id = meta.get("parent_id")
+        if parent_id is None:
+            continue
+        parent_F = masks.get(str(parent_id))
+        if parent_F is None:
+            continue
+        parent_F_b = hierarchy._as_bool(parent_F)
+        if not parent_F_b.any():
+            continue
+        child_prompts = all_prompts.get(oid, {})
+        if not child_prompts:
+            continue
+        # Nearest labeled frame for this child and its keypoint (last positive point).
+        labeled = sorted(int(fk) for fk in child_prompts.keys())
+        a_frame = min(labeled, key=lambda f: abs(f - target_frame))
+        pr = child_prompts[str(a_frame)]
+        kpt = None
+        for p, lab in zip(pr.get("points", []), pr.get("labels", [])):
+            if lab == 1:
+                kpt = p
+        if kpt is None and pr.get("points"):
+            kpt = pr["points"][0]
+        if kpt is None:
+            continue
+        frac = float(meta.get("point_blob_frac", 0.06) or 0.06)
+        # Map the keypoint through the parent's bbox change (labeled frame → target).
+        parent_A = ms.load_masks_dense(a_frame).get(str(parent_id))
+        if parent_A is not None and hierarchy._as_bool(parent_A).any():
+            (ax, ay, aw, ah), _ = bbox_norm_xywh_score_from_mask(hierarchy._as_bool(parent_A))
+            (fx, fy, fw, fh), _ = bbox_norm_xywh_score_from_mask(parent_F_b)
+            relx = (kpt[0] - ax) / aw if aw > 0 else 0.5
+            rely = (kpt[1] - ay) / ah if ah > 0 else 0.5
+            kx = fx + relx * fw
+            ky = fy + rely * fh
+        else:
+            kx, ky = kpt[0], kpt[1]
+        blob = hierarchy.point_blob_mask((kx, ky), parent_F_b, frac)
+        if not blob.any():
+            continue
+        masks[oid] = blob.astype(np.uint8)
+        if bboxes is not None:
+            box, score = bbox_norm_xywh_score_from_mask(blob)
+            bboxes[oid] = box + [score]
 
 
 def _full_ann_session_reinit_and_replay(
@@ -3024,9 +3087,13 @@ async def _run_propagation_bg(
 
                 for real_frame, (frame_masks, frame_bboxes) in sorted(frame_results.items()):
                     if frame_masks:
-                        # Enforce sub-object containment (clip children to parents,
-                        # reshape point children to blobs) before persisting.
+                        # Enforce sub-object containment (clip children to parents),
+                        # then place point sub-objects geometrically relative to the
+                        # parent bbox (more robust than SAM-tracking a keypoint).
                         masks_str, bboxes_str = _contain_propagation_frame(frame_masks)
+                        _place_point_children(
+                            masks_str, bboxes_str, objects, all_prompts, video_dir, real_frame,
+                        )
                         await loop.run_in_executor(
                             None,
                             _persist_propagation_frame,
