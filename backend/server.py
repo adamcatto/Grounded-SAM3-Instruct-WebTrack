@@ -1546,6 +1546,9 @@ class AddObjectRequest(BaseModel):
     description: str = ""
     min_instances: int = 1
     max_instances: int = 1
+    parent_id: Optional[str] = None
+    kind: str = "segmentation"
+    point_blob_frac: float = 0.06
 
 
 @app.post("/api/projects/{pid}/videos/{vid}/objects", status_code=201)
@@ -1553,12 +1556,18 @@ def add_object(pid: str, vid: str, req: AddObjectRequest):
     video = pm.get_video(pid, vid)
     if video is None:
         raise HTTPException(404, "Video not found")
-    return pm.add_object(
-        pid, vid, req.name, req.color,
-        description=req.description,
-        min_instances=req.min_instances,
-        max_instances=req.max_instances,
-    )
+    try:
+        return pm.add_object(
+            pid, vid, req.name, req.color,
+            description=req.description,
+            min_instances=req.min_instances,
+            max_instances=req.max_instances,
+            parent_id=req.parent_id,
+            kind=req.kind,
+            point_blob_frac=req.point_blob_frac,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
 class UpdateObjectRequest(BaseModel):
@@ -1567,25 +1576,37 @@ class UpdateObjectRequest(BaseModel):
     description: Optional[str] = None
     min_instances: Optional[int] = None
     max_instances: Optional[int] = None
+    parent_id: Optional[str] = None
+    kind: Optional[str] = None
+    point_blob_frac: Optional[float] = None
+    visible: Optional[bool] = None
 
 
 @app.patch("/api/projects/{pid}/videos/{vid}/objects/{oid}")
 def update_object(pid: str, vid: str, oid: str, req: UpdateObjectRequest):
+    # Note: `visible` is a real boolean field, so filtering on `is not None` keeps it;
+    # callers that want to clear parent_id (re-parent to root) must use a dedicated path.
     updates = {k: v for k, v in req.model_dump().items() if v is not None}
     if "name" in updates:
         pm.rename_object(pid, vid, oid, updates.pop("name"))
     if updates:
-        pm.update_object(pid, vid, oid, **updates)
+        try:
+            pm.update_object(pid, vid, oid, **updates)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
     return {"status": "ok"}
 
 
 @app.delete("/api/projects/{pid}/videos/{vid}/objects/{oid}", status_code=204)
 def remove_object(pid: str, vid: str, oid: str):
-    try:
-        sam.remove_object(pid, vid, int(oid))
-    except Exception:
-        pass
-    pm.remove_object(pid, vid, oid)
+    # Recursively removes the object and its descendants from config; mirror that on
+    # the SAM session so every removed id stops being tracked.
+    removed = pm.remove_object(pid, vid, oid)
+    for rid in removed:
+        try:
+            sam.remove_object(pid, vid, int(rid))
+        except Exception:
+            pass
 
 
 class RestoreObjectRequest(BaseModel):

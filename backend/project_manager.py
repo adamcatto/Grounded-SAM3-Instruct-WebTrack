@@ -51,6 +51,63 @@ OBJECT_COLORS = [
 ]
 
 
+# ─── Object hierarchy helpers ────────────────────────────────────────────────
+# Objects are stored flat (keyed by string id); the tree is expressed via each
+# object's optional "parent_id" field.  These helpers derive the tree on demand.
+
+def children_of(objects: dict, oid: str) -> list[str]:
+    """Direct children ids of *oid* (objects whose parent_id == oid)."""
+    oid = str(oid)
+    return [
+        str(k) for k, o in objects.items()
+        if str(o.get("parent_id")) == oid and o.get("parent_id") is not None
+    ]
+
+
+def _descendant_ids(objects: dict, oid: str) -> set[str]:
+    """All transitive descendants of *oid* (not including oid itself)."""
+    out: set[str] = set()
+    stack = list(children_of(objects, oid))
+    while stack:
+        cur = stack.pop()
+        if cur in out:
+            continue
+        out.add(cur)
+        stack.extend(children_of(objects, cur))
+    return out
+
+
+def iter_objects_topdown(objects: dict) -> list[str]:
+    """Object ids ordered parents-before-children (BFS by depth).
+
+    Containment cascades rely on this: clipping a child to its parent only works
+    if the parent has already been clipped to *its* parent.  Orphans (parent_id
+    pointing at a missing object) are treated as roots so nothing is dropped.
+    """
+    ids = [str(k) for k in objects.keys()]
+    id_set = set(ids)
+
+    def is_root(oid: str) -> bool:
+        p = objects[oid].get("parent_id")
+        return p is None or str(p) not in id_set
+
+    ordered: list[str] = []
+    seen: set[str] = set()
+    queue = [oid for oid in ids if is_root(oid)]
+    while queue:
+        cur = queue.pop(0)
+        if cur in seen:
+            continue
+        seen.add(cur)
+        ordered.append(cur)
+        queue.extend(children_of(objects, cur))
+    # Safety net: append any ids not reached (e.g. cycles) so callers see them all.
+    for oid in ids:
+        if oid not in seen:
+            ordered.append(oid)
+    return ordered
+
+
 class ProjectManager:
     def __init__(self):
         self._root_lock = threading.Lock()
@@ -415,11 +472,26 @@ class ProjectManager:
         description: str = "",
         min_instances: int = 1,
         max_instances: int = 1,
+        parent_id: Optional[str] = None,
+        kind: str = "segmentation",
+        point_blob_frac: float = 0.06,
     ) -> dict:
         config = self.get_project(pid)
         if config is None or vid not in config["videos"]:
             raise ValueError(f"Video {vid} not found")
-        existing_ids = list(config["videos"][vid]["objects"].keys())
+        objects = config["videos"][vid]["objects"]
+        # Hierarchy validation: parent must exist (top-level objects pass parent_id=None).
+        if parent_id is not None:
+            parent_id = str(parent_id)
+            if parent_id not in objects:
+                raise ValueError(f"Parent object {parent_id} not found in video {vid}")
+        # Only point/segmentation kinds are supported; top-level objects are always
+        # full segmentations (the "point" blob only makes sense inside a parent).
+        if kind not in ("segmentation", "point"):
+            raise ValueError(f"Invalid object kind: {kind}")
+        if parent_id is None:
+            kind = "segmentation"
+        existing_ids = list(objects.keys())
         new_id = str(len(existing_ids) + 1)
         while new_id in existing_ids:
             new_id = str(int(new_id) + 1)
@@ -433,6 +505,10 @@ class ProjectManager:
             "description": description,
             "min_instances": min_instances,
             "max_instances": max_instances,
+            "parent_id": parent_id,
+            "kind": kind,
+            "point_blob_frac": float(point_blob_frac),
+            "visible": True,
         }
         config["videos"][vid]["objects"][new_id] = obj
         # Initialize instance_groups entry: first SAM obj_id slot = int(new_id)
@@ -446,25 +522,45 @@ class ProjectManager:
         config = self.get_project(pid)
         if config is None or vid not in config["videos"]:
             raise ValueError(f"Video {vid} not found")
-        obj = config["videos"][vid]["objects"].get(obj_id)
+        objects = config["videos"][vid]["objects"]
+        obj = objects.get(obj_id)
         if obj is None:
             raise ValueError(f"Object {obj_id} not found in video {vid}")
-        allowed = {"name", "color", "description", "min_instances", "max_instances"}
+        allowed = {
+            "name", "color", "description", "min_instances", "max_instances",
+            "parent_id", "kind", "point_blob_frac", "visible",
+        }
+        # Re-parenting cycle guard: a node may not become a child of itself or of any
+        # of its own descendants.
+        if "parent_id" in kwargs and kwargs["parent_id"] is not None:
+            new_parent = str(kwargs["parent_id"])
+            if new_parent not in objects:
+                raise ValueError(f"Parent object {new_parent} not found in video {vid}")
+            if new_parent == obj_id or new_parent in _descendant_ids(objects, obj_id):
+                raise ValueError(f"Cannot set parent of {obj_id} to {new_parent} (would form a cycle)")
+            kwargs["parent_id"] = new_parent
         for k, v in kwargs.items():
             if k in allowed:
                 obj[k] = v
         self._save_config(pid, config)
         return obj
 
-    def remove_object(self, pid: str, vid: str, obj_id: str):
+    def remove_object(self, pid: str, vid: str, obj_id: str) -> list[str]:
+        """Remove *obj_id* and all of its descendants. Returns the removed ids."""
         config = self.get_project(pid)
         if config is None or vid not in config["videos"]:
             raise ValueError(f"Video {vid} not found")
-        config["videos"][vid]["objects"].pop(obj_id, None)
-        config["videos"][vid]["point_prompts"].pop(obj_id, None)
+        objects = config["videos"][vid]["objects"]
+        obj_id = str(obj_id)
+        removed = [obj_id] + sorted(_descendant_ids(objects, obj_id))
+        point_prompts = config["videos"][vid].get("point_prompts", {})
         igs = config["videos"][vid].get("instance_groups") or {}
-        igs.pop(obj_id, None)
+        for rid in removed:
+            objects.pop(rid, None)
+            point_prompts.pop(rid, None)
+            igs.pop(rid, None)
         self._save_config(pid, config)
+        return removed
 
     def restore_object_entry(
         self,
