@@ -20,6 +20,7 @@ export type ViewerTab = 'annotate' | 'player' | 'inference' | 'config'
 export interface AppConfig {
   usePrevFrameMask: boolean
   showMasks: boolean
+  showMaskLabels: boolean   // draw object-name labels on masks
   maskOpacity: number   // 0–1
   pointSize: number     // scale factor relative to default (1.0)
   useAllAnchors: boolean  // default tracking method when anchor frames are labeled
@@ -34,6 +35,7 @@ const CONFIG_KEY = 'sam3wt_config'
 const CONFIG_DEFAULTS: AppConfig = {
   usePrevFrameMask: true,
   showMasks: true,
+  showMaskLabels: true,
   maskOpacity: 0.85,
   pointSize: 1.0,
   useAllAnchors: false,

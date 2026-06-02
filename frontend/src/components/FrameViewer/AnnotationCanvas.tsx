@@ -111,12 +111,12 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
     // The stale flag prevents a superseded async draw from clobbering a newer
     // render that already ran its cleanup.
     let stale = false
-    drawMasks(ctx, masksToDraw, width, height, config.maskOpacity, objectNames, config.showMasks).then(() => {
+    drawMasks(ctx, masksToDraw, width, height, config.maskOpacity, objectNames, config.showMasks && config.showMaskLabels).then(() => {
       if (stale) return
       drawPoints(ctx, allPoints, width, height, config.pointSize)
     })
     return () => { stale = true }
-  }, [width, height, masksToShow, localAnnotations, currentFrame, config.showMasks, config.maskOpacity, config.pointSize, objectNames, objectVisibility, pointVisibility])
+  }, [width, height, masksToShow, localAnnotations, currentFrame, config.showMasks, config.showMaskLabels, config.maskOpacity, config.pointSize, objectNames, objectVisibility, pointVisibility])
 
   // ── Load saved masks when frame changes ───────────────────────────────────
   // No debounce: start the fetch on the very next event loop tick.

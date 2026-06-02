@@ -447,6 +447,12 @@ export default function ConfigPanel() {
             value={config.showMasks}
             onChange={v => setConfig({ showMasks: v })}
           />
+          <ToggleRow
+            label="Show object names"
+            description="Draw object-name labels on masks. Turn off to see small masks (e.g. point sub-objects) clearly."
+            value={config.showMaskLabels}
+            onChange={v => setConfig({ showMaskLabels: v })}
+          />
           <SliderRow
             label="Mask opacity"
             description="Transparency of mask overlays. Lower values let the underlying frame show through."
