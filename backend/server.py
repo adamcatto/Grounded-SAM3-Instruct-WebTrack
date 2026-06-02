@@ -34,7 +34,7 @@ from anchor_helpers import (
     normalize_anchor_batch_size,
     video_anchor_batch_size,
 )
-from project_manager import ProjectManager
+from project_manager import ProjectManager, iter_objects_topdown
 from sam_predictor import SAMPredictor, _get_predictor
 from mask_store import VideoMaskStorage
 import hierarchy
@@ -50,6 +50,7 @@ from video_processor import (
     extract_frame_range,
     generate_thumbnail,
     get_video_info,
+    bbox_norm_xywh_score_from_mask,
 )
 
 
@@ -2619,6 +2620,56 @@ async def _run_propagation_bg(
                 frame_bboxes[int(oid)] = (b + [score]) if b else []
         return real_frame, frame_masks, frame_bboxes
 
+    def _contain_propagation_frame(frame_masks_int: dict) -> tuple[dict, dict]:
+        """Apply sub-object containment to one propagated frame.
+
+        Walks the object tree top-down: segmentation children are hard-clipped to
+        their (already-clipped) parent; point children are reduced to a fixed blob
+        at their tracked centroid, sized to the parent bbox.  Parent-less / missing
+        parents drop the child.  Returns (str-keyed uint8 masks, str-keyed bboxes
+        recomputed from the final masks so boxes match the clipped regions).
+        """
+        str_masks: dict[str, np.ndarray] = {}
+        for sam_oid, m in frame_masks_int.items():
+            key = _obj_config_key_from_sam_oid(objects, int(sam_oid))
+            str_masks[key] = m
+
+        final: dict[str, np.ndarray] = {}
+        for oid in iter_objects_topdown(objects):
+            if oid not in str_masks:
+                continue
+            m = hierarchy._as_bool(str_masks[oid])
+            meta = objects.get(oid, {})
+            parent_id = meta.get("parent_id")
+            if parent_id is not None:
+                parent_m = final.get(str(parent_id))
+                if parent_m is None or not parent_m.any():
+                    m = np.zeros_like(m, dtype=bool)
+                elif meta.get("kind") == "point":
+                    frac = float(meta.get("point_blob_frac", 0.06) or 0.06)
+                    c = hierarchy.centroid_norm(m)
+                    m = (
+                        np.zeros_like(m, dtype=bool) if c is None
+                        else hierarchy.point_blob_mask(c, parent_m, frac)
+                    )
+                else:
+                    if parent_m.shape != m.shape:
+                        parent_m = hierarchy._resize_bool(parent_m, m.shape)
+                    m = m & parent_m
+            final[oid] = m
+        # Defensive: keep masks for ids not present in the object config.
+        for oid, m in str_masks.items():
+            if oid not in final:
+                final[oid] = hierarchy._as_bool(m)
+
+        masks_u8 = {k: v.astype(np.uint8) for k, v in final.items()}
+        bboxes: dict[str, list] = {}
+        for k, v in final.items():
+            if v.any():
+                box, score = bbox_norm_xywh_score_from_mask(v)
+                bboxes[k] = box + [score]
+        return masks_u8, bboxes
+
     try:
         for batch_idx, (P1, P2) in enumerate(batches):
             if state.is_paused:
@@ -2773,12 +2824,15 @@ async def _run_propagation_bg(
 
                 for real_frame, (frame_masks, frame_bboxes) in sorted(frame_results.items()):
                     if frame_masks:
+                        # Enforce sub-object containment (clip children to parents,
+                        # reshape point children to blobs) before persisting.
+                        masks_str, bboxes_str = _contain_propagation_frame(frame_masks)
                         await loop.run_in_executor(
                             None,
                             _persist_propagation_frame,
                             real_frame,
-                            dict(frame_masks),
-                            dict(frame_bboxes),
+                            masks_str,
+                            bboxes_str,
                         )
                     total_propagated += 1
                     progress = (start_frame + total_propagated) / num_frames
