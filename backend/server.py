@@ -1623,8 +1623,10 @@ def predict_frame(pid: str, vid: str, frame_idx: int):
     if fo:
         frame_masks_int = _int_masks_from_fo(fo)
     else:
-        # Propagate from the nearest annotated frame to the target (both directions
-        # so a target before or after the anchors is reached).
+        # Propagate from the nearest annotated frame to the target.  SAM's frame
+        # indices are positions in the sparse annotated session, so direction +
+        # max_frame_num_to_track are derived from those positions (mirrors the
+        # anchor-remainder predictor).
         frame_map = sam._frame_maps.get((pid, vid), [])
         annotated_in_session = sorted(
             int(f) for f in {int(fk) for fp in all_prompts.values() for fk in fp.keys()}
@@ -1633,29 +1635,35 @@ def predict_frame(pid: str, vid: str, frame_idx: int):
         if not annotated_in_session:
             raise HTTPException(400, "No annotated frames are loaded in the session.")
         start_from = min(annotated_in_session, key=lambda f: abs(f - frame_idx))
+        try:
+            start_sam = frame_map.index(start_from)
+            tgt_sam = frame_map.index(frame_idx)
+        except ValueError as e:
+            raise HTTPException(500, f"Frame map missing start/target: {e}")
+        direction = "forward" if tgt_sam > start_sam else "backward"
+        max_track = abs(tgt_sam - start_sam)
 
         def _run_predict_pass():
+            # SAM3 may yield the target frame more than once (an initial pass with
+            # unconfirmed/empty masks, then a refined pass).  Keep the LAST non-empty
+            # result instead of breaking on the first occurrence.
+            last_fm: dict = {}
             for item in sam.propagate_stream(
-                pid, vid, start_frame_idx=start_from, propagation_direction="both",
+                pid, vid,
+                start_frame_idx=start_from,
+                propagation_direction=direction,
+                max_frame_num_to_track=max_track,
             ):
-                sam_idx = item.get("frame_index")
-                real_idx = sam.to_real_idx(pid, vid, sam_idx) if sam_idx is not None else -1
-                if real_idx != frame_idx:
-                    continue
-                outputs = item.get("outputs", {})
-                if "out_obj_ids" in outputs:
-                    return outputs
-                for v in outputs.values():
-                    if isinstance(v, dict) and "out_obj_ids" in v:
-                        return v
-            return {}
+                real_frame, fm, _fb = _extract_frame_masks_bboxes(pid, vid, item)
+                if real_frame == frame_idx and fm:
+                    last_fm = dict(fm)
+            return last_fm
 
         try:
-            fo = _run_predict_pass()
+            frame_masks_int = _run_predict_pass()
         except Exception as e:
             logger.error(f"predict_frame propagation failed: {e}", exc_info=True)
             raise HTTPException(500, f"Prediction failed: {e}")
-        frame_masks_int = _int_masks_from_fo(fo)
 
     # Apply sub-object containment, then encode (do NOT persist / mark propagated).
     masks_str, _bboxes = _contain_frame_masks(objects, frame_masks_int)
