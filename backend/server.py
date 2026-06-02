@@ -34,7 +34,7 @@ from anchor_helpers import (
     normalize_anchor_batch_size,
     video_anchor_batch_size,
 )
-from project_manager import ProjectManager, iter_objects_topdown
+from project_manager import ProjectManager, iter_objects_topdown, _descendant_ids
 from sam_predictor import SAMPredictor, _get_predictor
 from mask_store import VideoMaskStorage
 import hierarchy
@@ -2251,6 +2251,14 @@ def add_points(pid: str, vid: str, oid: str, req: AddPointsRequest):
         # Parent has no mask on this frame → drop the child (strict hierarchy).
         raw_masks[str(oid)] = np.zeros_like(hierarchy._as_bool(raw_masks[str(oid)]), dtype=np.uint8)
         mask_b64.pop(str(oid), None)
+
+    # Annotating an object must NOT natively produce masks for its descendants:
+    # a sub-object is only predicted from its own point prompts.  SAM can surface
+    # tracked descendants in this frame's output, so drop them here (their own
+    # saved masks, from their own annotations, are left untouched).
+    for d in _descendant_ids(objects, str(oid)):
+        raw_masks.pop(d, None)
+        mask_b64.pop(d, None)
 
     _persist_merged_masks_for_frame(pid, vid, req.frame_idx, raw_masks)
 
