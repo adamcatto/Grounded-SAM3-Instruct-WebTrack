@@ -25,6 +25,7 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
     config,
     anchorPhase,
     addToast,
+    objectVisibility, isObjectVisible,
   } = store
 
   const [hoverLabel, setHoverLabel] = useState<string | null>(null)
@@ -87,7 +88,10 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
     canvas.height = height
     ctx.clearRect(0, 0, width, height)
 
-    const masksToDraw = config.showMasks ? masksToShow : {}
+    // Respect per-object visibility (cascade-aware: hidden if any ancestor is hidden).
+    const masksToDraw = config.showMasks
+      ? Object.fromEntries(Object.entries(masksToShow).filter(([oid]) => isObjectVisible(oid)))
+      : {}
 
     // Collect points for current frame
     const allPoints: { x: number; y: number; label: 0 | 1 }[] = []
@@ -109,7 +113,7 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
       drawPoints(ctx, allPoints, width, height, config.pointSize)
     })
     return () => { stale = true }
-  }, [width, height, masksToShow, localAnnotations, currentFrame, config.showMasks, config.maskOpacity, config.pointSize, objectNames])
+  }, [width, height, masksToShow, localAnnotations, currentFrame, config.showMasks, config.maskOpacity, config.pointSize, objectNames, objectVisibility])
 
   // ── Load saved masks when frame changes ───────────────────────────────────
   // No debounce: start the fetch on the very next event loop tick.

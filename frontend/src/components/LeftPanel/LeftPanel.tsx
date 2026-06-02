@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState, useCallback } from 'react'
 import { Plus, RotateCcw, ChevronRight, ChevronDown, Loader, Download, X, Pause, Play, SkipBack, SkipForward, Trash2, GripVertical, ArrowLeftRight, Undo2, Redo2 } from 'lucide-react'
 import { useStore, currentVideo as selectCurrentVideo } from '../../store/useStore'
 import {
-  addObject, initSession, startPropagationSSE, startExportSSE, getProject, resetVideo,
+  addObject, addSubObject, initSession, startPropagationSSE, startExportSSE, getProject, resetVideo,
   clearFrameMasks, clearMasksBulk, getPropagationStatus, pausePropagation, updateVideoMeta,
   resumeFromFrame, getAnchorFrames, commitAnchorFrame, swapObjectMasks,
   startAnchorRemainderPredictionSSE,
@@ -26,7 +26,7 @@ import {
 import NumericDraftInput from '../NumericDraftInput'
 import ObjectCard from './ObjectCard'
 import StepIndicator from './StepIndicator'
-import type { PropagationEvent } from '../../types'
+import type { PropagationEvent, ObjectKind } from '../../types'
 
 function targetIsTypingContext(target: EventTarget | null): boolean {
   const el = target instanceof HTMLElement ? target : null
@@ -73,6 +73,11 @@ export default function LeftPanel() {
 
   const [addingObject, setAddingObject] = useState(false)
   const [newObjName, setNewObjName] = useState('')
+  // Sub-object add form (keyed by the parent object being added to)
+  const [subParentId, setSubParentId] = useState<string | null>(null)
+  const [subName, setSubName] = useState('')
+  const [subKind, setSubKind] = useState<ObjectKind>('segmentation')
+  const [subBlobFrac, setSubBlobFrac] = useState(0.06)
   const [initializingSession, setInitializingSession] = useState(false)
   const [trackingError, setTrackingError] = useState('')
   const [trackingRetryMsg, setTrackingRetryMsg] = useState('')
@@ -220,6 +225,26 @@ export default function LeftPanel() {
     setCurrentObject(obj.id)
     setNewObjName('')
     setAddingObject(false)
+  }
+
+  function openSubForm(parentId: string) {
+    setSubParentId(parentId)
+    setSubName('')
+    setSubKind('segmentation')
+    setSubBlobFrac(0.06)
+  }
+
+  async function handleAddSubObject() {
+    if (!subParentId || !subName.trim()) return
+    const color = getObjectColor(objects.length)
+    const obj = await addSubObject(pid, vid, subParentId, subName.trim(), subKind, {
+      color,
+      point_blob_frac: subKind === 'point' ? subBlobFrac : undefined,
+    })
+    updateVideo({ objects: { ...(video?.objects ?? {}), [obj.id]: obj } })
+    setCurrentObject(obj.id)
+    setSubParentId(null)
+    setSubName('')
   }
 
   // ── Session Init ─────────────────────────────────────────────────────────────
@@ -1264,6 +1289,90 @@ export default function LeftPanel() {
     Array.from({ length: manualNAnchors }, (_, i) => i).every(i => annotatedAnchorIndices.includes(i)) &&
     anchorFrames.some((_, idx) => idx >= manualNAnchors && !annotatedAnchorIndices.includes(idx))
 
+  // ── Object tree rendering ─────────────────────────────────────────────────────
+
+  const objsById = video.objects
+  const childrenOfParent = (parentId: string | null) =>
+    Object.values(objsById)
+      .filter(o => (o.parent_id ?? null) === parentId)
+      .sort((a, b) => Number(a.id) - Number(b.id))
+
+  const subObjectForm = (parentId: string) => (
+    <div className="rounded-lg border border-[#333] bg-[#141414] p-2.5 ml-3.5" onClick={e => e.stopPropagation()}>
+      <p className="text-[10px] text-[#666] mb-1.5 uppercase tracking-wide">New sub-object</p>
+      <input
+        type="text"
+        value={subName}
+        onChange={e => setSubName(e.target.value)}
+        onKeyDown={e => {
+          if (e.key === 'Enter') handleAddSubObject()
+          if (e.key === 'Escape') setSubParentId(null)
+        }}
+        placeholder="e.g. head, left-ear, snout..."
+        className="w-full mb-2 text-xs"
+        autoFocus
+      />
+      <div className="flex gap-1.5 mb-2">
+        {(['segmentation', 'point'] as ObjectKind[]).map(k => (
+          <button
+            key={k}
+            onClick={() => setSubKind(k)}
+            className={`flex-1 text-[11px] py-1 rounded-md border transition-colors
+              ${subKind === k
+                ? 'bg-blue-600 border-blue-500 text-white'
+                : 'border-[#333] text-[#888] hover:border-[#555]'}`}
+          >
+            {k === 'segmentation' ? 'Segmentation' : 'Point'}
+          </button>
+        ))}
+      </div>
+      {subKind === 'point' && (
+        <label className="block text-[10px] text-[#666] mb-2">
+          Blob size: {(subBlobFrac * 100).toFixed(0)}% of parent
+          <input
+            type="range" min={0.02} max={0.25} step={0.01}
+            value={subBlobFrac}
+            onChange={e => setSubBlobFrac(parseFloat(e.target.value))}
+            className="w-full mt-1"
+          />
+        </label>
+      )}
+      <div className="flex gap-2">
+        <button
+          onClick={() => setSubParentId(null)}
+          className="btn btn-secondary flex-1 text-xs py-1"
+        >
+          Cancel
+        </button>
+        <button
+          onClick={handleAddSubObject}
+          disabled={!subName.trim()}
+          className="btn btn-primary flex-1 text-xs py-1"
+        >
+          Add
+        </button>
+      </div>
+    </div>
+  )
+
+  const renderObjectNode = (obj: typeof objsById[string], depth: number): React.ReactNode => (
+    <React.Fragment key={obj.id}>
+      <ObjectCard
+        objId={obj.id}
+        name={obj.name}
+        color={obj.color}
+        isActive={currentObjectId === obj.id}
+        onSelect={() => setCurrentObject(currentObjectId === obj.id ? null : obj.id)}
+        description={obj.description}
+        depth={depth}
+        kind={obj.kind ?? 'segmentation'}
+        onAddSub={!isTracking && !anchorPhase ? () => openSubForm(obj.id) : undefined}
+      />
+      {subParentId === obj.id && subObjectForm(obj.id)}
+      {childrenOfParent(obj.id).map(child => renderObjectNode(child, depth + 1))}
+    </React.Fragment>
+  )
+
   // ── Render ───────────────────────────────────────────────────────────────────
 
   return (
@@ -1344,21 +1453,9 @@ export default function LeftPanel() {
         </div>
       )}
 
-      {/* Objects list */}
+      {/* Objects list (hierarchical: top-level objects + nested sub-objects) */}
       <div className="flex-1 overflow-y-auto p-3 space-y-2">
-        {objects.map(obj => (
-          <ObjectCard
-            key={obj.id}
-            objId={obj.id}
-            name={obj.name}
-            color={obj.color}
-            isActive={currentObjectId === obj.id}
-            onSelect={() => {
-              setCurrentObject(currentObjectId === obj.id ? null : obj.id)
-            }}
-            description={obj.description}
-          />
-        ))}
+        {childrenOfParent(null).map(obj => renderObjectNode(obj, 0))}
 
         {/* Add new object */}
         {!isTracking && !anchorPhase && (

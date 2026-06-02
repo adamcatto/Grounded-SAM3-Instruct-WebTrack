@@ -1,8 +1,9 @@
 import React, { useState, useEffect } from 'react'
-import { Pencil, Trash2, MousePointer, MinusCircle, Check, ChevronDown, ChevronUp, Save, Loader } from 'lucide-react'
+import { Pencil, Trash2, MousePointer, MinusCircle, Check, ChevronDown, ChevronUp, Save, Loader, Eye, EyeOff, ZoomIn, ZoomOut, Plus } from 'lucide-react'
 import { useStore } from '../../store/useStore'
 import { renameObject, removeObject, clearObjectFramePoints, updateObject, rebuildFromConfig, replaceFramePromptsData, restoreObjectSnapshot, getSavedMask } from '../../api/client'
 import { applyRebuildMasksToStore, localAnnotationsToPointPrompts } from '../../history/applyRebuild'
+import type { ObjectKind } from '../../types'
 
 interface Props {
   objId: string
@@ -11,16 +12,26 @@ interface Props {
   isActive: boolean
   onSelect: () => void
   description?: string
+  /** Nesting depth (0 = top-level); used for indentation. */
+  depth?: number
+  /** 'point' sub-objects render a small keypoint badge. */
+  kind?: ObjectKind
+  /** Opens the "add sub-object" form for this object in the parent panel. */
+  onAddSub?: () => void
 }
 
-export default function ObjectCard({ objId, name, color, isActive, onSelect, description }: Props) {
+export default function ObjectCard({ objId, name, color, isActive, onSelect, description, depth = 0, kind = 'segmentation', onAddSub }: Props) {
   const {
     project, currentVideoId, currentFrame,
     pointMode, setPointMode, setCurrentObject,
     clearLocalPoints, clearLocalPointsForFrame, setCurrentFrameMasks, currentFrameMasks,
     savedMaskCache, setSavedMask,
     addToast,
+    toggleObjectVisibility, isObjectVisible, setZoomToObject, zoomToObjectId,
   } = useStore()
+
+  const visible = isObjectVisible(objId)
+  const isZoomTarget = zoomToObjectId === objId
 
   const [editing, setEditing] = useState(false)
   const [editName, setEditName] = useState(name)
@@ -49,7 +60,8 @@ export default function ObjectCard({ objId, name, color, isActive, onSelect, des
     useStore.getState().updateVideo({
       objects: {
         ...o,
-        [objId]: { id: objId, name: nextName, color, description },
+        // Preserve hierarchy fields (parent_id/kind/...) — only the name changes.
+        [objId]: { ...(o?.[objId] ?? { id: objId, name, color, description }), name: nextName },
       },
     })
     useStore.getState().pushHistory({
@@ -141,24 +153,40 @@ export default function ObjectCard({ objId, name, color, isActive, onSelect, des
       : {}
     const ig = (v as { instance_groups?: Record<string, number[]> }).instance_groups?.[objId]
 
+    // Backend removal cascades to descendants — mirror that in the store.
+    const allObjsNow = useStore.getState().project?.videos[vid]?.objects ?? {}
+    const removedIds = new Set<string>([objId])
+    {
+      const stack = [objId]
+      while (stack.length) {
+        const cur = stack.pop() as string
+        for (const [k, o] of Object.entries(allObjsNow)) {
+          if (o.parent_id != null && String(o.parent_id) === cur && !removedIds.has(k)) {
+            removedIds.add(k)
+            stack.push(k)
+          }
+        }
+      }
+    }
+
     setRemoving(true)
     try {
       await removeObject(pid, vid, objId)
-      clearLocalPoints(objId)
+      for (const rid of removedIds) clearLocalPoints(rid)
       const newMasks = { ...useStore.getState().currentFrameMasks }
-      delete newMasks[objId]
+      for (const rid of removedIds) delete newMasks[rid]
       useStore.getState().setCurrentFrameMasks(newMasks, useStore.getState().currentFrameMasksFrame ?? useStore.getState().currentFrame)
       useStore.getState().updateVideo({
         objects: Object.fromEntries(
-          Object.entries(useStore.getState().project?.videos[vid]?.objects ?? {}).filter(([k]) => k !== objId)
+          Object.entries(useStore.getState().project?.videos[vid]?.objects ?? {}).filter(([k]) => !removedIds.has(k))
         ),
         point_prompts: (() => {
           const pp = { ...useStore.getState().project?.videos[vid]?.point_prompts }
-          delete pp[objId]
+          for (const rid of removedIds) delete pp[rid]
           return pp
         })(),
       })
-      if (useStore.getState().currentObjectId === objId) {
+      if (removedIds.has(useStore.getState().currentObjectId ?? '')) {
         setCurrentObject(null)
       }
 
@@ -304,7 +332,8 @@ export default function ObjectCard({ objId, name, color, isActive, onSelect, des
         ${isActive
           ? 'border-[#444] bg-[#1e1e1e]'
           : 'border-[#2a2a2a] bg-[#161616] hover:border-[#333] hover:bg-[#1a1a1a]'
-        }`}
+        } ${!visible ? 'opacity-50' : ''}`}
+      style={depth > 0 ? { marginLeft: depth * 14, borderLeft: `2px solid ${color}66` } : undefined}
       onClick={onSelect}
     >
       {/* Top row: color swatch + name */}
@@ -334,12 +363,33 @@ export default function ObjectCard({ objId, name, color, isActive, onSelect, des
               onClick={e => e.stopPropagation()}
             />
           ) : (
-            <span className="text-sm font-medium text-white block truncate">{name}</span>
+            <span className="text-sm font-medium text-white truncate flex items-center gap-1.5">
+              {name}
+              {kind === 'point' && (
+                <span className="text-[8px] uppercase tracking-wide px-1 py-0.5 rounded bg-[#333] text-[#aaa]" title="Keypoint sub-object">pt</span>
+              )}
+            </span>
           )}
           {hasDescription && !editing && (
             <span className="text-[10px] text-[#666] block truncate">{description}</span>
           )}
         </div>
+        {/* Visibility toggle (cascade-aware) */}
+        <button
+          onClick={e => { e.stopPropagation(); toggleObjectVisibility(objId) }}
+          className="p-1 text-[#555] hover:text-[#ccc] rounded"
+          title={visible ? 'Hide mask' : 'Show mask'}
+        >
+          {visible ? <Eye size={13} /> : <EyeOff size={13} />}
+        </button>
+        {/* Zoom-to-bbox toggle */}
+        <button
+          onClick={e => { e.stopPropagation(); setZoomToObject(isZoomTarget ? null : objId) }}
+          className={`p-1 rounded ${isZoomTarget ? 'text-blue-400' : 'text-[#555] hover:text-[#ccc]'}`}
+          title={isZoomTarget ? 'Zoom out' : 'Zoom to this object'}
+        >
+          {isZoomTarget ? <ZoomOut size={13} /> : <ZoomIn size={13} />}
+        </button>
         <button
           onClick={e => { e.stopPropagation(); setEditing(!editing) }}
           className="p-1 text-[#555] hover:text-[#ccc] rounded"
@@ -432,12 +482,20 @@ export default function ObjectCard({ objId, name, color, isActive, onSelect, des
           >
             Clear selection
           </button>
+          {onAddSub && (
+            <button
+              onClick={e => { e.stopPropagation(); onAddSub() }}
+              className="w-full mt-1 py-1 text-xs text-[#666] hover:text-[#aaa] flex items-center justify-center gap-1 transition-colors"
+            >
+              <Plus size={11} /> Add sub-object
+            </button>
+          )}
         </div>
       )}
 
       {/* Inactive: Edit/Clear links */}
       {!isActive && (
-        <div className="flex gap-3 px-3 pb-3">
+        <div className="flex gap-3 px-3 pb-3 flex-wrap">
           <button
             onClick={e => { e.stopPropagation(); onSelect() }}
             className="text-xs text-[#666] hover:text-[#aaa] flex items-center gap-1"
@@ -450,6 +508,14 @@ export default function ObjectCard({ objId, name, color, isActive, onSelect, des
           >
             <Trash2 size={11} /> Clear
           </button>
+          {onAddSub && (
+            <button
+              onClick={e => { e.stopPropagation(); onAddSub() }}
+              className="text-xs text-[#666] hover:text-[#aaa] flex items-center gap-1"
+            >
+              <Plus size={11} /> Sub-object
+            </button>
+          )}
         </div>
       )}
     </div>
