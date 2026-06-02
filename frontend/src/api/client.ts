@@ -317,6 +317,15 @@ export const getSavedMask = (pid: string, vid: string, fidx: number) =>
     headers: { 'Cache-Control': 'no-cache' }
   }).then(r => r.data)
 
+/**
+ * Predict masks for all objects on a single frame using the annotated inference
+ * state, WITHOUT persisting them or adding to the inference state (preview only).
+ */
+export const predictFrame = (pid: string, vid: string, frameIdx: number) =>
+  api.post<{ frame_idx: number; masks: MaskData }>(
+    `/projects/${pid}/videos/${vid}/predict_frame/${frameIdx}`,
+  ).then(r => r.data)
+
 export interface RebuildSessionResponse {
   status: string
   masks_by_frame: Record<string, MaskData>

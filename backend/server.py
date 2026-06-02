@@ -1540,6 +1540,133 @@ def rebuild_session_from_config(pid: str, vid: str, req: RebuildSessionRequest):
     return {"status": "ok", "masks_by_frame": masks_by_frame}
 
 
+@app.post("/api/projects/{pid}/videos/{vid}/predict_frame/{frame_idx}")
+def predict_frame(pid: str, vid: str, frame_idx: int):
+    """Predict masks for ALL objects on a single frame using the annotated state.
+
+    Rebuilds the SAM session from the annotated frames + saved point prompts, then
+    returns predicted masks for *frame_idx* (propagating to it from the nearest
+    annotated frame if the frame itself is not annotated).  Sub-object containment
+    is applied.  Results are NOT persisted and the frame is NOT marked propagated —
+    this is a preview using the annotated inference state without adding to it.
+    """
+    video = pm.get_video(pid, vid)
+    if video is None:
+        raise HTTPException(404, "Video not found")
+
+    prop_state = _get_prop_state(pid, vid)
+    if prop_state is not None and prop_state.is_running:
+        raise HTTPException(409, "Propagation is running — pause first before predicting.")
+
+    source_path = video.get("source_path", "")
+    if not source_path or not Path(source_path).exists():
+        raise HTTPException(400, "Video source file not found")
+
+    all_prompts = pm.get_all_point_prompts(pid, vid)
+    if not all_prompts:
+        raise HTTPException(400, "No annotations yet — label at least one frame first.")
+
+    ann_dir_path = pm.annotated_frames_dir(pid, vid)
+    ann_dir_path.mkdir(parents=True, exist_ok=True)
+    ann_dir = str(ann_dir_path)
+
+    # Ensure the target frame is available to the session.
+    target_jpg = ann_dir_path / f"{frame_idx:06d}.jpg"
+    if not target_jpg.exists():
+        ds_max_dim, ds_scale = _video_ds_params(video)
+        try:
+            extract_frame_range(source_path, ann_dir, frame_idx, frame_idx + 1,
+                                max_dim=ds_max_dim, scale_factor=ds_scale)
+        except Exception as e:
+            raise HTTPException(500, f"Failed to extract frame {frame_idx}: {e}")
+        if not target_jpg.exists():
+            raise HTTPException(500, f"Frame {frame_idx} could not be extracted")
+
+    # Rebuild the annotated session (init + replay all saved prompts).
+    try:
+        last_out = _full_ann_session_reinit_and_replay(
+            pid, vid, ann_dir, collect_last_outputs=True
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"predict_frame rebuild failed: {e}", exc_info=True)
+        raise HTTPException(500, f"Session rebuild failed: {e}")
+
+    objects = (pm.get_video(pid, vid) or video)["objects"]
+
+    # Point sub-objects: lower their SAM2 binarization threshold during propagation.
+    point_sam_ids = {
+        _to_sam_obj_id_from_npz_key(oid)
+        for oid, meta in objects.items()
+        if meta.get("kind") == "point"
+    }
+    if point_sam_ids:
+        sam.register_point_objects(pid, vid, point_sam_ids)
+
+    def _int_masks_from_fo(fo: dict) -> dict:
+        out: dict[int, np.ndarray] = {}
+        ids = fo.get("out_obj_ids", [])
+        masks = fo.get("out_binary_masks", [])
+        for i, oid in enumerate(ids):
+            m = masks[i] if i < len(masks) else None
+            if m is None:
+                continue
+            if hasattr(m, "numpy"):
+                m = m.numpy()
+            out[int(oid)] = np.squeeze(m).astype(np.uint8)
+        return out
+
+    # If the target frame is itself annotated, replay already produced its masks.
+    frame_masks_int: dict = {}
+    fo = last_out.get(frame_idx)
+    if fo:
+        frame_masks_int = _int_masks_from_fo(fo)
+    else:
+        # Propagate from the nearest annotated frame to the target (both directions
+        # so a target before or after the anchors is reached).
+        frame_map = sam._frame_maps.get((pid, vid), [])
+        annotated_in_session = sorted(
+            int(f) for f in {int(fk) for fp in all_prompts.values() for fk in fp.keys()}
+            if int(f) in frame_map
+        )
+        if not annotated_in_session:
+            raise HTTPException(400, "No annotated frames are loaded in the session.")
+        start_from = min(annotated_in_session, key=lambda f: abs(f - frame_idx))
+
+        def _run_predict_pass():
+            for item in sam.propagate_stream(
+                pid, vid, start_frame_idx=start_from, propagation_direction="both",
+            ):
+                sam_idx = item.get("frame_index")
+                real_idx = sam.to_real_idx(pid, vid, sam_idx) if sam_idx is not None else -1
+                if real_idx != frame_idx:
+                    continue
+                outputs = item.get("outputs", {})
+                if "out_obj_ids" in outputs:
+                    return outputs
+                for v in outputs.values():
+                    if isinstance(v, dict) and "out_obj_ids" in v:
+                        return v
+            return {}
+
+        try:
+            fo = _run_predict_pass()
+        except Exception as e:
+            logger.error(f"predict_frame propagation failed: {e}", exc_info=True)
+            raise HTTPException(500, f"Prediction failed: {e}")
+        frame_masks_int = _int_masks_from_fo(fo)
+
+    # Apply sub-object containment, then encode (do NOT persist / mark propagated).
+    masks_str, _bboxes = _contain_frame_masks(objects, frame_masks_int)
+    mask_b64: dict[str, str] = {}
+    for oid, m in masks_str.items():
+        if np.asarray(m).any():
+            mask_b64[oid] = encode_mask_as_png(m, _get_instance_color(oid, objects))
+
+    return {"frame_idx": frame_idx, "masks": mask_b64}
+
+
 # ─── Objects ──────────────────────────────────────────────────────────────────
 
 class AddObjectRequest(BaseModel):
@@ -1800,6 +1927,57 @@ def _persist_merged_masks_for_frame(
     merged = {**existing, **{str(k): np.asarray(v) for k, v in raw_masks.items()}}
     ms.save_frame(frame_idx, merged, None)
     _invalidate_mask_cache(pid, vid)
+
+
+def _contain_frame_masks(objects: dict, frame_masks_int: dict) -> tuple[dict, dict]:
+    """Apply sub-object containment to one frame's masks (SAM int-id keyed).
+
+    Walks the object tree top-down: segmentation children are hard-clipped to
+    their already-clipped parent; point children are reduced to a fixed blob at
+    their tracked centroid sized to the parent bbox; parent-less / missing-parent
+    children are dropped.  Returns (str-keyed uint8 masks, str-keyed bboxes
+    recomputed from the final masks).  Shared by propagation and single-frame predict.
+    """
+    str_masks: dict[str, np.ndarray] = {}
+    for sam_oid, m in frame_masks_int.items():
+        key = _obj_config_key_from_sam_oid(objects, int(sam_oid))
+        str_masks[key] = m
+
+    final: dict[str, np.ndarray] = {}
+    for oid in iter_objects_topdown(objects):
+        if oid not in str_masks:
+            continue
+        m = hierarchy._as_bool(str_masks[oid])
+        meta = objects.get(oid, {})
+        parent_id = meta.get("parent_id")
+        if parent_id is not None:
+            parent_m = final.get(str(parent_id))
+            if parent_m is None or not parent_m.any():
+                m = np.zeros_like(m, dtype=bool)
+            elif meta.get("kind") == "point":
+                frac = float(meta.get("point_blob_frac", 0.06) or 0.06)
+                c = hierarchy.centroid_norm(m)
+                m = (
+                    np.zeros_like(m, dtype=bool) if c is None
+                    else hierarchy.point_blob_mask(c, parent_m, frac)
+                )
+            else:
+                if parent_m.shape != m.shape:
+                    parent_m = hierarchy._resize_bool(parent_m, m.shape)
+                m = m & parent_m
+        final[oid] = m
+    # Defensive: keep masks for ids not present in the object config.
+    for oid, m in str_masks.items():
+        if oid not in final:
+            final[oid] = hierarchy._as_bool(m)
+
+    masks_u8 = {k: v.astype(np.uint8) for k, v in final.items()}
+    bboxes: dict[str, list] = {}
+    for k, v in final.items():
+        if v.any():
+            box, score = bbox_norm_xywh_score_from_mask(v)
+            bboxes[k] = box + [score]
+    return masks_u8, bboxes
 
 
 def _full_ann_session_reinit_and_replay(
@@ -2629,54 +2807,8 @@ async def _run_propagation_bg(
         return real_frame, frame_masks, frame_bboxes
 
     def _contain_propagation_frame(frame_masks_int: dict) -> tuple[dict, dict]:
-        """Apply sub-object containment to one propagated frame.
-
-        Walks the object tree top-down: segmentation children are hard-clipped to
-        their (already-clipped) parent; point children are reduced to a fixed blob
-        at their tracked centroid, sized to the parent bbox.  Parent-less / missing
-        parents drop the child.  Returns (str-keyed uint8 masks, str-keyed bboxes
-        recomputed from the final masks so boxes match the clipped regions).
-        """
-        str_masks: dict[str, np.ndarray] = {}
-        for sam_oid, m in frame_masks_int.items():
-            key = _obj_config_key_from_sam_oid(objects, int(sam_oid))
-            str_masks[key] = m
-
-        final: dict[str, np.ndarray] = {}
-        for oid in iter_objects_topdown(objects):
-            if oid not in str_masks:
-                continue
-            m = hierarchy._as_bool(str_masks[oid])
-            meta = objects.get(oid, {})
-            parent_id = meta.get("parent_id")
-            if parent_id is not None:
-                parent_m = final.get(str(parent_id))
-                if parent_m is None or not parent_m.any():
-                    m = np.zeros_like(m, dtype=bool)
-                elif meta.get("kind") == "point":
-                    frac = float(meta.get("point_blob_frac", 0.06) or 0.06)
-                    c = hierarchy.centroid_norm(m)
-                    m = (
-                        np.zeros_like(m, dtype=bool) if c is None
-                        else hierarchy.point_blob_mask(c, parent_m, frac)
-                    )
-                else:
-                    if parent_m.shape != m.shape:
-                        parent_m = hierarchy._resize_bool(parent_m, m.shape)
-                    m = m & parent_m
-            final[oid] = m
-        # Defensive: keep masks for ids not present in the object config.
-        for oid, m in str_masks.items():
-            if oid not in final:
-                final[oid] = hierarchy._as_bool(m)
-
-        masks_u8 = {k: v.astype(np.uint8) for k, v in final.items()}
-        bboxes: dict[str, list] = {}
-        for k, v in final.items():
-            if v.any():
-                box, score = bbox_norm_xywh_score_from_mask(v)
-                bboxes[k] = box + [score]
-        return masks_u8, bboxes
+        """Apply sub-object containment to one propagated frame (see _contain_frame_masks)."""
+        return _contain_frame_masks(objects, frame_masks_int)
 
     try:
         for batch_idx, (P1, P2) in enumerate(batches):
