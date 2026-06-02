@@ -84,6 +84,8 @@ interface AppState {
 
   // Sub-object UI: per-object mask visibility override (default true) + zoom target
   objectVisibility: Record<string, boolean>
+  // Per-object point-prompt marker visibility (default true; hide to see small masks)
+  pointVisibility: Record<string, boolean>
   zoomToObjectId: string | null
 
   // Playback
@@ -141,6 +143,9 @@ interface AppState {
   setObjectVisibility: (oid: string, v: boolean) => void
   /** Cascade-aware: false if the object or any ancestor is toggled hidden. */
   isObjectVisible: (oid: string) => boolean
+  togglePointVisibility: (oid: string) => void
+  /** Whether point-prompt markers for an object are shown (default true). */
+  arePointsVisible: (oid: string) => boolean
   setZoomToObject: (oid: string | null) => void
   setPendingInferenceFrame: (f: number | null) => void
   setPlaying: (v: boolean) => void
@@ -190,6 +195,7 @@ export const useStore = create<AppState>((set, get) => ({
   savedMaskCache: {},
   pendingInferenceFrame: null,
   objectVisibility: {},
+  pointVisibility: {},
   zoomToObjectId: null,
   isPlaying: false,
   propagationStatus: 'idle',
@@ -419,6 +425,9 @@ export const useStore = create<AppState>((set, get) => ({
     return true
   },
   setZoomToObject: oid => set({ zoomToObjectId: oid }),
+  togglePointVisibility: oid =>
+    set(s => ({ pointVisibility: { ...s.pointVisibility, [oid]: s.pointVisibility[oid] === false } })),
+  arePointsVisible: oid => get().pointVisibility[oid] !== false,
 
   setPendingInferenceFrame: f => set({ pendingInferenceFrame: f }),
   setPlaying: v => set({ isPlaying: v }),

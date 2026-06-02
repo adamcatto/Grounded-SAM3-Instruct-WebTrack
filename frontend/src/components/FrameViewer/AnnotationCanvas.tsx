@@ -26,6 +26,7 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
     anchorPhase,
     addToast,
     objectVisibility, isObjectVisible,
+    pointVisibility, arePointsVisible,
   } = store
 
   const [hoverLabel, setHoverLabel] = useState<string | null>(null)
@@ -93,9 +94,11 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
       ? Object.fromEntries(Object.entries(masksToShow).filter(([oid]) => isObjectVisible(oid)))
       : {}
 
-    // Collect points for current frame
+    // Collect points for current frame, skipping objects whose point markers are
+    // toggled off (lets the user see small masks without the dots covering them).
     const allPoints: { x: number; y: number; label: 0 | 1 }[] = []
-    for (const [, framePts] of Object.entries(localAnnotations)) {
+    for (const [objId, framePts] of Object.entries(localAnnotations)) {
+      if (!arePointsVisible(objId)) continue
       const pts = framePts[String(currentFrame)]
       if (pts) {
         for (const p of pts.points) {
@@ -113,7 +116,7 @@ export default function AnnotationCanvas({ width, height, videoRef }: Props) {
       drawPoints(ctx, allPoints, width, height, config.pointSize)
     })
     return () => { stale = true }
-  }, [width, height, masksToShow, localAnnotations, currentFrame, config.showMasks, config.maskOpacity, config.pointSize, objectNames, objectVisibility])
+  }, [width, height, masksToShow, localAnnotations, currentFrame, config.showMasks, config.maskOpacity, config.pointSize, objectNames, objectVisibility, pointVisibility])
 
   // ── Load saved masks when frame changes ───────────────────────────────────
   // No debounce: start the fetch on the very next event loop tick.

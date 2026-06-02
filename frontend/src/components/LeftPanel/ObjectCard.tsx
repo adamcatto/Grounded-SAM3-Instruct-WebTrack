@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react'
-import { Pencil, Trash2, MousePointer, MinusCircle, Check, ChevronDown, ChevronUp, Save, Loader, Eye, EyeOff, ZoomIn, ZoomOut, Plus } from 'lucide-react'
+import { Pencil, Trash2, MousePointer, MinusCircle, Check, ChevronDown, ChevronUp, Save, Loader, Eye, EyeOff, ZoomIn, ZoomOut, Plus, Crosshair } from 'lucide-react'
 import { useStore } from '../../store/useStore'
 import { renameObject, removeObject, clearObjectFramePoints, updateObject, rebuildFromConfig, replaceFramePromptsData, restoreObjectSnapshot, getSavedMask } from '../../api/client'
 import { applyRebuildMasksToStore, localAnnotationsToPointPrompts } from '../../history/applyRebuild'
@@ -28,10 +28,12 @@ export default function ObjectCard({ objId, name, color, isActive, onSelect, des
     savedMaskCache, setSavedMask,
     addToast,
     toggleObjectVisibility, isObjectVisible, setZoomToObject, zoomToObjectId,
+    togglePointVisibility, arePointsVisible,
   } = useStore()
 
   const visible = isObjectVisible(objId)
   const isZoomTarget = zoomToObjectId === objId
+  const pointsVisible = arePointsVisible(objId)
 
   const [editing, setEditing] = useState(false)
   const [editName, setEditName] = useState(name)
@@ -370,6 +372,14 @@ export default function ObjectCard({ objId, name, color, isActive, onSelect, des
             <span className="text-[10px] text-[#666] block truncate">{description}</span>
           )}
         </div>
+        {/* Point-marker visibility toggle (hide dots to see small masks) */}
+        <button
+          onClick={e => { e.stopPropagation(); togglePointVisibility(objId) }}
+          className={`p-1 rounded ${pointsVisible ? 'text-[#555] hover:text-[#ccc]' : 'text-[#333] hover:text-[#888]'}`}
+          title={pointsVisible ? 'Hide point markers' : 'Show point markers'}
+        >
+          <Crosshair size={13} />
+        </button>
         {/* Visibility toggle (cascade-aware) */}
         <button
           onClick={e => { e.stopPropagation(); toggleObjectVisibility(objId) }}
