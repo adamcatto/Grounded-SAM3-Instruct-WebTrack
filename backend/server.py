@@ -1538,6 +1538,102 @@ def rebuild_session_from_config(pid: str, vid: str, req: RebuildSessionRequest):
     return {"status": "ok", "masks_by_frame": masks_by_frame}
 
 
+@app.post("/api/projects/{pid}/videos/{vid}/predict_frame/{frame_idx}")
+def predict_frame(pid: str, vid: str, frame_idx: int):
+    """Predict masks for ALL objects on a single frame using the annotated state.
+
+    Loads every labeled anchor frame from this video into a fresh SAM inference
+    state (init + replay all saved point prompts), then returns predicted masks for
+    *frame_idx* — propagating to it from the nearest annotated frame if the frame
+    itself is not annotated.  Results are NOT persisted and the frame is NOT marked
+    propagated: this is a preview that uses the annotated inference state without
+    adding to it.
+    """
+    video = pm.get_video(pid, vid)
+    if video is None:
+        raise HTTPException(404, "Video not found")
+
+    prop_state = _get_prop_state(pid, vid)
+    if prop_state is not None and prop_state.is_running:
+        raise HTTPException(409, "Propagation is running — pause first before predicting.")
+
+    source_path = video.get("source_path", "")
+    if not source_path or not Path(source_path).exists():
+        raise HTTPException(400, "Video source file not found")
+
+    all_prompts = pm.get_all_point_prompts(pid, vid)
+    if not all_prompts:
+        raise HTTPException(400, "No annotations yet — label at least one frame first.")
+
+    ann_dir_path = pm.annotated_frames_dir(pid, vid)
+    ann_dir_path.mkdir(parents=True, exist_ok=True)
+    ann_dir = str(ann_dir_path)
+
+    # Ensure the target frame is available to the session.
+    target_jpg = ann_dir_path / f"{frame_idx:06d}.jpg"
+    if not target_jpg.exists():
+        ds_max_dim, ds_scale = _video_ds_params(video)
+        try:
+            extract_frame_range(source_path, ann_dir, frame_idx, frame_idx + 1,
+                                max_dim=ds_max_dim, scale_factor=ds_scale)
+        except Exception as e:
+            raise HTTPException(500, f"Failed to extract frame {frame_idx}: {e}")
+        if not target_jpg.exists():
+            raise HTTPException(500, f"Frame {frame_idx} could not be extracted")
+
+    # Load all labeled anchor frames into a fresh session (init + replay all prompts).
+    try:
+        last_out = _full_ann_session_reinit_and_replay(
+            pid, vid, ann_dir, collect_last_outputs=True
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"predict_frame rebuild failed: {e}", exc_info=True)
+        raise HTTPException(500, f"Session rebuild failed: {e}")
+
+    objects = (pm.get_video(pid, vid) or video)["objects"]
+
+    # If the target frame is itself annotated, replay already produced its masks.
+    frame_outputs = last_out.get(frame_idx)
+    if not frame_outputs:
+        # Propagate from the nearest annotated frame to the target (both directions so
+        # a target before or after the anchors is reached) and grab the target output.
+        frame_map = sam._frame_maps.get((pid, vid), [])
+        annotated_in_session = sorted(
+            f for f in {int(fk) for fp in all_prompts.values() for fk in fp.keys()}
+            if f in frame_map
+        )
+        if not annotated_in_session:
+            raise HTTPException(400, "No annotated frames are loaded in the session.")
+        start_from = min(annotated_in_session, key=lambda f: abs(f - frame_idx))
+
+        def _run_predict_pass() -> dict:
+            for item in sam.propagate_stream(
+                pid, vid, start_frame_idx=start_from, propagation_direction="both",
+            ):
+                sam_idx = item.get("frame_index")
+                real_idx = sam.to_real_idx(pid, vid, sam_idx) if sam_idx is not None else -1
+                if real_idx != frame_idx:
+                    continue
+                outputs = item.get("outputs", {})
+                if "out_obj_ids" in outputs:
+                    return outputs
+                for v in outputs.values():
+                    if isinstance(v, dict) and "out_obj_ids" in v:
+                        return v
+            return {}
+
+        try:
+            frame_outputs = _run_predict_pass()
+        except Exception as e:
+            logger.error(f"predict_frame propagation failed: {e}", exc_info=True)
+            raise HTTPException(500, f"Prediction failed: {e}")
+
+    mask_b64, _raw = _encode_masks_from_sam_frame_output(frame_outputs or {}, objects)
+    return {"frame_idx": frame_idx, "masks": mask_b64}
+
+
 # ─── Objects ──────────────────────────────────────────────────────────────────
 
 class AddObjectRequest(BaseModel):

@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react'
-import { Plus, RotateCcw, ChevronRight, ChevronDown, Loader, Download, X, Pause, Play, SkipBack, SkipForward, Trash2, GripVertical, ArrowLeftRight, Undo2, Redo2 } from 'lucide-react'
+import { Plus, RotateCcw, ChevronRight, ChevronDown, Loader, Download, X, Pause, Play, SkipBack, SkipForward, Trash2, GripVertical, ArrowLeftRight, Undo2, Redo2, Sparkles } from 'lucide-react'
 import { useStore, currentVideo as selectCurrentVideo } from '../../store/useStore'
 import {
   addObject, initSession, startPropagationSSE, startExportSSE, getProject, resetVideo,
@@ -10,6 +10,7 @@ import {
   getSavedMask,
   extractFrame,
   restoreMaskFrames,
+  predictFrame,
   type ClearMasksMode,
 } from '../../api/client'
 import { getObjectColor } from '../../utils/colors'
@@ -76,6 +77,7 @@ export default function LeftPanel() {
   const [initializingSession, setInitializingSession] = useState(false)
   const [trackingError, setTrackingError] = useState('')
   const [trackingRetryMsg, setTrackingRetryMsg] = useState('')
+  const [predicting, setPredicting] = useState(false)
   const [extractingPhase, setExtractingPhase] = useState(false)
   const [totalBatchesRef] = useState({ current: 1 })
   const [extractedFrameCount, setExtractedFrameCount] = useState(0)
@@ -780,6 +782,30 @@ export default function LeftPanel() {
     _connectSSE(0, undefined, -1, useAllAnchors)
   }
 
+  async function handlePredictFrame() {
+    if (!pid || !vid || !hasObjects || predicting) return
+    setPredicting(true)
+    try {
+      // Make sure the frame is available, then predict all objects on it.
+      try { await extractFrame(pid, vid, currentFrame) } catch { /* may already exist */ }
+      const result = await predictFrame(pid, vid, currentFrame)
+      const masks = result.masks ?? {}
+      // Display only — predict_frame does not persist server-side.
+      setCurrentFrameMasks(masks, currentFrame)
+      setSavedMask(currentFrame, masks)
+      const n = Object.keys(masks).length
+      addToast(
+        n > 0 ? `Predicted ${n} object${n === 1 ? '' : 's'} on frame #${currentFrame}` : 'No objects predicted on this frame',
+        n > 0 ? 'success' : 'info',
+      )
+    } catch (e: unknown) {
+      const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+      addToast(detail ?? (e instanceof Error ? e.message : 'Prediction failed'), 'error')
+    } finally {
+      setPredicting(false)
+    }
+  }
+
   function handleStartTrackRange() {
     const from = parseInt(trackRangeStart)
     const to = parseInt(trackRangeEnd)
@@ -1406,6 +1432,20 @@ export default function LeftPanel() {
           )
         )}
       </div>
+
+      {/* Predict current frame (preview all objects from the annotated state) */}
+      {!isTracking && hasObjects && (
+        <button
+          type="button"
+          onClick={() => void handlePredictFrame()}
+          disabled={predicting}
+          className="mx-3 mb-2 flex items-center justify-center gap-2 py-2 rounded-lg border border-[#333] bg-[#161616] text-sm text-[#ccc] hover:border-blue-500/50 hover:text-blue-300 disabled:opacity-50 transition-colors flex-shrink-0"
+          title={`Predict masks for all objects on frame #${currentFrame} without saving`}
+        >
+          {predicting ? <Loader size={14} className="animate-spin" /> : <Sparkles size={14} />}
+          {predicting ? 'Predicting…' : `Predict frame #${currentFrame}`}
+        </button>
+      )}
 
       {anchorRemainderInferencing && (
         <div className="mx-3 mb-2 flex items-center gap-2 text-xs text-violet-300">
