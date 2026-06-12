@@ -58,7 +58,13 @@
       "Bash(ls -lt /sc/arion/projects/KennyComputational/Behavior/Grounded-SAM3-Instruct-WebTrack/logs/uvicorn_gpu*)",
       "Bash(bpeek 242954812)",
       "Bash(bjobs:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(git log *)",
+      "Bash(git checkout *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git merge *)",
+      "Bash(git push *)"
     ]
   }
 }
