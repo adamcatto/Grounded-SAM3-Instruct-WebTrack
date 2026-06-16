@@ -64,7 +64,9 @@
       "Bash(git add *)",
       "Bash(git commit -m ' *)",
       "Bash(git merge *)",
-      "Bash(git push *)"
+      "Bash(git push *)",
+      "Bash(sed -n '1,60p' downstream_analysis/plots.py)",
+      "Bash(sed -n '1,40p' downstream_analysis/__main__.py)"
     ]
   }
 }
