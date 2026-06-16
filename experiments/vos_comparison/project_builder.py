@@ -72,7 +72,12 @@ def _single_shot_video_meta(
     vm["sam3_session_id"] = None
     vm["propagated_frames"] = []
     vm["propagation_complete"] = False
-    vm["anchor_labeling_complete"] = False
+    # Mark labeling "complete" = ready to propagate. There is intentionally only
+    # one anchor, but the video IS ready to track, and this flag is what the HPC
+    # parallel worker (run_pending_inference.video_eligibility) gates on when
+    # claiming videos across many bsub jobs. Without it the single-shot videos
+    # would be skipped as "anchor labeling incomplete".
+    vm["anchor_labeling_complete"] = True
     vm["whole_video_inference"] = {"status": "none", "updated_at": None, "host": None}
     return vm
 

@@ -15,11 +15,10 @@ import argparse
 from pathlib import Path
 
 from . import DEFAULT_IOU_THRESHOLD
-from .common import resolve_project_dir
-from .evaluation import evaluate_project
-from .figures import make_figures
-from .project_builder import build_single_shot_project
-from .tracking import run_tracking
+
+# Submodules are imported lazily inside each command so that, e.g., `build` and
+# `track` don't require matplotlib (only `figures` does) and `figures` doesn't
+# require a SAM/backend environment.
 
 
 def _add_threshold_args(p: argparse.ArgumentParser) -> None:
@@ -39,6 +38,12 @@ def _out_dir(args, project_dir: Path) -> Path:
     return Path(args.out_dir).resolve() if args.out_dir else (project_dir / "vos_comparison_results")
 
 
+def _resolve(ref: str) -> Path:
+    from .common import resolve_project_dir
+
+    return resolve_project_dir(ref)
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="python -m experiments.vos_comparison",
@@ -56,6 +61,9 @@ def build_parser() -> argparse.ArgumentParser:
     pb.add_argument("--output-parent", default=None,
                     help="Where to create the project (default: alongside the source project).")
     pb.add_argument("--overwrite", action="store_true", help="Replace an existing output project.")
+    pb.add_argument("--emit-path-file", default=None,
+                    help="Write the emitted project directory path to this file "
+                         "(for shell/bsub orchestration).")
 
     pt = sub.add_parser("track", help="Run SAM3 propagation on the single-shot project.")
     pt.add_argument("--project", required=True, help="Single-shot project: path, name, or id.")
@@ -96,18 +104,24 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     if args.cmd == "build":
-        build_single_shot_project(
+        from .project_builder import build_single_shot_project
+
+        project_dir = build_single_shot_project(
             args.source_project,
             output_parent=Path(args.output_parent) if args.output_parent else None,
             batch_size=_parse_batch_size(args.batch_size),
             only_videos=args.videos,
             overwrite=args.overwrite,
         )
+        if args.emit_path_file:
+            Path(args.emit_path_file).write_text(str(project_dir) + "\n")
         return 0
 
     if args.cmd == "track":
+        from .tracking import run_tracking
+
         return run_tracking(
-            resolve_project_dir(args.project),
+            _resolve(args.project),
             backend=args.backend,
             only_videos=args.videos,
             sse_timeout=args.sse_timeout,
@@ -116,7 +130,9 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     if args.cmd == "evaluate":
-        project_dir = resolve_project_dir(args.project)
+        from .evaluation import evaluate_project
+
+        project_dir = _resolve(args.project)
         evaluate_project(
             project_dir,
             out_dir=_out_dir(args, project_dir),
@@ -127,11 +143,18 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "figures":
-        project_dir = resolve_project_dir(args.project)
+        from .figures import make_figures
+
+        project_dir = _resolve(args.project)
         make_figures(_out_dir(args, project_dir), threshold=args.threshold)
         return 0
 
     if args.cmd == "all":
+        from .evaluation import evaluate_project
+        from .figures import make_figures
+        from .project_builder import build_single_shot_project
+        from .tracking import run_tracking
+
         project_dir = build_single_shot_project(
             args.source_project,
             output_parent=Path(args.output_parent) if args.output_parent else None,

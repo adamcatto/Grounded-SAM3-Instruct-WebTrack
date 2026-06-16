@@ -1,0 +1,45 @@
+#!/bin/bash
+
+#BSUB -J vos_eval
+#BSUB -P acc_KennyComputational
+#BSUB -q premium
+#BSUB -n 4
+#BSUB -R "rusage[mem=16000]"
+#BSUB -R "span[hosts=1]"
+#BSUB -W 12:00
+#BSUB -oo /sc/arion/projects/KennyComputational/Behavior/logs/%J.out
+#BSUB -eo /sc/arion/projects/KennyComputational/Behavior/logs/%J.err
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Evaluate single-shot tracks against the anchor-frame ground truth and render
+# conference-ready figures + LaTeX tables. CPU-only; runs after all tracking
+# jobs finish (chained via -w dependency by scripts/bsub_vos_comparison.sh).
+#
+# Required env: PROJECT_DIR  (the single_shot_vos_* project directory)
+# Optional env: THRESHOLD (default 0.5)
+# ─────────────────────────────────────────────────────────────────────────────
+
+set -euo pipefail
+
+if [[ -z "${PROJECT_DIR:-}" ]]; then
+    echo "ERROR: PROJECT_DIR is not set (the single-shot project dir)." >&2
+    exit 1
+fi
+
+THRESHOLD="${THRESHOLD:-0.5}"
+REPO_ROOT="/sc/arion/projects/KennyComputational/Behavior/Grounded-SAM3-Instruct-WebTrack"
+
+echo "PROJECT_DIR=${PROJECT_DIR}"
+echo "THRESHOLD=${THRESHOLD}"
+
+cd "${REPO_ROOT}"
+
+source /sc/arion/work/cattoa01/miniconda3/etc/profile.d/conda.sh
+conda activate /sc/arion/work/cattoa01/miniconda3/envs/sam3
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
+export SAM3_PROJECTS_DIR="$(dirname "${PROJECT_DIR}")"
+
+python -m experiments.vos_comparison evaluate --project "${PROJECT_DIR}" --threshold "${THRESHOLD}"
+python -m experiments.vos_comparison figures  --project "${PROJECT_DIR}" --threshold "${THRESHOLD}"
+
+echo "Results under: ${PROJECT_DIR}/vos_comparison_results/"
