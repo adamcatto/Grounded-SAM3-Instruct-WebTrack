@@ -8,6 +8,9 @@ import numpy as np
 
 from .common import npz_key_base_id
 
+# np.trapz was renamed to np.trapezoid in NumPy 2.0 and removed under the old name.
+_trapezoid = getattr(np, "trapezoid", None) or np.trapz
+
 
 def mask_iou(a: np.ndarray, b: np.ndarray) -> float:
     """Jaccard index between two binary masks.
@@ -168,7 +171,7 @@ def summarize_series(
     # Area under the IoU-vs-normalized-position curve (trapezoid over valid frames).
     if finite.size >= 2:
         xs = np.linspace(0.0, 1.0, finite.size)
-        auc = float(np.trapz(finite, xs))
+        auc = float(_trapezoid(finite, xs))
     else:
         auc = float(finite.mean()) if finite.size else float("nan")
 
