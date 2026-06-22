@@ -75,6 +75,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     pe = sub.add_parser("evaluate", help="Score single-shot tracks vs. anchor ground truth.")
     pe.add_argument("--project", required=True, help="Single-shot project: path, name, or id.")
+    pe.add_argument("--no-resume", dest="resume", action="store_false",
+                    help="Re-score every video from scratch (default: skip already-scored videos).")
+    pe.set_defaults(resume=True)
     _add_threshold_args(pe)
 
     pf = sub.add_parser("figures", help="Render figures + LaTeX tables from results.")
@@ -139,6 +142,7 @@ def main(argv: list[str] | None = None) -> int:
             threshold=args.threshold,
             window=args.window,
             persist_frac=args.persist_frac,
+            resume=args.resume,
         )
         return 0
 
