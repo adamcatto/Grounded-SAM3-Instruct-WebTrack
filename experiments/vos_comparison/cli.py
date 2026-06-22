@@ -78,7 +78,18 @@ def build_parser() -> argparse.ArgumentParser:
     pe.add_argument("--no-resume", dest="resume", action="store_false",
                     help="Re-score every video from scratch (default: skip already-scored videos).")
     pe.set_defaults(resume=True)
+    pe.add_argument("--shard-index", type=int, default=None,
+                    help="This worker's shard (0-based). Use with --num-shards for array eval; "
+                         "write each shard to its own --out-dir, then combine with `merge`.")
+    pe.add_argument("--num-shards", type=int, default=None,
+                    help="Total number of eval shards. Scores videos where i %% num_shards == shard_index.")
     _add_threshold_args(pe)
+
+    pm = sub.add_parser("merge", help="Combine sharded eval outputs → results.json (run before figures).")
+    pm.add_argument("--project", required=True, help="Single-shot project: path, name, or id.")
+    pm.add_argument("--shards-dir", default=None,
+                    help="Directory holding shard_* subdirs (default <out-dir>/_shards).")
+    _add_threshold_args(pm)
 
     pf = sub.add_parser("figures", help="Render figures + LaTeX tables from results.")
     pf.add_argument("--project", required=True, help="Single-shot project: path, name, or id.")
@@ -143,6 +154,21 @@ def main(argv: list[str] | None = None) -> int:
             window=args.window,
             persist_frac=args.persist_frac,
             resume=args.resume,
+            shard_index=args.shard_index,
+            num_shards=args.num_shards,
+        )
+        return 0
+
+    if args.cmd == "merge":
+        from .evaluation import merge_shards
+
+        project_dir = _resolve(args.project)
+        merge_shards(
+            project_dir,
+            out_dir=_out_dir(args, project_dir),
+            shards_dir=Path(args.shards_dir).resolve() if args.shards_dir else None,
+            threshold=args.threshold,
+            persist_frac=args.persist_frac,
         )
         return 0
 

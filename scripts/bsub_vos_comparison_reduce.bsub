@@ -1,0 +1,44 @@
+#!/bin/bash
+
+#BSUB -J vos_reduce
+#BSUB -P acc_KennyComputational
+#BSUB -q premium
+#BSUB -n 4
+#BSUB -R "rusage[mem=16000]"
+#BSUB -R "span[hosts=1]"
+#BSUB -W 4:00
+#BSUB -oo /sc/arion/projects/KennyComputational/Behavior/logs/%J.out
+#BSUB -eo /sc/arion/projects/KennyComputational/Behavior/logs/%J.err
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reduce master: combine the sharded eval outputs (_shards/shard_*) into the
+# top-level results.json + CSVs + timelines.npz, then render figures + tables.
+# Runs after the eval array finishes (chained via -w by scripts/bsub_vos_comparison.sh).
+#
+# Required env: PROJECT_DIR
+# Optional env: THRESHOLD (default 0.5)
+# ─────────────────────────────────────────────────────────────────────────────
+
+set -euo pipefail
+
+if [[ -z "${PROJECT_DIR:-}" ]]; then
+    echo "ERROR: PROJECT_DIR is not set." >&2
+    exit 1
+fi
+
+THRESHOLD="${THRESHOLD:-0.5}"
+REPO_ROOT="/sc/arion/projects/KennyComputational/Behavior/Grounded-SAM3-Instruct-WebTrack"
+
+echo "PROJECT_DIR=${PROJECT_DIR}  THRESHOLD=${THRESHOLD}"
+
+cd "${REPO_ROOT}"
+
+source /sc/arion/work/cattoa01/miniconda3/etc/profile.d/conda.sh
+conda activate /sc/arion/work/cattoa01/miniconda3/envs/sam3
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
+export SAM3_PROJECTS_DIR="$(dirname "${PROJECT_DIR}")"
+
+python -m experiments.vos_comparison merge   --project "${PROJECT_DIR}" --threshold "${THRESHOLD}"
+python -m experiments.vos_comparison figures --project "${PROJECT_DIR}" --threshold "${THRESHOLD}"
+
+echo "Results under: ${PROJECT_DIR}/vos_comparison_results/"

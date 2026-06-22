@@ -1,23 +1,26 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────────────────
-# One-command vos_comparison launcher for LSF/Minerva:
+# One-command vos_comparison launcher for LSF/Minerva (3-stage chained pipeline):
 #   1. build  the single_shot_vos_<project> (inline; fast, CPU, just symlinks)
-#   2. submit a GPU tracking job ARRAY (workers split videos via a claims file)
-#   3. submit one CPU evaluate+figures "master" job that waits for the whole array
+#   2. GPU tracking job ARRAY            (workers split videos via a claims file)
+#   3. CPU evaluate job ARRAY            (each element scores a shard of videos)
+#   4. CPU reduce master                 (merge shards → results.json → figures)
+# Stage 3 waits for stage 2; stage 4 waits for stage 3.
 #
 # Usage:
-#   scripts/bsub_vos_comparison.sh SOURCE_PROJECT [N_JOBS] [BATCH_SIZE] [THRESHOLD] [MAX_CONCURRENT]
+#   scripts/bsub_vos_comparison.sh SOURCE_PROJECT [N_JOBS] [BATCH_SIZE] [THRESHOLD] [MAX_CONCURRENT] [EVAL_SHARDS]
 #
 #   SOURCE_PROJECT  path / folder name / short id of the anchor-based project
-#   N_JOBS          number of array elements (parallel workers)  (default 4)
-#   BATCH_SIZE      inherit | single | <int>                     (default inherit)
-#   THRESHOLD       IoU collapse threshold for evaluation        (default 0.5)
-#   MAX_CONCURRENT  cap on simultaneously RUNNING array elements (default: no cap)
+#   N_JOBS          tracking array elements (parallel GPU workers)  (default 4)
+#   BATCH_SIZE      inherit | single | <int>                       (default inherit)
+#   THRESHOLD       IoU collapse threshold for evaluation          (default 0.5)
+#   MAX_CONCURRENT  cap on simultaneously RUNNING tracking elements (default: no cap)
+#   EVAL_SHARDS     evaluate array elements (parallel CPU shards)   (default = N_JOBS)
 #
-# Example (8 workers, at most 4 running at once):
+# Example (8 GPU trackers ≤4 at once, 16 eval shards):
 #   scripts/bsub_vos_comparison.sh \
 #     /sc/arion/projects/KennyComputational/Behavior/projects/3c9bddf2-Home-Cage-Interactions-0126-test-day \
-#     8 inherit 0.5 4
+#     8 inherit 0.5 4 16
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -31,6 +34,7 @@ N_JOBS="${2:-4}"
 BATCH_SIZE="${3:-inherit}"
 THRESHOLD="${4:-0.5}"
 MAX_CONCURRENT="${5:-}"
+EVAL_SHARDS="${6:-${N_JOBS}}"
 
 REPO_ROOT="/sc/arion/projects/KennyComputational/Behavior/Grounded-SAM3-Instruct-WebTrack"
 SCRIPT_DIR="${REPO_ROOT}/scripts"
@@ -59,28 +63,34 @@ if [[ -z "${PROJECT_DIR}" || ! -d "${PROJECT_DIR}" ]]; then
 fi
 echo "── Single-shot project: ${PROJECT_DIR}"
 
-# Unique LSF job-name tag so the eval job depends only on THIS run's trackers.
+# Unique LSF job-name tags so each stage depends only on THIS run's predecessor.
 TAG="$(basename "${PROJECT_DIR}" | tr -cd 'A-Za-z0-9_')_$$"
 TRACK_NAME="vost_${TAG}"
 EVAL_NAME="vose_${TAG}"
+REDUCE_NAME="vosr_${TAG}"
 
 export PROJECT_DIR THRESHOLD
+export NUM_SHARDS="${EVAL_SHARDS}"
 
-# ── 2. Submit the tracking job ARRAY (elements split videos via claims file) ──
-ARRAY_SPEC="${TRACK_NAME}[1-${N_JOBS}]"
+# ── 2. Tracking job ARRAY (elements split videos via the claims file) ────────
+TRACK_SPEC="${TRACK_NAME}[1-${N_JOBS}]"
 if [[ -n "${MAX_CONCURRENT}" ]]; then
-    ARRAY_SPEC="${ARRAY_SPEC}%${MAX_CONCURRENT}"
+    TRACK_SPEC="${TRACK_SPEC}%${MAX_CONCURRENT}"
 fi
-echo "── Submitting tracking array as '${ARRAY_SPEC}'"
-bsub -J "${ARRAY_SPEC}" < "${SCRIPT_DIR}/bsub_vos_comparison_track.bsub"
+echo "── Submitting tracking array as '${TRACK_SPEC}'"
+bsub -J "${TRACK_SPEC}" < "${SCRIPT_DIR}/bsub_vos_comparison_track.bsub"
 
-# ── 3. Submit the eval+figures master, gated on the whole array finishing ────
-# 'ended' (not 'done') fires once ALL array elements have ended, regardless of
-# exit status — so one failed element can't leave the master pending forever
-# (evaluation scores whatever masks were produced).
-echo "── Submitting eval+figures master as '${EVAL_NAME}' (waits for '${TRACK_NAME}')"
-bsub -J "${EVAL_NAME}" -w "ended(\"${TRACK_NAME}\")" \
-     < "${SCRIPT_DIR}/bsub_vos_comparison_eval.bsub"
+# ── 3. Evaluate job ARRAY (each element scores a shard), waits for tracking ──
+# 'ended' (not 'done') fires once ALL elements have ended regardless of exit
+# status, so one failed element can't deadlock the next stage.
+echo "── Submitting eval array as '${EVAL_NAME}[1-${EVAL_SHARDS}]' (waits for '${TRACK_NAME}')"
+bsub -J "${EVAL_NAME}[1-${EVAL_SHARDS}]" -w "ended(\"${TRACK_NAME}\")" \
+     < "${SCRIPT_DIR}/bsub_vos_comparison_eval_array.bsub"
+
+# ── 4. Reduce master: merge shards + figures, waits for the eval array ───────
+echo "── Submitting reduce master as '${REDUCE_NAME}' (waits for '${EVAL_NAME}')"
+bsub -J "${REDUCE_NAME}" -w "ended(\"${EVAL_NAME}\")" \
+     < "${SCRIPT_DIR}/bsub_vos_comparison_reduce.bsub"
 
 echo
 echo "Submitted. Monitor with:  bjobs -w"

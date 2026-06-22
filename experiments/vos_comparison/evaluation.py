@@ -133,11 +133,26 @@ def evaluate_project(
     persist_frac: float = 0.8,
     progress: bool = True,
     resume: bool = True,
+    shard_index: int | None = None,
+    num_shards: int | None = None,
 ) -> dict[str, Any]:
     project_dir = project_dir.resolve()
     manifest = load_manifest(project_dir)
     out_dir = (out_dir or (project_dir / "vos_comparison_results")).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Optional sharding: this worker scores only the videos whose position in the
+    # manifest satisfies (i % num_shards == shard_index). Shards must write to
+    # SEPARATE out_dirs (the writers append to shared CSVs) and are recombined by
+    # merge_shards(). Interleaving (i % N) balances long/short videos across shards.
+    all_videos = list(manifest["videos"])
+    if num_shards and num_shards > 1:
+        if shard_index is None or not (0 <= shard_index < num_shards):
+            raise ValueError(f"shard_index must be in [0,{num_shards}); got {shard_index}")
+        videos = [v for i, v in enumerate(all_videos) if i % num_shards == shard_index]
+        print(f"[evaluate] shard {shard_index}/{num_shards}: {len(videos)}/{len(all_videos)} videos")
+    else:
+        videos = all_videos
 
     video_summary_csv = out_dir / "video_summary.csv"
     object_summary_csv = out_dir / "object_summary.csv"
@@ -191,7 +206,7 @@ def evaluate_project(
 
     results: dict[str, Any] = {}
     try:
-        for ventry in _try_tqdm(manifest["videos"], desc="Videos", unit="vid", disable=not progress):
+        for ventry in _try_tqdm(videos, desc="Videos", unit="vid", disable=not progress):
             sid = str(ventry["single_shot_video_id"])
             if sid in done_ids:
                 continue
@@ -285,6 +300,86 @@ def evaluate_project(
     print(f"[evaluate] {len(video_summaries)} video(s) scored → {out_dir}")
     if agg.get("n_videos"):
         print(f"[evaluate] aggregate mean IoU = {agg['mean_iou']:.3f}; "
+              f"{agg['n_collapsed']}/{agg['n_videos']} videos collapsed "
+              f"(median collapse at {agg['median_collapse_fraction_pct']}% of video).")
+    return results
+
+
+def _concat_csv(srcs: list[Path], dst: Path, fieldnames: list[str]) -> int:
+    """Concatenate shard CSVs (disjoint videos) into one, writing a single header."""
+    n = 0
+    with dst.open("w", newline="") as out:
+        writer = csv.DictWriter(out, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for s in srcs:
+            if not s.is_file():
+                continue
+            with s.open(newline="") as f:
+                for r in csv.DictReader(f):
+                    writer.writerow(r)
+                    n += 1
+    return n
+
+
+def merge_shards(
+    project_dir: Path,
+    *,
+    out_dir: Path | None = None,
+    shards_dir: Path | None = None,
+    threshold: float = DEFAULT_IOU_THRESHOLD,
+    persist_frac: float = 0.8,
+) -> dict[str, Any]:
+    """Combine per-shard eval outputs into the top-level results (CSVs, results.json,
+    timelines.npz). Shards are disjoint by construction, so this is a plain concat
+    plus a re-aggregation. Run after the eval array finishes; figures read the result.
+    """
+    project_dir = project_dir.resolve()
+    manifest = load_manifest(project_dir)
+    out_dir = (out_dir or (project_dir / "vos_comparison_results")).resolve()
+    shards_dir = (shards_dir or (out_dir / "_shards")).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    shard_dirs = sorted(d for d in shards_dir.glob("shard_*") if d.is_dir())
+    if not shard_dirs:
+        raise FileNotFoundError(f"no shard_* directories under {shards_dir}")
+    print(f"[merge] combining {len(shard_dirs)} shard(s) from {shards_dir}")
+
+    for fname, fields in (
+        ("per_frame_iou.csv", _PER_FRAME_FIELDS),
+        ("per_object_iou.csv", _PER_OBJECT_FIELDS),
+        ("video_summary.csv", _VIDEO_FIELDS),
+        ("object_summary.csv", _OBJECT_FIELDS),
+    ):
+        _concat_csv([d / fname for d in shard_dirs], out_dir / fname, fields)
+
+    timelines: dict[str, np.ndarray] = {}
+    for d in shard_dirs:
+        p = d / "timelines.npz"
+        if p.is_file():
+            with np.load(p) as z:
+                for k in z.files:
+                    timelines[k] = z[k]
+    if timelines:
+        np.savez_compressed(out_dir / "timelines.npz", **timelines)
+
+    video_summaries = _read_typed_csv(out_dir / "video_summary.csv", _VS_INT, _VS_FLOAT, _VS_BOOL)
+    object_summaries = _read_typed_csv(out_dir / "object_summary.csv", _OS_INT, _OS_FLOAT, _OS_BOOL)
+    agg = _aggregate(video_summaries, threshold)
+    results = {
+        "source_project": manifest.get("source_project_name"),
+        "single_shot_project_id": manifest.get("single_shot_project_id"),
+        "threshold": threshold,
+        "persist_frac": persist_frac,
+        "n_videos": len(video_summaries),
+        "aggregate": agg,
+        "videos": video_summaries,
+        "objects": object_summaries,
+    }
+    (out_dir / "results.json").write_text(json.dumps(results, indent=2, default=_json_default))
+
+    print(f"[merge] {len(video_summaries)} video(s) → {out_dir}")
+    if agg.get("n_videos"):
+        print(f"[merge] aggregate mean IoU = {agg['mean_iou']:.3f}; "
               f"{agg['n_collapsed']}/{agg['n_videos']} videos collapsed "
               f"(median collapse at {agg['median_collapse_fraction_pct']}% of video).")
     return results

@@ -1,0 +1,50 @@
+#!/bin/bash
+
+#BSUB -J vos_eval
+#BSUB -P acc_KennyComputational
+#BSUB -q premium
+#BSUB -n 4
+#BSUB -R "rusage[mem=16000]"
+#BSUB -R "span[hosts=1]"
+#BSUB -W 24:00
+#BSUB -oo /sc/arion/projects/KennyComputational/Behavior/logs/%J_%I.out
+#BSUB -eo /sc/arion/projects/KennyComputational/Behavior/logs/%J_%I.err
+
+# ─────────────────────────────────────────────────────────────────────────────
+# One shard of the evaluation, run as a job ARRAY element ("name[1-N]"). Element
+# k (LSB_JOBINDEX) scores the videos where (i % NUM_SHARDS == k-1) and writes to
+# its own results subdir, so shards never contend on the same CSV files. A
+# dependent `reduce` job recombines them. Launched by scripts/bsub_vos_comparison.sh.
+#
+# Required env: PROJECT_DIR, NUM_SHARDS
+# Optional env: THRESHOLD (default 0.5)
+# ─────────────────────────────────────────────────────────────────────────────
+
+set -euo pipefail
+
+if [[ -z "${PROJECT_DIR:-}" || -z "${NUM_SHARDS:-}" ]]; then
+    echo "ERROR: PROJECT_DIR and NUM_SHARDS must be set." >&2
+    exit 1
+fi
+
+THRESHOLD="${THRESHOLD:-0.5}"
+SHARD_INDEX=$(( ${LSB_JOBINDEX:-1} - 1 ))          # array index is 1-based; shard is 0-based
+SHARD_OUT="${PROJECT_DIR}/vos_comparison_results/_shards/shard_${LSB_JOBINDEX:-1}"
+REPO_ROOT="/sc/arion/projects/KennyComputational/Behavior/Grounded-SAM3-Instruct-WebTrack"
+
+echo "PROJECT_DIR=${PROJECT_DIR}  NUM_SHARDS=${NUM_SHARDS}  SHARD_INDEX=${SHARD_INDEX}"
+echo "SHARD_OUT=${SHARD_OUT}"
+
+cd "${REPO_ROOT}"
+
+source /sc/arion/work/cattoa01/miniconda3/etc/profile.d/conda.sh
+conda activate /sc/arion/work/cattoa01/miniconda3/envs/sam3
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
+export SAM3_PROJECTS_DIR="$(dirname "${PROJECT_DIR}")"
+
+python -m experiments.vos_comparison evaluate \
+    --project "${PROJECT_DIR}" \
+    --out-dir "${SHARD_OUT}" \
+    --threshold "${THRESHOLD}" \
+    --shard-index "${SHARD_INDEX}" \
+    --num-shards "${NUM_SHARDS}"
