@@ -9,14 +9,14 @@
 #BSUB -R "h100nvl"
 #BSUB -gpu "num=1"
 #BSUB -W 144:00
-#BSUB -oo /sc/arion/projects/KennyComputational/Behavior/logs/%J.out
-#BSUB -eo /sc/arion/projects/KennyComputational/Behavior/logs/%J.err
+#BSUB -oo /sc/arion/projects/KennyComputational/Behavior/logs/%J_%I.out
+#BSUB -eo /sc/arion/projects/KennyComputational/Behavior/logs/%J_%I.err
 
 # ─────────────────────────────────────────────────────────────────────────────
-# One tracking worker for the vos_comparison single-shot project. Submit this
-# script N times (same PROJECT_DIR) for cross-node parallelism — workers claim
-# distinct videos via the flock'd `tracked_videos_in_progress.txt` claims file.
-# Normally launched by scripts/bsub_vos_comparison.sh.
+# One tracking worker for the vos_comparison single-shot project. Submitted by
+# scripts/bsub_vos_comparison.sh as a job ARRAY ("name[1-N]"): every element runs
+# this same script and claims distinct videos via the flock'd
+# `tracked_videos_in_progress.txt` claims file, so N elements = N parallel workers.
 #
 # Required env: PROJECT_DIR  (the single_shot_vos_* project directory)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -33,9 +33,10 @@ echo "EXTRA_ARGS=$*"
 
 REPO_ROOT="/sc/arion/projects/KennyComputational/Behavior/Grounded-SAM3-Instruct-WebTrack"
 
-# Derive a per-job backend port so multiple workers never collide, even if LSF
-# co-locates two on one node.
-BACKEND_PORT=$(( 8800 + (${LSB_JOBID:-$$} % 150) ))
+# Derive a per-worker backend port so workers never collide, even if LSF
+# co-locates two on one node. Array elements share LSB_JOBID but differ in
+# LSB_JOBINDEX; standalone jobs differ in LSB_JOBID — combine both so either works.
+BACKEND_PORT=$(( 8800 + ((${LSB_JOBID:-$$} + ${LSB_JOBINDEX:-0}) % 150) ))
 
 cd "${REPO_ROOT}"
 

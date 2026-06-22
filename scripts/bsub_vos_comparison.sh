@@ -2,21 +2,22 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # One-command vos_comparison launcher for LSF/Minerva:
 #   1. build  the single_shot_vos_<project> (inline; fast, CPU, just symlinks)
-#   2. submit N parallel GPU tracking jobs (coordinated via a shared claims file)
-#   3. submit one CPU evaluate+figures job that waits for all tracking jobs
+#   2. submit a GPU tracking job ARRAY (workers split videos via a claims file)
+#   3. submit one CPU evaluate+figures "master" job that waits for the whole array
 #
 # Usage:
-#   scripts/bsub_vos_comparison.sh SOURCE_PROJECT [N_JOBS] [BATCH_SIZE] [THRESHOLD]
+#   scripts/bsub_vos_comparison.sh SOURCE_PROJECT [N_JOBS] [BATCH_SIZE] [THRESHOLD] [MAX_CONCURRENT]
 #
 #   SOURCE_PROJECT  path / folder name / short id of the anchor-based project
-#   N_JOBS          number of simultaneous tracking jobs   (default 4)
-#   BATCH_SIZE      inherit | single | <int>               (default inherit)
-#   THRESHOLD       IoU collapse threshold for evaluation  (default 0.5)
+#   N_JOBS          number of array elements (parallel workers)  (default 4)
+#   BATCH_SIZE      inherit | single | <int>                     (default inherit)
+#   THRESHOLD       IoU collapse threshold for evaluation        (default 0.5)
+#   MAX_CONCURRENT  cap on simultaneously RUNNING array elements (default: no cap)
 #
-# Example:
+# Example (8 workers, at most 4 running at once):
 #   scripts/bsub_vos_comparison.sh \
 #     /sc/arion/projects/KennyComputational/Behavior/projects/3c9bddf2-Home-Cage-Interactions-0126-test-day \
-#     8
+#     8 inherit 0.5 4
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -29,6 +30,7 @@ SOURCE_PROJECT="$1"
 N_JOBS="${2:-4}"
 BATCH_SIZE="${3:-inherit}"
 THRESHOLD="${4:-0.5}"
+MAX_CONCURRENT="${5:-}"
 
 REPO_ROOT="/sc/arion/projects/KennyComputational/Behavior/Grounded-SAM3-Instruct-WebTrack"
 SCRIPT_DIR="${REPO_ROOT}/scripts"
@@ -64,17 +66,19 @@ EVAL_NAME="vose_${TAG}"
 
 export PROJECT_DIR THRESHOLD
 
-# ── 2. Submit N parallel tracking jobs (same PROJECT_DIR ⇒ they split videos) ─
-echo "── Submitting ${N_JOBS} tracking job(s) as '${TRACK_NAME}'"
-for i in $(seq 1 "${N_JOBS}"); do
-    bsub -J "${TRACK_NAME}" < "${SCRIPT_DIR}/bsub_vos_comparison_track.bsub"
-done
+# ── 2. Submit the tracking job ARRAY (elements split videos via claims file) ──
+ARRAY_SPEC="${TRACK_NAME}[1-${N_JOBS}]"
+if [[ -n "${MAX_CONCURRENT}" ]]; then
+    ARRAY_SPEC="${ARRAY_SPEC}%${MAX_CONCURRENT}"
+fi
+echo "── Submitting tracking array as '${ARRAY_SPEC}'"
+bsub -J "${ARRAY_SPEC}" < "${SCRIPT_DIR}/bsub_vos_comparison_track.bsub"
 
-# ── 3. Submit eval+figures, gated on every tracking job finishing ────────────
-# 'ended' (not 'done') fires once ALL jobs with that name have ended, regardless
-# of exit status — so one failed tracker can't leave the eval job pending forever
+# ── 3. Submit the eval+figures master, gated on the whole array finishing ────
+# 'ended' (not 'done') fires once ALL array elements have ended, regardless of
+# exit status — so one failed element can't leave the master pending forever
 # (evaluation scores whatever masks were produced).
-echo "── Submitting eval+figures as '${EVAL_NAME}' (waits for '${TRACK_NAME}')"
+echo "── Submitting eval+figures master as '${EVAL_NAME}' (waits for '${TRACK_NAME}')"
 bsub -J "${EVAL_NAME}" -w "ended(\"${TRACK_NAME}\")" \
      < "${SCRIPT_DIR}/bsub_vos_comparison_eval.bsub"
 
