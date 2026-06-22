@@ -199,7 +199,9 @@ def evaluate_project(
         tmp.write_text(json.dumps(res, indent=2, default=_json_default))
         tmp.replace(results_json)
         if timelines:
-            tmp_npz = timelines_npz.with_suffix(".npz.tmp")
+            # Temp name MUST end in .npz, else np.savez_compressed appends ".npz"
+            # (writing timelines.tmp.npz.npz) and the replace below would fail.
+            tmp_npz = timelines_npz.with_name("timelines.tmp.npz")
             np.savez_compressed(tmp_npz, **timelines)
             tmp_npz.replace(timelines_npz)
         return res
@@ -355,6 +357,13 @@ def merge_shards(
     timelines: dict[str, np.ndarray] = {}
     for d in shard_dirs:
         p = d / "timelines.npz"
+        if not p.is_file():
+            # Tolerate the stray temp file left by the old checkpoint bug
+            # (np.savez auto-appended .npz to "timelines.npz.tmp").
+            for alt in ("timelines.tmp.npz", "timelines.npz.tmp.npz"):
+                if (d / alt).is_file():
+                    p = d / alt
+                    break
         if p.is_file():
             with np.load(p) as z:
                 for k in z.files:
