@@ -1,8 +1,10 @@
-import React, { useCallback, useRef, useState, useMemo } from 'react'
-import { X, Upload, Film, Server, FolderOpen, Search, CheckSquare, Square, AlertTriangle } from 'lucide-react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { X, Upload, Film, Server, FolderOpen, Search, CheckSquare, Square, AlertTriangle, FolderSearch } from 'lucide-react'
 import { useStore } from '../store/useStore'
-import { createProject, addVideo, importVideo, getProject, browseDirectory } from '../api/client'
-import type { BrowseEntry, DownsampleOptions } from '../api/client'
+import { createProject, addVideo, importVideo, getProject, browseDirectory, getProjectsRoot } from '../api/client'
+import type { BrowseEntry, DownsampleOptions, ProjectsRootInfo } from '../api/client'
+import FolderBrowserModal, { type FolderBrowserQuickJump } from './FolderBrowserModal'
+import { pathDirname } from '../utils/fsPaths'
 
 type InputMode = 'upload' | 'server' | 'folder'
 
@@ -93,6 +95,10 @@ export default function UploadModal() {
   const [recursive, setRecursive] = useState(true)
   const [scanDepth, setScanDepth] = useState(0)
 
+  // Server filesystem browser
+  const [pathBrowse, setPathBrowse] = useState<'folder' | 'file' | null>(null)
+  const [fsRootInfo, setFsRootInfo] = useState<ProjectsRootInfo | null>(null)
+
   // Symlink (server/folder modes only)
   const [useSymlink, setUseSymlink] = useState(true)
 
@@ -117,6 +123,44 @@ export default function UploadModal() {
     return browseFiles.filter(f => matchesPatterns(f.name, includePattern, excludePattern))
   }, [browseFiles, includePattern, excludePattern])
 
+  const fsQuickJumps = useMemo((): FolderBrowserQuickJump[] => {
+    if (!fsRootInfo) return []
+    const jumps: FolderBrowserQuickJump[] = []
+    if (fsRootInfo.home) {
+      jumps.push({
+        id: 'home',
+        label: 'Home',
+        path: fsRootInfo.home,
+        icon: <FolderOpen size={12} />,
+        title: fsRootInfo.home,
+      })
+    }
+    if (fsRootInfo.app_root) {
+      jumps.push({
+        id: 'app',
+        label: 'App folder',
+        path: fsRootInfo.app_root,
+        icon: <Server size={12} />,
+        title: fsRootInfo.app_root,
+      })
+    }
+    return jumps
+  }, [fsRootInfo])
+
+  const fsFallbackPaths = useMemo(() => {
+    if (!fsRootInfo) return []
+    return [fsRootInfo.home, fsRootInfo.app_root, fsRootInfo.active_root].filter(
+      (v, i, arr) => v && arr.indexOf(v) === i,
+    )
+  }, [fsRootInfo])
+
+  useEffect(() => {
+    if (!uploadModalOpen) return
+    getProjectsRoot()
+      .then(setFsRootInfo)
+      .catch(() => setFsRootInfo(null))
+  }, [uploadModalOpen])
+
   function handleClose() {
     if (busy) return
     setUploadModalOpen(false)
@@ -137,6 +181,7 @@ export default function UploadModal() {
     setScanDepth(0)
     setImportProceedPrompt(null)
     proceedResolverRef.current = null
+    setPathBrowse(null)
   }
 
   function resolveImportProceed(cont: boolean) {
@@ -229,28 +274,40 @@ export default function UploadModal() {
     }
   }
 
-  async function handleScanFolder() {
-    if (!folderPath.trim()) {
+  async function handleScanFolder(pathOverride?: string) {
+    const target = (pathOverride ?? folderPath).trim()
+    if (!target) {
       setError('Please enter a folder path')
       return
     }
+    if (pathOverride) setFolderPath(pathOverride)
     setScanning(true)
     setError('')
     setBrowseFiles(null)
     setCheckedPaths(new Set())
     try {
-      const result = await browseDirectory(folderPath.trim(), recursive ? scanDepth : 1)
+      const result = await browseDirectory(target, recursive ? scanDepth : 1)
       setBrowseFiles(result.files)
-      // Auto-select all video files
       const videoPaths = new Set(result.files.filter(f => f.is_video).map(f => f.path))
       setCheckedPaths(videoPaths)
     } catch (e: unknown) {
-      const axiosErr = e as any
+      const axiosErr = e as { response?: { data?: { detail?: string } } }
       const detail = axiosErr?.response?.data?.detail
-      setError(detail ?? (e instanceof Error ? e.message : 'Scan failed'))
+      setError(typeof detail === 'string' ? detail : (e instanceof Error ? e.message : 'Scan failed'))
     } finally {
       setScanning(false)
     }
+  }
+
+  function handleFolderBrowseSelect(path: string) {
+    setPathBrowse(null)
+    void handleScanFolder(path)
+  }
+
+  function handleFileBrowseSelect(path: string) {
+    setServerPath(path)
+    setPathBrowse(null)
+    setError('')
   }
 
   // Re-sync checked set when filter changes: uncheck files no longer visible
@@ -436,17 +493,29 @@ export default function UploadModal() {
           {inputMode === 'server' && (
             <div className="space-y-2">
               <label className="text-xs text-[#888] font-medium">Video file path on server</label>
-              <input
-                type="text"
-                value={serverPath}
-                onChange={e => setServerPath(e.target.value)}
-                onKeyDown={e => e.key === 'Enter' && handleImport()}
-                placeholder="/path/to/video.mp4"
-                className="w-full font-mono text-sm"
-                disabled={busy}
-              />
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={serverPath}
+                  onChange={e => setServerPath(e.target.value)}
+                  onKeyDown={e => e.key === 'Enter' && handleImport()}
+                  placeholder="/path/to/video.mp4"
+                  className="flex-1 font-mono text-sm"
+                  disabled={busy}
+                />
+                <button
+                  type="button"
+                  onClick={() => setPathBrowse('file')}
+                  disabled={busy}
+                  className="btn btn-secondary flex items-center gap-1.5 px-3 flex-shrink-0"
+                  title="Browse server filesystem"
+                >
+                  <FolderSearch size={13} />
+                  Browse…
+                </button>
+              </div>
               <p className="text-xs text-[#555]">
-                Enter the absolute path to a video file on the server filesystem.
+                Enter the absolute path to a video file on the server filesystem, or browse to select one.
                 Supported formats: MP4, AVI, MOV, MKV, WebM
               </p>
             </div>
@@ -463,13 +532,23 @@ export default function UploadModal() {
                     type="text"
                     value={folderPath}
                     onChange={e => setFolderPath(e.target.value)}
-                    onKeyDown={e => e.key === 'Enter' && handleScanFolder()}
+                    onKeyDown={e => e.key === 'Enter' && void handleScanFolder()}
                     placeholder="/path/to/folder"
                     className="flex-1 font-mono text-sm"
                     disabled={busy || scanning}
                   />
                   <button
-                    onClick={handleScanFolder}
+                    type="button"
+                    onClick={() => setPathBrowse('folder')}
+                    disabled={busy || scanning}
+                    className="btn btn-secondary flex items-center gap-1.5 px-3 flex-shrink-0"
+                    title="Browse server filesystem"
+                  >
+                    <FolderSearch size={13} />
+                    Browse…
+                  </button>
+                  <button
+                    onClick={() => void handleScanFolder()}
                     disabled={!folderPath.trim() || busy || scanning}
                     className="btn btn-secondary flex items-center gap-1.5 px-3 flex-shrink-0"
                   >
@@ -849,6 +928,28 @@ export default function UploadModal() {
           )}
         </div>
       </div>
+      {pathBrowse && (
+        <FolderBrowserModal
+          open
+          mode={pathBrowse}
+          title={pathBrowse === 'folder' ? 'Choose folder' : 'Choose video file'}
+          subtitle={
+            pathBrowse === 'folder'
+              ? 'Navigate into a folder, then confirm to scan it for videos'
+              : 'Navigate folders and select a video file (double-click to open)'
+          }
+          confirmLabel={pathBrowse === 'folder' ? 'Select folder' : 'Open file'}
+          initialPath={
+            pathBrowse === 'folder'
+              ? (folderPath.trim() || fsRootInfo?.home)
+              : (serverPath.trim() ? pathDirname(serverPath.trim()) : fsRootInfo?.home)
+          }
+          fallbackPaths={fsFallbackPaths}
+          quickJumps={fsQuickJumps}
+          onClose={() => setPathBrowse(null)}
+          onSelect={pathBrowse === 'folder' ? handleFolderBrowseSelect : handleFileBrowseSelect}
+        />
+      )}
       {importProceedPrompt && (
         <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/75 p-4 pointer-events-auto">
           <div className="bg-[#252525] border border-[#3a3a3a] rounded-xl max-w-lg w-full p-5 shadow-2xl pointer-events-auto">

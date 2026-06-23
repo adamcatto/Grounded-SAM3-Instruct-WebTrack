@@ -973,6 +973,8 @@ def fs_list_dir(path: str = Query("")):
         except OSError:
             continue
         is_project = False
+        size = 0
+        is_video = False
         if is_dir:
             cfg = entry / "config.json"
             if cfg.is_file():
@@ -981,6 +983,12 @@ def fs_list_dir(path: str = Query("")):
                     is_project = isinstance(meta.get("id"), str) and len(meta.get("id", "")) > 0
                 except (OSError, json.JSONDecodeError, TypeError, ValueError):
                     is_project = False
+        else:
+            try:
+                size = entry.stat().st_size
+            except OSError:
+                size = 0
+            is_video = entry.suffix.lower() in VIDEO_EXTENSIONS
         try:
             rpath = str(entry.resolve())
         except OSError:
@@ -990,6 +998,8 @@ def fs_list_dir(path: str = Query("")):
             "path": rpath,
             "is_dir": is_dir,
             "is_project": is_project,
+            "size": size,
+            "is_video": is_video,
         })
     return {"path": str(target), "parent": parent, "entries": entries}
 

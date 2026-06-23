@@ -41,6 +41,8 @@ export interface FsListEntry {
   path: string
   is_dir: boolean
   is_project: boolean
+  size: number
+  is_video: boolean
 }
 
 export interface FsListDirResponse {
