@@ -11,12 +11,12 @@
 #BSUB -eo /sc/arion/projects/KennyComputational/Behavior/logs/%J.err
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Reduce master: combine the sharded eval outputs (_shards/shard_*) into the
-# top-level results.json + CSVs + timelines.npz, then render figures + tables.
+# Reduce master: merge the sharded eval outputs (_shards/shard_*) → analyze
+# (derive mean/min/per-object series + collapse/duration stats) → figures + tables.
 # Runs after the eval array finishes (chained via -w by scripts/bsub_vos_comparison.sh).
 #
 # Required env: PROJECT_DIR
-# Optional env: THRESHOLD (default 0.5)
+# Optional env: THRESHOLD (default 0.5), MIN_RUN (default 150)
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -euo pipefail
@@ -39,6 +39,7 @@ export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
 export SAM3_PROJECTS_DIR="$(dirname "${PROJECT_DIR}")"
 
 python -m experiments.vos_comparison merge   --project "${PROJECT_DIR}" --threshold "${THRESHOLD}"
+python -m experiments.vos_comparison analyze --project "${PROJECT_DIR}" --threshold "${THRESHOLD}" --min-run "${MIN_RUN:-150}"
 python -m experiments.vos_comparison figures --project "${PROJECT_DIR}" --threshold "${THRESHOLD}"
 
 echo "Results under: ${PROJECT_DIR}/vos_comparison_results/"

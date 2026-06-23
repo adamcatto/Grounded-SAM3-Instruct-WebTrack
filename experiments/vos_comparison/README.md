@@ -21,14 +21,41 @@ only the first anchor's point prompts; all propagation state is reset. A
 `/propagate` endpoint (the same path the UI uses, so all SAM3 session workarounds
 are reused). Predicted masks are written to each video's `masks.sqlite`.
 
-`evaluate` and `figures` produce, under `<project>/vos_comparison_results/`:
+The analysis is split into three cheap-to-iterate stages after tracking:
+
+- **`evaluate`** — the only expensive stage: decodes masks and writes the raw
+  per-(video, frame, object) Jaccard/IoU to `per_object_iou.csv`. Shardable.
+- **`analyze`** — derives *everything else* from `per_object_iou.csv` (no mask
+  decoding), so you can re-run with new thresholds/metrics in seconds. For each
+  video it builds three per-frame IoU **reductions** — `mean` over objects, `min`
+  over objects (worst object), and each **object** separately — and computes
+  collapse + time-below-threshold + time-at-zero statistics for each.
+- **`figures`** — renders the figure tree and LaTeX tables (backend-free).
+
+Outputs under `<project>/vos_comparison_results/`:
 
 ```
-per_frame_iou.csv      per_object_iou.csv     video_summary.csv
-object_summary.csv     results.json           timelines.npz
-figures/  fig_iou_curves  fig_aggregate_band  fig_survival  fig_summary_bars   (.pdf + .png)
-tables/   table_per_video.tex   table_aggregate.tex                            (booktabs)
+per_object_iou.csv     per_frame_iou.csv      timelines.npz      results.json
+video_summary.csv      object_summary.csv                        (mean-reduction collapse)
+collapse_stats.csv     # one row per (video, reduction): time-collapsed, time-below-τ,
+                       #   time-at-zero, longest run, … on raw and rolling-average IoU
+aggregate_stats.csv    # one row per (reduction, metric): cross-video mean/median/IQR/min/max
+
+figures/
+  curves/      mean  min  objects_overlay  objects_facets        # per-video small multiples
+  aggregate/   band_{mean,min,objects}  survival_{mean,min,objects}
+  summary/     box_<metric>  summary_overview                    # boxplots by reduction
+  bars/        per_video_summary
+tables/        table_aggregate.tex  table_per_video.tex  table_collapse_by_reduction.tex
 ```
+
+**Reductions** (how per-object IoU becomes a per-frame signal): `mean` is the
+default video signal but masks single-object failures in multi-object scenes;
+`min` is the worst-object signal; per-`object` series expose exactly which object
+failed and when. Every collapse/duration metric and most figures are produced for
+all three. **Collapse / "time collapsed"** = frames where the rolling-average IoU
+stays below τ for ≥ `--min-run` (default 150) consecutive frames; companion
+metrics count *any* frame below τ and *any* frame at zero IoU.
 
 ## Usage
 
@@ -49,8 +76,14 @@ python -m experiments.vos_comparison all \
 python -m experiments.vos_comparison build    --source-project <ref>
 python -m experiments.vos_comparison track    --project single_shot_vos_<ref> --backend http://127.0.0.1:8000
 python -m experiments.vos_comparison evaluate --project single_shot_vos_<ref> --threshold 0.5
+python -m experiments.vos_comparison analyze  --project single_shot_vos_<ref> --threshold 0.5 --min-run 150
 python -m experiments.vos_comparison figures  --project single_shot_vos_<ref>
 ```
+
+`analyze` + `figures` read only CSV/npz, so you can iterate on thresholds,
+`--min-run`, or plots without re-running the expensive `evaluate` stage. On the
+HPC the chained launcher runs `evaluate` as a sharded array and a reduce master
+that does `merge → analyze → figures` (see `scripts/bsub_vos_comparison*.{sh,bsub}`).
 
 Projects are resolved the same way as the backend: by filesystem path, folder
 name, or short id, searched under `$SAM3_TRACKING_PROJECTS_DIR` /

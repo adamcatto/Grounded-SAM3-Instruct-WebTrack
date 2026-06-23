@@ -91,7 +91,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Directory holding shard_* subdirs (default <out-dir>/_shards).")
     _add_threshold_args(pm)
 
-    pf = sub.add_parser("figures", help="Render figures + LaTeX tables from results.")
+    pan = sub.add_parser("analyze",
+                         help="Derive series/collapse/duration stats from per_object_iou.csv (no masks).")
+    pan.add_argument("--project", required=True, help="Single-shot project: path, name, or id.")
+    pan.add_argument("--min-run", type=int, default=150,
+                     help="Min consecutive frames of rolling IoU<τ to count as collapsed (default %(default)s).")
+    _add_threshold_args(pan)
+
+    pf = sub.add_parser("figures", help="Render figures + LaTeX tables from analyzed results.")
     pf.add_argument("--project", required=True, help="Single-shot project: path, name, or id.")
     pf.add_argument("--out-dir", default=None, help="Results directory (default <project>/vos_comparison_results).")
     pf.add_argument("--threshold", type=float, default=None, help="Override τ used for figure annotations.")
@@ -172,6 +179,20 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
+    if args.cmd == "analyze":
+        from .analyze import analyze_project
+
+        project_dir = _resolve(args.project)
+        analyze_project(
+            project_dir,
+            out_dir=_out_dir(args, project_dir),
+            threshold=args.threshold,
+            window=args.window,
+            persist_frac=args.persist_frac,
+            min_run=args.min_run,
+        )
+        return 0
+
     if args.cmd == "figures":
         from .figures import make_figures
 
@@ -180,6 +201,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "all":
+        from .analyze import analyze_project
         from .evaluation import evaluate_project
         from .figures import make_figures
         from .project_builder import build_single_shot_project
@@ -199,6 +221,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[all] tracking exited with code {rc}; evaluating what completed.")
         out_dir = _out_dir(args, project_dir)
         evaluate_project(
+            project_dir,
+            out_dir=out_dir,
+            threshold=args.threshold,
+            window=args.window,
+            persist_frac=args.persist_frac,
+        )
+        analyze_project(
             project_dir,
             out_dir=out_dir,
             threshold=args.threshold,

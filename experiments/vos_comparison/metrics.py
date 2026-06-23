@@ -135,6 +135,92 @@ def detect_collapse(
     }
 
 
+def consecutive_runs(mask: np.ndarray) -> list[tuple[int, int]]:
+    """Maximal runs of True in a 1-D boolean array as (start_index, length)."""
+    m = np.asarray(mask, dtype=bool).astype(np.int8)
+    if m.size == 0:
+        return []
+    d = np.diff(np.concatenate(([np.int8(0)], m, [np.int8(0)])))
+    starts = np.flatnonzero(d == 1)
+    ends = np.flatnonzero(d == -1)
+    return [(int(s), int(e - s)) for s, e in zip(starts, ends)]
+
+
+def duration_stats(
+    frame_indices: np.ndarray,
+    series: np.ndarray,
+    *,
+    threshold: float,
+    window: int,
+    min_run: int = 150,
+    zero_eps: float = 1e-6,
+) -> dict:
+    """How long an IoU series spends below threshold / at zero, plus sustained collapse.
+
+    Computed for one per-frame series (a reduction over objects, or a single object).
+    "any" = every scored frame meeting the condition (no run constraint); "sustained"
+    = frames inside runs of >= ``min_run`` consecutive frames on the *rolling-average*
+    series (the "amount of time the video is collapsed"). Fractions for the raw/rolling
+    counts are over scored frames; collapse fractions are over the full series length.
+    NaN (unscored / object absent) frames are excluded from the counts.
+    """
+    fi = np.asarray(frame_indices)
+    v = np.asarray(series, dtype=np.float64)
+    n = int(v.size)
+    valid = np.isfinite(v)
+    nval = int(valid.sum())
+
+    below_raw = valid & (v < threshold)
+    zero_raw = valid & (v <= zero_eps)
+
+    roll = rolling_mean(v, window)
+    rvalid = np.isfinite(roll)
+    nrval = int(rvalid.sum())
+    below_roll = rvalid & (roll < threshold)
+    zero_roll = rvalid & (roll <= zero_eps)
+
+    def _sustained(mask: np.ndarray) -> tuple[int, int, int, int | None]:
+        runs = [(s, ln) for (s, ln) in consecutive_runs(mask) if ln >= min_run]
+        total = int(sum(ln for _, ln in runs))
+        longest = int(max((ln for _, ln in runs), default=0))
+        first = int(fi[runs[0][0]]) if runs else None
+        return total, longest, len(runs), first
+
+    sb_total, sb_long, sb_n, sb_first = _sustained(below_roll)
+    sz_total, sz_long, sz_n, sz_first = _sustained(zero_roll)
+    fin = v[valid]
+
+    return {
+        "n_frames": n,
+        "n_scored": nval,
+        "mean_iou": float(fin.mean()) if nval else float("nan"),
+        "median_iou": float(np.median(fin)) if nval else float("nan"),
+        "min_run": int(min_run),
+        # "any value" conditions on the raw per-frame series (over scored frames)
+        "frames_below_thresh": int(below_raw.sum()),
+        "frac_below_thresh": float(below_raw.sum() / nval) if nval else float("nan"),
+        "frames_zero": int(zero_raw.sum()),
+        "frac_zero": float(zero_raw.sum() / nval) if nval else float("nan"),
+        # same conditions on the rolling-average series (over rolling-valid frames)
+        "roll_frames_below_thresh": int(below_roll.sum()),
+        "roll_frac_below_thresh": float(below_roll.sum() / nrval) if nrval else float("nan"),
+        "roll_frames_zero": int(zero_roll.sum()),
+        "roll_frac_zero": float(zero_roll.sum() / nrval) if nrval else float("nan"),
+        # sustained collapse: rolling avg below threshold for >= min_run consecutive frames
+        "collapsed_frames": sb_total,
+        "collapsed_frac": float(sb_total / n) if n else float("nan"),
+        "collapsed_longest_run": sb_long,
+        "collapsed_n_runs": sb_n,
+        "collapse_start_frame": sb_first,
+        # sustained zero: rolling avg ~0 for >= min_run consecutive frames
+        "zero_collapsed_frames": sz_total,
+        "zero_collapsed_frac": float(sz_total / n) if n else float("nan"),
+        "zero_collapsed_longest_run": sz_long,
+        "zero_collapsed_n_runs": sz_n,
+        "zero_collapse_start_frame": sz_first,
+    }
+
+
 def _finite(x: np.ndarray) -> np.ndarray:
     x = np.asarray(x, dtype=np.float64)
     return x[np.isfinite(x)]
