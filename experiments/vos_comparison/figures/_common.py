@@ -41,10 +41,11 @@ def apply_paper_style() -> None:
 
 def save(fig, out_dir: Path, name: str) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    for ext in ("pdf", "png"):
+    exts = ("pdf", "png", "svg")
+    for ext in exts:
         fig.savefig(out_dir / f"{name}.{ext}")
     plt.close(fig)
-    print(f"[figures]   {out_dir.name}/{name}.pdf/.png")
+    print(f"[figures]   {out_dir.name}/{name}.{{{','.join(exts)}}}")
 
 
 # ── tiny typed-CSV helpers (no pandas) ─────────────────────────────────────
