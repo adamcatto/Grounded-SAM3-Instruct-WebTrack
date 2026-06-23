@@ -968,8 +968,6 @@ def fs_list_dir(path: str = Query("")):
     except PermissionError:
         raise HTTPException(403, "Permission denied")
     for entry in subs:
-        if entry.name.startswith("."):
-            continue
         try:
             is_dir = entry.is_dir()
         except OSError:
