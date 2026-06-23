@@ -29,13 +29,17 @@ REDUCTION_COLOR = {"mean": C_SINGLE, "min": C_MIN, "object": "#16A085"}
 
 def apply_paper_style() -> None:
     plt.rcParams.update({
-        "figure.dpi": 150, "savefig.dpi": 300, "savefig.bbox": "tight",
+        "figure.dpi": 150, "savefig.dpi": 600, "savefig.bbox": "tight",
         "font.family": "serif", "font.size": 10,
         "axes.titlesize": 10, "axes.labelsize": 10, "legend.fontsize": 8,
         "xtick.labelsize": 8, "ytick.labelsize": 8,
         "axes.grid": True, "grid.alpha": 0.25,
         "axes.spines.top": False, "axes.spines.right": False,
         "lines.linewidth": 1.3,
+        # Embed TrueType (Type 42) fonts so PDFs pass IEEE/ACM/CVPR PDF checks
+        # (matplotlib's default Type 3 fonts are commonly rejected). Keep SVG text
+        # as selectable <text> rather than outlined paths.
+        "pdf.fonttype": 42, "ps.fonttype": 42, "svg.fonttype": "none",
     })
 
 
