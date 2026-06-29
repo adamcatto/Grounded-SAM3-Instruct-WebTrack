@@ -18,27 +18,33 @@ from experiments.vos_comparison.metrics import mask_iou, summarize_series
 PER_FRAME_FIELDS = [
     "video_id", "video_name", "frame", "mean_iou", "min_iou",
     "n_anchor_objects", "n_queue_objects", "n_missing_objects",
+    "n_low_iou_objects", "n_lost_objects",
 ]
 PER_OBJECT_FIELDS = [
     "video_id", "video_name", "frame", "object_id", "object_name",
     "anchor_present", "queue_present", "anchor_area", "queue_area", "iou",
-    "entered_after_absence",
+    "low_iou", "lost_tracking", "entered_after_absence",
 ]
 OBJECT_SUMMARY_FIELDS = [
     "video_id", "video_name", "object_id", "object_name",
     "n_present_anchor_frames", "n_present_queue_frames", "n_missing_frames",
+    "n_low_iou_frames", "n_lost_frames",
     "mean_iou", "median_iou", "frac_frames_above_threshold",
-    "frac_present_frames_missed", "reentry_events", "missed_reentry_events",
+    "frac_present_frames_missed", "frac_present_frames_low_iou",
+    "frac_present_frames_lost", "reentry_events", "missed_reentry_events",
     "mean_iou_on_reentry_window", "missed_frames_after_reentry",
+    "lost_frames_after_reentry",
 ]
 VIDEO_SUMMARY_FIELDS = [
     "video_id", "video_name", "num_frames", "num_scored_frames",
     "mean_iou", "median_iou", "mean_min_iou", "frac_frames_above_threshold",
-    "total_missing_object_frames", "total_reentry_events", "missed_reentry_events",
+    "total_missing_object_frames", "total_low_iou_object_frames",
+    "total_lost_object_frames", "total_reentry_events", "missed_reentry_events",
 ]
 REENTRY_FIELDS = [
     "video_id", "video_name", "object_id", "object_name", "frame",
     "absence_length", "window", "mean_iou_window", "missed_frames_window",
+    "low_iou_frames_window", "lost_frames_window",
 ]
 
 
@@ -104,6 +110,7 @@ def evaluate_project(
     *,
     out_dir: Path | None = None,
     threshold: float = DEFAULT_IOU_THRESHOLD,
+    low_iou_threshold: float = 0.2,
     min_absence_frames: int = 30,
     reentry_window: int = 90,
 ) -> dict[str, Any]:
@@ -150,6 +157,8 @@ def evaluate_project(
             present_anchor = 0
             present_queue = 0
             missing = 0
+            low_iou = 0
+            lost = 0
             oids = sorted(set(expected_oids) | set(anchor.keys()), key=lambda x: (not x.isdigit(), int(x) if x.isdigit() else x))
             for oid in oids:
                 am = anchor.get(oid)
@@ -171,6 +180,10 @@ def evaluate_project(
                     frame_ious.append(val)
                     if not q_present:
                         missing += 1
+                    elif val < low_iou_threshold:
+                        low_iou += 1
+                    if (not q_present) or val < low_iou_threshold:
+                        lost += 1
                 if q_present:
                     present_queue += 1
                 if oid in obj_iou:
@@ -186,12 +199,15 @@ def evaluate_project(
                     "video_id": vid, "video_name": name, "frame": int(frame),
                     "mean_iou": mean_series[row], "min_iou": min_series[row],
                     "n_anchor_objects": present_anchor, "n_queue_objects": present_queue,
-                    "n_missing_objects": missing,
+                    "n_missing_objects": missing, "n_low_iou_objects": low_iou,
+                    "n_lost_objects": lost,
                 })
 
         total_reentries = 0
         missed_reentries = 0
         total_missing_object_frames = 0
+        total_low_iou_object_frames = 0
+        total_lost_object_frames = 0
         for oid in sorted(obj_iou.keys(), key=lambda x: (not x.isdigit(), int(x) if x.isdigit() else x)):
             flags, absence_lengths = _entry_flags(obj_anchor_present[oid], min_absence_frames)
             total_reentries += int(flags.sum())
@@ -199,9 +215,14 @@ def evaluate_project(
             present = obj_anchor_present[oid]
             queue_present = obj_queue_present[oid]
             missing_mask = present & ~queue_present
+            low_iou_mask = present & queue_present & np.isfinite(vals) & (vals < low_iou_threshold)
+            lost_mask = missing_mask | low_iou_mask
             total_missing_object_frames += int(missing_mask.sum())
+            total_low_iou_object_frames += int(low_iou_mask.sum())
+            total_lost_object_frames += int(lost_mask.sum())
             missed_obj_reentries = 0
             missed_after = 0
+            lost_after = 0
             window_iou_vals: list[float] = []
             for idx in np.flatnonzero(flags):
                 hi = min(frames.size, idx + reentry_window)
@@ -209,11 +230,14 @@ def evaluate_project(
                 win_queue = queue_present[idx:hi]
                 win_iou = vals[idx:hi]
                 miss_count = int((win_present & ~win_queue).sum())
+                low_count = int((win_present & win_queue & np.isfinite(win_iou) & (win_iou < low_iou_threshold)).sum())
+                lost_count = miss_count + low_count
                 missed_after += miss_count
+                lost_after += lost_count
                 finite = win_iou[np.isfinite(win_iou)]
                 mean_win = float(finite.mean()) if finite.size else float("nan")
                 window_iou_vals.append(mean_win)
-                if miss_count > 0:
+                if lost_count > 0:
                     missed_obj_reentries += 1
                 reentry_rows.append({
                     "video_id": vid, "video_name": name, "object_id": oid,
@@ -221,6 +245,8 @@ def evaluate_project(
                     "absence_length": int(absence_lengths.get(int(idx), 0)),
                     "window": int(hi - idx), "mean_iou_window": mean_win,
                     "missed_frames_window": miss_count,
+                    "low_iou_frames_window": low_count,
+                    "lost_frames_window": lost_count,
                 })
             missed_reentries += missed_obj_reentries
 
@@ -235,6 +261,8 @@ def evaluate_project(
                     "anchor_area": int(obj_anchor_area[oid][row]),
                     "queue_area": int(obj_queue_area[oid][row]),
                     "iou": float(vals[row]) if np.isfinite(vals[row]) else "",
+                    "low_iou": bool(low_iou_mask[row]),
+                    "lost_tracking": bool(lost_mask[row]),
                     "entered_after_absence": bool(flags[row]),
                 })
             mean_iou, med_iou = _safe_stats(vals[present].tolist())
@@ -245,14 +273,19 @@ def evaluate_project(
                 "n_present_anchor_frames": int(present.sum()),
                 "n_present_queue_frames": int((present & queue_present).sum()),
                 "n_missing_frames": int(missing_mask.sum()),
+                "n_low_iou_frames": int(low_iou_mask.sum()),
+                "n_lost_frames": int(lost_mask.sum()),
                 "mean_iou": mean_iou,
                 "median_iou": med_iou,
                 "frac_frames_above_threshold": float(above.mean()) if above.size else float("nan"),
                 "frac_present_frames_missed": float(missing_mask.sum() / present.sum()) if present.sum() else float("nan"),
+                "frac_present_frames_low_iou": float(low_iou_mask.sum() / present.sum()) if present.sum() else float("nan"),
+                "frac_present_frames_lost": float(lost_mask.sum() / present.sum()) if present.sum() else float("nan"),
                 "reentry_events": int(flags.sum()),
                 "missed_reentry_events": int(missed_obj_reentries),
                 "mean_iou_on_reentry_window": _safe_stats(window_iou_vals)[0],
                 "missed_frames_after_reentry": int(missed_after),
+                "lost_frames_after_reentry": int(lost_after),
             })
 
         finite_mean = mean_series[np.isfinite(mean_series)]
@@ -265,6 +298,8 @@ def evaluate_project(
             "mean_min_iou": float(finite_min.mean()) if finite_min.size else float("nan"),
             "frac_frames_above_threshold": float((finite_mean >= threshold).mean()) if finite_mean.size else float("nan"),
             "total_missing_object_frames": int(total_missing_object_frames),
+            "total_low_iou_object_frames": int(total_low_iou_object_frames),
+            "total_lost_object_frames": int(total_lost_object_frames),
             "total_reentry_events": int(total_reentries),
             "missed_reentry_events": int(missed_reentries),
         })
@@ -279,6 +314,15 @@ def evaluate_project(
             timelines[f"{vid}__obj__{oid}"] = arr
             timelines[f"{vid}__present__{oid}"] = obj_anchor_present[oid].astype(np.uint8)
             timelines[f"{vid}__queue_present__{oid}"] = obj_queue_present[oid].astype(np.uint8)
+            low_iou_arr = (
+                obj_anchor_present[oid]
+                & obj_queue_present[oid]
+                & np.isfinite(arr)
+                & (arr < low_iou_threshold)
+            )
+            lost_arr = (obj_anchor_present[oid] & ~obj_queue_present[oid]) | low_iou_arr
+            timelines[f"{vid}__low_iou__{oid}"] = low_iou_arr.astype(np.uint8)
+            timelines[f"{vid}__lost__{oid}"] = lost_arr.astype(np.uint8)
 
     _write_csv(out_dir / "per_frame_iou.csv", per_frame_rows, PER_FRAME_FIELDS)
     _write_csv(out_dir / "per_object_iou.csv", per_object_rows, PER_OBJECT_FIELDS)
@@ -297,15 +341,23 @@ def evaluate_project(
         "queue_project_id": manifest.get("queue_project_id"),
         "queue_project_dir": manifest.get("queue_project_dir"),
         "threshold": threshold,
+        "low_iou_threshold": low_iou_threshold,
         "min_absence_frames": min_absence_frames,
         "reentry_window": reentry_window,
+        "anchor_frames_by_video": {
+            str(v["video_id"]): [int(x) for x in v.get("annotated_anchors", [])]
+            for v in manifest.get("videos", [])
+        },
         "aggregate": agg,
         "videos": video_summaries,
         "objects": object_summaries,
     }
     (out_dir / "results.json").write_text(json.dumps(results, indent=2, default=_json_default))
     print(f"[evaluate] wrote {out_dir}")
-    print(f"[evaluate] mean IoU={agg.get('mean_iou'):.3f}; missing object-frames={agg.get('total_missing_object_frames')}")
+    print(
+        f"[evaluate] mean IoU={agg.get('mean_iou'):.3f}; "
+        f"lost object-frames={agg.get('total_lost_object_frames')}"
+    )
     return results
 
 
@@ -321,6 +373,8 @@ def _aggregate(video_rows: list[dict[str, Any]], object_rows: list[dict[str, Any
         "median_video_iou": float(np.nanmedian(means)),
         "mean_object_iou": float(np.nanmean(obj_means)) if obj_means.size else float("nan"),
         "total_missing_object_frames": int(sum(r["total_missing_object_frames"] for r in video_rows)),
+        "total_low_iou_object_frames": int(sum(r["total_low_iou_object_frames"] for r in video_rows)),
+        "total_lost_object_frames": int(sum(r["total_lost_object_frames"] for r in video_rows)),
         "total_reentry_events": int(sum(r["total_reentry_events"] for r in video_rows)),
         "missed_reentry_events": int(sum(r["missed_reentry_events"] for r in video_rows)),
     }

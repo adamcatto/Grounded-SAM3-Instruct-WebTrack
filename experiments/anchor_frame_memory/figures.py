@@ -64,7 +64,7 @@ def make_figures(out_dir: Path) -> None:
     _plot_timecourse(tl, video_rows, reentry_rows, results, fig_dir)
     _plot_object_facets(tl, object_rows, reentry_rows, results, fig_dir)
     _plot_summary_bars(object_rows, video_rows, fig_dir)
-    _plot_missing_timeline(per_frame, fig_dir)
+    _plot_missing_timeline(per_frame, results, fig_dir)
     _plot_reentry_windows(reentry_rows, fig_dir)
 
 
@@ -114,7 +114,15 @@ def _plot_object_facets(tl, object_rows, reentry_rows, results, fig_dir):
         for oid, name in zip(oids, names):
             key = f"{vid}__obj__{oid}"
             if key in tl:
-                panels.append((vid, oid, name, frames, tl[key], tl.get(f"{vid}__present__{oid}")))
+                panels.append((
+                    vid,
+                    oid,
+                    name,
+                    frames,
+                    tl[key],
+                    tl.get(f"{vid}__present__{oid}"),
+                    tl.get(f"{vid}__low_iou__{oid}"),
+                ))
     if not panels:
         return
     ncols = min(2, len(panels))
@@ -123,20 +131,35 @@ def _plot_object_facets(tl, object_rows, reentry_rows, results, fig_dir):
     tau = float(results.get("threshold", 0.5))
     for ax in axes.flat:
         ax.set_visible(False)
-    for ax, (vid, oid, name, frames, vals, present) in zip(axes.flat, panels):
+    low_tau = float(results.get("low_iou_threshold", 0.2))
+    for ax, (vid, oid, name, frames, vals, present, low_iou) in zip(axes.flat, panels):
         ax.set_visible(True)
         ax.plot(frames, vals, color="#9467BD", lw=1.0)
         if present is not None:
             y0 = np.full(frames.shape, -0.015, dtype=float)
-            ax.fill_between(frames, y0, 0.02, where=present.astype(bool), color="#2CA02C", alpha=0.25, linewidth=0)
+            ax.fill_between(
+                frames, y0, 0.02, where=present.astype(bool),
+                color="#2CA02C", alpha=0.25, linewidth=0,
+                label="anchor present",
+            )
+        if low_iou is not None:
+            ax.fill_between(
+                frames, 0.025, 0.065, where=low_iou.astype(bool),
+                color="#FF7F0E", alpha=0.55, linewidth=0,
+                label=f"IoU < {low_tau:g}",
+            )
         for frame in event_frames.get((vid, oid), []):
             ax.axvline(frame, color="#2CA02C", alpha=0.45, lw=0.9)
         ax.axhline(tau, color="0.25", ls=":", lw=0.9)
+        ax.axhline(low_tau, color="#FF7F0E", ls="--", lw=0.8, alpha=0.8)
         ax.set_title(f"{name} ({oid})")
         ax.set_ylim(-0.04, 1.03)
         ax.set_xlabel("frame")
         ax.set_ylabel("IoU")
-    fig.suptitle("Per-object IoU; green baseline indicates anchor-memory object present", y=1.0)
+    fig.suptitle(
+        "Per-object IoU; green baseline = anchor present, orange baseline = low-IoU identity failure",
+        y=1.0,
+    )
     fig.tight_layout()
     _save(fig, fig_dir, "object_iou_facets")
 
@@ -146,7 +169,9 @@ def _plot_summary_bars(object_rows, video_rows, fig_dir):
         return
     labels = [r["object_name"] for r in object_rows]
     mean_iou = [_f(r["mean_iou"]) for r in object_rows]
-    missed = [100 * _f(r["frac_present_frames_missed"]) for r in object_rows]
+    missing = [100 * _f(r["frac_present_frames_missed"]) for r in object_rows]
+    low_iou = [100 * _f(r.get("frac_present_frames_low_iou")) for r in object_rows]
+    lost = [100 * _f(r.get("frac_present_frames_lost")) for r in object_rows]
     y = np.arange(len(labels))
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, max(3, 0.55 * len(labels) + 1.4)), sharey=True)
     ax1.barh(y, mean_iou, color="#1F77B4")
@@ -154,30 +179,49 @@ def _plot_summary_bars(object_rows, video_rows, fig_dir):
     ax1.set_xlim(0, 1)
     ax1.set_xlabel("mean IoU")
     ax1.set_title("Queue-memory quality")
-    ax2.barh(y, missed, color="#D62728")
+    ax2.barh(y, missing, color="#D62728", label="missing")
+    ax2.barh(y, low_iou, left=missing, color="#FF7F0E", label="IoU < 0.2")
+    for yi, pct in zip(y, lost):
+        if np.isfinite(pct):
+            ax2.text(min(99.2, pct + 1.0), yi, f"{pct:.2f}%", va="center", ha="left", fontsize=9)
     ax2.set_xlim(0, 100)
-    ax2.set_xlabel("% anchor-present frames missed")
-    ax2.set_title("Lost tracking")
+    ax2.set_xlabel("% anchor-present frames lost")
+    ax2.set_title("Lost tracking (missing or low IoU)")
+    ax2.legend(loc="lower right")
     fig.suptitle("Per-object summary: queue memory evaluated against anchor-frame memory")
     fig.tight_layout()
     _save(fig, fig_dir, "object_summary_bars")
 
 
-def _plot_missing_timeline(per_frame, fig_dir):
+def _plot_missing_timeline(per_frame, results, fig_dir):
     if not per_frame:
         return
     frames = np.asarray([int(float(r["frame"])) for r in per_frame])
     missing = np.asarray([int(float(r["n_missing_objects"])) for r in per_frame])
+    low_iou = np.asarray([int(float(r.get("n_low_iou_objects") or 0)) for r in per_frame])
+    lost = np.asarray([int(float(r.get("n_lost_objects") or r["n_missing_objects"])) for r in per_frame])
     mean_iou = np.asarray([_f(r["mean_iou"]) for r in per_frame])
     fig, ax1 = plt.subplots(figsize=(12, 3.5))
     ax1.fill_between(frames, 0, missing, color="#D62728", alpha=0.35, step="mid", label="missing objects")
-    ax1.set_ylabel("missing objects")
+    ax1.fill_between(frames, missing, lost, color="#FF7F0E", alpha=0.35, step="mid", label="low-IoU objects")
+    anchor_frames = []
+    anchor_by_video = results.get("anchor_frames_by_video") or {}
+    if anchor_by_video:
+        first = next(iter(anchor_by_video.values()))
+        anchor_frames = [int(x) for x in first]
+    if anchor_frames:
+        ax1.vlines(anchor_frames, ymin=-0.18, ymax=-0.04, color="0.1", lw=0.7, alpha=0.65, label="anchor frames")
+    ax1.set_ylabel("lost objects")
     ax1.set_xlabel("frame")
+    ax1.set_ylim(-0.22, max(1.05, float(np.nanmax(lost)) + 0.2))
     ax2 = ax1.twinx()
     ax2.plot(frames, mean_iou, color="#1F77B4", lw=1.0, label="mean IoU")
     ax2.set_ylabel("mean IoU")
     ax2.set_ylim(-0.03, 1.03)
-    ax1.set_title("Object-frame loss over time")
+    ax1.set_title("Object-frame loss over time (missing or low IoU), with anchor frame ticks")
+    h1, l1 = ax1.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    ax1.legend(h1 + h2, l1 + l2, loc="upper right", ncol=2)
     fig.tight_layout()
     _save(fig, fig_dir, "missing_objects_timeline")
 
@@ -187,7 +231,7 @@ def _plot_reentry_windows(reentry_rows, fig_dir):
         return
     labels = [f"{r['object_name']}@{int(float(r['frame']))}" for r in reentry_rows]
     mean_iou = [_f(r["mean_iou_window"]) for r in reentry_rows]
-    missed = [int(float(r["missed_frames_window"])) for r in reentry_rows]
+    missed = [int(float(r.get("lost_frames_window") or r["missed_frames_window"])) for r in reentry_rows]
     x = np.arange(len(labels))
     fig, ax1 = plt.subplots(figsize=(max(6, 0.7 * len(labels) + 2), 4))
     ax1.bar(x - 0.18, mean_iou, width=0.36, color="#1F77B4", label="mean IoU in window")
@@ -195,7 +239,7 @@ def _plot_reentry_windows(reentry_rows, fig_dir):
     ax1.set_ylabel("mean IoU")
     ax2 = ax1.twinx()
     ax2.bar(x + 0.18, missed, width=0.36, color="#D62728", alpha=0.75, label="missed frames")
-    ax2.set_ylabel("missed frames")
+    ax2.set_ylabel("lost frames")
     ax1.set_xticks(x, labels, rotation=45, ha="right")
     ax1.set_title("Tracking immediately after anchor-GT object re-entry")
     fig.tight_layout()

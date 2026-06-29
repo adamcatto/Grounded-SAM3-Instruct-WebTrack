@@ -59,6 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
     pe.add_argument("--project", required=True)
     pe.add_argument("--out-dir", default=None)
     pe.add_argument("--threshold", type=float, default=DEFAULT_IOU_THRESHOLD)
+    pe.add_argument("--low-iou-threshold", type=float, default=0.2)
     pe.add_argument("--min-absence-frames", type=int, default=30)
     pe.add_argument("--reentry-window", type=int, default=90)
 
@@ -75,6 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
     pa.add_argument("--backend", default="http://127.0.0.1:8000")
     pa.add_argument("--quiet-stream", action="store_true")
     pa.add_argument("--threshold", type=float, default=DEFAULT_IOU_THRESHOLD)
+    pa.add_argument("--low-iou-threshold", type=float, default=0.2)
     pa.add_argument("--min-absence-frames", type=int, default=30)
     pa.add_argument("--reentry-window", type=int, default=90)
     return ap
@@ -126,6 +128,7 @@ def main(argv: list[str] | None = None) -> int:
             project_dir,
             out_dir=_out_dir(args, project_dir),
             threshold=args.threshold,
+            low_iou_threshold=args.low_iou_threshold,
             min_absence_frames=args.min_absence_frames,
             reentry_window=args.reentry_window,
         )
@@ -169,6 +172,7 @@ def main(argv: list[str] | None = None) -> int:
             project_dir,
             out_dir=out_dir,
             threshold=args.threshold,
+            low_iou_threshold=args.low_iou_threshold,
             min_absence_frames=args.min_absence_frames,
             reentry_window=args.reentry_window,
         )

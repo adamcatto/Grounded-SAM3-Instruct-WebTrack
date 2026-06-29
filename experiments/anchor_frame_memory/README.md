@@ -45,6 +45,12 @@ The main re-entry definition is: an object is present in the anchor-memory masks
 after being absent for at least `--min-absence-frames` frames. Each event is scored
 over the following `--reentry-window` frames.
 
+Lost tracking is counted when an object is anchor-present and either absent from
+the queue-memory prediction or predicted with IoU below `--low-iou-threshold`
+(default `0.2`). The low-IoU case captures identity swaps or badly corrupted
+masks where a same-id prediction exists but no longer overlaps the anchor-memory
+reference well enough to count as useful tracking.
+
 ## Interpretation
 
 Anchor-frame memory is used as the reference because those tracks were generated
@@ -74,10 +80,12 @@ Headline results for `2B_video_2LBFwithdrawal_20250919_130012.mp4`:
 - Median IoU: `0.9435`
 - Worst-object mean IoU: `0.8064`
 - Missing anchor-present object-frames: `3,455`
+- Low-IoU anchor-present object-frames (`IoU < 0.2`): `1,262`
+- Lost anchor-present object-frames (missing or low-IoU): `4,717`
 - Anchor-GT re-entry events: `19`
-- Missed re-entry events: `10`
-- `CageMouse`: 10 missing frames out of 34,134 anchor-present frames.
-- `FreeMouse`: 3,445 missing frames out of 14,300 anchor-present frames, with 10 missed re-entry events.
+- Missed/lost re-entry events: `12`
+- `CageMouse`: 452 lost frames out of 34,134 anchor-present frames (`1.32%`).
+- `FreeMouse`: 4,265 lost frames out of 14,300 anchor-present frames (`29.83%`), with 12 lost re-entry events.
 
 The generated artifacts include CSV tables, `results.json`, `timelines.npz`, and
 PNG/PDF/SVG versions of:
