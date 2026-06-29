@@ -297,10 +297,10 @@ export default function FrameViewer() {
     const startBottom = anchorReturnOffsets.bottom
     const cw = stack.clientWidth
     const ch = stack.clientHeight
+    const pw = panel.offsetWidth
+    const ph = panel.offsetHeight
     const pad = 6
     function move(ev: MouseEvent) {
-      const pw = panel.offsetWidth
-      const ph = panel.offsetHeight
       const dx = ev.clientX - startX
       const dy = ev.clientY - startY
       let nr = startRight - dx

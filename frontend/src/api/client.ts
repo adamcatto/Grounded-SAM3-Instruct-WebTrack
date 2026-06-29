@@ -387,7 +387,7 @@ export const resumeFromFrame = (pid: string, vid: string, resumeFrame: number, c
     { resume_frame: resumeFrame, clear_from_frame: clearFromFrame }
   ).then(r => r.data)
 
-export const startPropagationSSE = (pid: string, vid: string, startFrame = 0, resumeFrom = -1, endFrame = -1, useAllAnchors = false) => {
+export const startPropagationSSE = (pid: string, vid: string, startFrame = 0, resumeFrom = -1, endFrame = -1, useAllAnchors = true) => {
   const params = new URLSearchParams({ start_frame: String(startFrame) })
   if (resumeFrom >= 0) params.set('resume_from', String(resumeFrom))
   if (endFrame >= 0) params.set('end_frame', String(endFrame))

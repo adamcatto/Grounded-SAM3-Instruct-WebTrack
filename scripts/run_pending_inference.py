@@ -27,7 +27,8 @@ Options (common):
   --list-only          Print RUN/SKIP eligibility summary and exit (no HTTP propagation)
   --clear-stuck        Reset ``whole_video_inference`` status ``running`` -> ``none`` before checks
   --videos VID [VID …] Restrict to specific video ids
-  --use-all-anchors    Match web UI "use all anchors" propagate mode
+  --use-all-anchors    Match web UI "use all anchors" propagate mode (default)
+  --no-use-all-anchors Use standard recent-queue memory instead
   --quiet-stream       Suppress per-frame SSE progress on stdout (eligibility still on stderr)
   --backend URL        FastAPI origin (default http://127.0.0.1:8000; ``/api`` added if omitted)
   --stale-timeout SEC  Treat ``running`` as killed if no progress file update (default 300)
@@ -167,7 +168,7 @@ def propagation_sse(
 
     Returns (ok, last_payload_dict, human_error_message).
     """
-    q = urllib.parse.urlencode({"use_all_anchors": "true"} if use_all_anchors else {})
+    q = urllib.parse.urlencode({"use_all_anchors": "true" if use_all_anchors else "false"})
     tail = ("?" + q) if q else ""
     api = backend_api_base.rstrip("/")
     url = f"{api}/projects/{urllib.parse.quote(pid)}/videos/{urllib.parse.quote(vid)}/propagate{tail}"
@@ -415,11 +416,20 @@ def main() -> int:
         default="http://127.0.0.1:8000",
         help="HTTP origin of FastAPI backend (default %(default)s). /api prefix is optional.",
     )
-    ap.add_argument(
+    ua = ap.add_mutually_exclusive_group()
+    ua.add_argument(
         "--use-all-anchors",
+        dest="use_all_anchors",
         action="store_true",
         help="Pass use_all_anchors=true on propagate (matches all-anchors web tracking).",
     )
+    ua.add_argument(
+        "--no-use-all-anchors",
+        dest="use_all_anchors",
+        action="store_false",
+        help="Pass use_all_anchors=false on propagate (standard recent-queue memory).",
+    )
+    ap.set_defaults(use_all_anchors=True)
     ap.add_argument(
         "--retry-failed",
         action="store_true",

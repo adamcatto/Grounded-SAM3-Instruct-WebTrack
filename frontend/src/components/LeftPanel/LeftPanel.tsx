@@ -756,13 +756,14 @@ export default function LeftPanel() {
 
   function handleStartTracking() {
     // When all anchors are labeled, prompt the user to choose the tracking method.
-    // Otherwise start immediately with the default (sequential) approach.
+    // Otherwise start immediately; with partial labels this is equivalent to the
+    // available prompt set.
     if (!hasObjects) return
     if (allAnchorsLabeled) {
       setTrackMethodChoice(config.useAllAnchors ? 'all_anchors' : 'sequential')
       setShowTrackMethodModal(true)
     } else {
-      _doStartTracking(false)
+      _doStartTracking(config.useAllAnchors)
     }
   }
 
@@ -879,7 +880,7 @@ export default function LeftPanel() {
 
   // ── SSE Propagation ──────────────────────────────────────────────────────────
 
-  function _connectSSE(retryCount: number, explicitStart?: number, endFrame = -1, useAllAnchors = false) {
+  function _connectSSE(retryCount: number, explicitStart?: number, endFrame = -1, useAllAnchors = config.useAllAnchors) {
     const MAX_RETRIES = 3
     activeEsRef.current?.close()
 
@@ -978,7 +979,7 @@ export default function LeftPanel() {
   function _connectSSEResume(resumeFrom: number, retryCount: number) {
     const MAX_RETRIES = 3
     activeEsRef.current?.close()
-    const es = startPropagationSSE(pid, vid, propagationStartFrame, resumeFrom)
+    const es = startPropagationSSE(pid, vid, propagationStartFrame, resumeFrom, -1, config.useAllAnchors)
     activeEsRef.current = es
 
     es.addEventListener('init', (e: MessageEvent) => {

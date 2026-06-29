@@ -2849,7 +2849,7 @@ async def _run_propagation_bg(
 # ─── Propagation SSE endpoint ─────────────────────────────────────────────────
 
 @app.get("/api/projects/{pid}/videos/{vid}/propagate")
-async def propagate_video(pid: str, vid: str, start_frame: int = 0, resume_from: int = -1, end_frame: int = -1, use_all_anchors: bool = False):
+async def propagate_video(pid: str, vid: str, start_frame: int = 0, resume_from: int = -1, end_frame: int = -1, use_all_anchors: bool = True):
     """
     Stream propagation results as Server-Sent Events.
 

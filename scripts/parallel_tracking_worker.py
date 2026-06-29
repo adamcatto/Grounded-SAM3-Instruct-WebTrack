@@ -300,7 +300,7 @@ def _apply_parallel_tracking_yaml(
 
     if args.use_all_anchors is None:
         ua = pt.get("use_all_anchors")
-        args.use_all_anchors = bool(ua) if ua is not None else False
+        args.use_all_anchors = bool(ua) if ua is not None else True
 
     if args.clear_stuck is None:
         cs = pt.get("clear_stuck")

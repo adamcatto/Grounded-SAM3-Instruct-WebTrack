@@ -36,7 +36,7 @@ const CONFIG_DEFAULTS: AppConfig = {
   showMasks: true,
   maskOpacity: 0.85,
   pointSize: 1.0,
-  useAllAnchors: false,
+  useAllAnchors: true,
   autoInferAnchorRemainder: false,
   anchorBatchSize: 1000,
 }
