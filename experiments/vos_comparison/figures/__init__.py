@@ -22,7 +22,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from . import _common as C
-from . import aggregate, bars, curves, summary, tables
+from . import aggregate, bars, composite, curves, summary, tables
 
 
 def make_figures(out_dir: Path, *, threshold: float | None = None) -> None:
@@ -51,6 +51,9 @@ def make_figures(out_dir: Path, *, threshold: float | None = None) -> None:
     summary.make_summary(out_dir, fig_root / "summary")
     bars.make_bars(out_dir, meta, tau, fig_root / "bars")
     tables.make_tables(out_dir, results, tab_dir)
+
+    if tl:
+        composite.make_figure5(out_dir, fig_root, tau=tau)
 
 
 __all__ = ["make_figures"]
