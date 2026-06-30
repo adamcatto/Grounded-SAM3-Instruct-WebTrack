@@ -87,7 +87,7 @@ that does `merge → analyze → figures` (see `scripts/bsub_vos_comparison*.{sh
 
 Projects are resolved the same way as the backend: by filesystem path, folder
 name, or short id, searched under `$SAM3_TRACKING_PROJECTS_DIR` /
-`$SAM3_PROJECTS_DIR` / `~/.sam3_zero_projects`.
+`$SAM3_PROJECTS_DIR` or `/opt/projects/segmentation_tracking_projects`.
 
 ## Experimental design notes
 

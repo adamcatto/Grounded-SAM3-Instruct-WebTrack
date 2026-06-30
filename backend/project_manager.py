@@ -32,7 +32,7 @@ def default_projects_base_dir() -> Path:
     p, _ = _env_projects_path_from_environ()
     if p is not None:
         return p
-    return Path.home() / ".sam3_zero_projects"
+    return Path("/opt/projects/segmentation_tracking_projects")
 
 
 def env_projects_var_name() -> Optional[str]:

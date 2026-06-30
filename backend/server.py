@@ -661,7 +661,7 @@ def list_projects():
 
 @app.get("/api/projects/root")
 def get_projects_root():
-    """Active projects directory and env-configured default (SAM3_TRACKING_PROJECTS_DIR → SAM3_PROJECTS_DIR → ~/.sam3_zero_projects)."""
+    """Active projects directory and env-configured default (SAM3_TRACKING_PROJECTS_DIR → SAM3_PROJECTS_DIR → /opt/projects/segmentation_tracking_projects)."""
     return pm.get_projects_root_info()
 
 

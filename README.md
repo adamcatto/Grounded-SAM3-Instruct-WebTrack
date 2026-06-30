@@ -159,7 +159,7 @@ The system consists of three layers:
           SAMPredictor       ProjectManager
           (sam3/sam2)         (config.json)
                |                    |
-          pretrained_models/    ~/.sam3_zero_projects/
+          pretrained_models/    /opt/projects/segmentation_tracking_projects/
           sam3.pt                 <project-uuid>/
           sam2.1_hiera_large.pt     config.json
                                     videos/<vid>/
@@ -305,7 +305,7 @@ React 18 + TypeScript + Vite, styled with Tailwind CSS.
 ## Storage Layout
 
 ```
-~/.sam3_zero_projects/                      # or $SAM3_TRACKING_PROJECTS_DIR
+/opt/projects/segmentation_tracking_projects/                      # or $SAM3_TRACKING_PROJECTS_DIR
   <project-uuid>/
     config.json                             # Project metadata, objects, point prompts
     videos/
@@ -515,7 +515,7 @@ failed jobs, or inspect eligibility before starting HPC workers.
 
 **Prerequisites:** SAM backend running and reachable (default `http://127.0.0.1:8000`). Project
 resolved via `--project-dir` (directory containing `config.json`) or `--pid` under
-`SAM3_PROJECTS_DIR` / `~/.sam3_zero_projects`.
+`SAM3_PROJECTS_DIR` or `/opt/projects/segmentation_tracking_projects`.
 
 **Output:** eligibility summary on **stderr**; live SSE progress on **stdout** (suppress with
 `--quiet-stream`).
@@ -523,7 +523,7 @@ resolved via `--project-dir` (directory containing `config.json`) or `--pid` und
 ```bash
 # Dry-run: show which videos would RUN vs SKIP (no HTTP calls)
 python scripts/run_pending_inference.py \
-  --project-dir ~/.sam3_zero_projects/ab12-demo \
+  --project-dir /opt/projects/segmentation_tracking_projects/ab12-demo \
   --backend http://127.0.0.1:8000 \
   --list-only
 
@@ -592,7 +592,7 @@ bash start_frontend.sh   # terminal 2
 
 Add the `export SAM3_TRACKING_PROJECTS_DIR=...` line to your `~/.bashrc` (or job preamble) so the backend, downstream CLIs, and HPC workers all resolve the same project folders.
 
-On shared HPC filesystems, prefer a project directory under your allocation (e.g. `/sc/arion/projects/YourLab/Behavior/projects/`) rather than `~/.sam3_zero_projects`, so jobs on compute nodes see the same data as your interactive sessions.
+On shared HPC filesystems, prefer a project directory under your allocation (e.g. `/sc/arion/projects/YourLab/Behavior/projects/`) rather than `/opt/projects/segmentation_tracking_projects`, so jobs on compute nodes see the same data as your interactive sessions.
 
 ---
 
@@ -601,7 +601,7 @@ On shared HPC filesystems, prefer a project directory under your allocation (e.g
 
 | Variable                     | Default                 | Used by                      | Description                                                                                                                                               |
 | ---------------------------- | ----------------------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `SAM3_TRACKING_PROJECTS_DIR` | `~/.sam3_zero_projects` | Backend, downstream analysis | Root folder for all SAM3 project directories. **Set this first** on any machine that runs tracking or analysis.                                           |
+| `SAM3_TRACKING_PROJECTS_DIR` | `/opt/projects/segmentation_tracking_projects` | Backend, downstream analysis | Root folder for all SAM3 project directories. **Set this first** on any machine that runs tracking or analysis.                                           |
 | `SAM3_PROJECTS_DIR`          | (same as above)         | Backend, downstream analysis | Legacy alias; if both are set, `SAM3_TRACKING_PROJECTS_DIR` wins.                                                                                         |
 | `HF_TOKEN`                   | —                       | `scripts/download_model.py`  | HuggingFace token for downloading gated SAM3 weights.                                                                                                     |
 | `SAM3_ENV_YAML`              | `configs/env.yaml`      | Parallel tracking scripts    | Path to YAML config for HPC propagation workers (see below).                                                                                              |

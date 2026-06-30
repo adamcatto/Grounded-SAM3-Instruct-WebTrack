@@ -14,7 +14,7 @@ Usage:
   parallel_tracking_launcher.py [--local] [--env-yaml PATH] [--submit-count N] PROJECT_DIR [-- WORKER_ARGS...]
 
 Examples:
-  parallel_tracking_launcher.py ~/.sam3_zero_projects/ab12-demo
+  parallel_tracking_launcher.py /opt/projects/segmentation_tracking_projects/ab12-demo
   parallel_tracking_launcher.py /path/proj -- --use-all-anchors --clear-stuck
   SAM3_ENV_YAML=/other/env.yaml parallel_tracking_launcher.py --local /path/proj
 """

@@ -42,7 +42,7 @@ Examples:
   # Start backend elsewhere, then dry-run eligibility only:
   uvicorn server:app --host 127.0.0.1 --port 8000
   python scripts/run_pending_inference.py \\
-    --project-dir ~/.sam3_zero_projects/ab12-demo \\
+    --project-dir /opt/projects/segmentation_tracking_projects/ab12-demo \\
     --backend http://127.0.0.1:8000 \\
     --list-only
 
@@ -405,11 +405,11 @@ def main() -> int:
     ap.add_argument(
         "--project-dir",
         help="Directory containing config.json for one project "
-        "(e.g. ~/.sam3_zero_projects/ab12-name). Overrides --pid.",
+        "(e.g. /opt/projects/segmentation_tracking_projects/ab12-name). Overrides --pid.",
     )
     ap.add_argument(
         "--pid",
-        help="Project id only (looks under SAM3_PROJECTS_DIR / ~/.sam3_zero_projects).",
+        help="Project id only (looks under SAM3_PROJECTS_DIR or /opt/projects/segmentation_tracking_projects).",
     )
     ap.add_argument(
         "--backend",

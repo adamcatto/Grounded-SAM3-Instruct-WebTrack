@@ -19,7 +19,7 @@ DEST="${2:-}"
 
 if [[ -z "$SRC" ]] || [[ -z "$DEST" ]]; then
   echo "Usage: $0 <LOCAL_PROJECT_DIR> <REMOTE_PARENT_OR_FULL_DEST>" >&2
-  echo "Example: $0 ~/.sam3_zero_projects/ab12-myproj user@host:/srv/sam3/" >&2
+  echo "Example: $0 /opt/projects/segmentation_tracking_projects/ab12-myproj user@host:/srv/sam3/" >&2
   exit 2
 fi
 

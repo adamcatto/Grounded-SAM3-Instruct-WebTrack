@@ -13,7 +13,7 @@ those masks against the source project's anchor-memory masks.
 
 ```bash
 python -m experiments.anchor_frame_memory all \
-  --source-project /home/adam/.sam3_zero_projects/0818b9be-Mouse-Mingle-Test \
+  --source-project /opt/projects/segmentation_tracking_projects/0818b9be-Mouse-Mingle-Test \
   --backend http://127.0.0.1:8000 \
   --quiet-stream
 ```
@@ -63,14 +63,14 @@ object-frames and missed re-entry events.
 
 This experiment was run on:
 
-- Anchor-memory reference: `/home/adam/.sam3_zero_projects/0818b9be-Mouse-Mingle-Test`
-- Queue-memory fork: `/home/adam/.sam3_zero_projects/dcd9b5c1-recent_queue_memory_Mouse-Mingle-Test`
-- Backup made before the run: `/home/adam/.sam3_zero_projects/_backups/0818b9be-Mouse-Mingle-Test.backup-20260629T170508Z`
-- Results: `/home/adam/.sam3_zero_projects/dcd9b5c1-recent_queue_memory_Mouse-Mingle-Test/anchor_frame_memory_results`
+- Anchor-memory reference: `/opt/projects/segmentation_tracking_projects/0818b9be-Mouse-Mingle-Test`
+- Queue-memory fork: `/opt/projects/segmentation_tracking_projects/dcd9b5c1-recent_queue_memory_Mouse-Mingle-Test`
+- Backup made before the run: `/opt/projects/segmentation_tracking_projects/_backups/0818b9be-Mouse-Mingle-Test.backup-20260629T170508Z`
+- Results: `/opt/projects/segmentation_tracking_projects/dcd9b5c1-recent_queue_memory_Mouse-Mingle-Test/anchor_frame_memory_results`
 
 The source project's legacy masks were also migrated into:
 
-`/home/adam/.sam3_zero_projects/0818b9be-Mouse-Mingle-Test/videos/f17961f9/masks.sqlite`
+`/opt/projects/segmentation_tracking_projects/0818b9be-Mouse-Mingle-Test/videos/f17961f9/masks.sqlite`
 
 The SQLite migration verified 34,136 frame rows spanning frames 0 through 34,135.
 

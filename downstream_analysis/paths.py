@@ -16,7 +16,7 @@ def projects_base_dir() -> Path:
         raw = (os.environ.get(key) or "").strip()
         if raw:
             return Path(raw).expanduser()
-    return Path.home() / ".sam3_zero_projects"
+    return Path("/opt/projects/segmentation_tracking_projects")
 
 
 def find_project_dir(project_id: str) -> Path | None:
