@@ -21,9 +21,12 @@ import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from scipy import stats
 
 
 FIG_FORMATS = ("png", "pdf", "svg")
+NEAR_BBOX_GAP_THRESHOLD_NORM = 0.02
+ZERO_BBOX_GAP_EPS = 1e-12
 
 
 @dataclass(frozen=True)
@@ -108,6 +111,83 @@ def _bbox_object_count(raw: str) -> int:
     except json.JSONDecodeError:
         return 0
     return len(value) if isinstance(value, dict) else 0
+
+
+def _bbox_pair_metrics(bboxes: dict[str, Any], width: float, height: float) -> dict[str, Any]:
+    boxes: list[tuple[str, float, float, float, float]] = []
+    for oid, raw in bboxes.items():
+        if not isinstance(raw, (list, tuple)) or len(raw) < 4:
+            continue
+        try:
+            x, y, w, h = [float(v) for v in raw[:4]]
+        except (TypeError, ValueError):
+            continue
+        if w <= 0 or h <= 0:
+            continue
+        boxes.append((str(oid), x, y, w, h))
+
+    if len(boxes) < 2 or width <= 0 or height <= 0:
+        return {
+            "bbox_pair_count": 0,
+            "nearest_bbox_pair": "",
+            "min_bbox_center_distance_px": math.nan,
+            "min_bbox_center_distance_norm": math.nan,
+            "min_bbox_edge_gap_px": math.nan,
+            "min_bbox_edge_gap_norm": math.nan,
+        }
+
+    diag = math.hypot(width, height)
+    best: dict[str, Any] | None = None
+    pair_count = 0
+    for i, (oid_a, ax, ay, aw, ah) in enumerate(boxes):
+        for oid_b, bx, by, bw, bh in boxes[i + 1:]:
+            pair_count += 1
+            acx, acy = ax + aw / 2.0, ay + ah / 2.0
+            bcx, bcy = bx + bw / 2.0, by + bh / 2.0
+            center_px = math.hypot((acx - bcx) * width, (acy - bcy) * height)
+
+            gap_x_norm = max(ax - (bx + bw), bx - (ax + aw), 0.0)
+            gap_y_norm = max(ay - (by + bh), by - (ay + ah), 0.0)
+            edge_gap_px = math.hypot(gap_x_norm * width, gap_y_norm * height)
+            row = {
+                "bbox_pair_count": pair_count,
+                "nearest_bbox_pair": f"{oid_a}:{oid_b}",
+                "min_bbox_center_distance_px": center_px,
+                "min_bbox_center_distance_norm": center_px / diag if diag > 0 else math.nan,
+                "min_bbox_edge_gap_px": edge_gap_px,
+                "min_bbox_edge_gap_norm": edge_gap_px / diag if diag > 0 else math.nan,
+            }
+            if best is None or row["min_bbox_edge_gap_px"] < best["min_bbox_edge_gap_px"]:
+                best = row
+
+    if best is None:
+        return {
+            "bbox_pair_count": 0,
+            "nearest_bbox_pair": "",
+            "min_bbox_center_distance_px": math.nan,
+            "min_bbox_center_distance_norm": math.nan,
+            "min_bbox_edge_gap_px": math.nan,
+            "min_bbox_edge_gap_norm": math.nan,
+        }
+    best["bbox_pair_count"] = pair_count
+    return best
+
+
+def read_bbox_separation(sqlite_path: Path, frame_indices: list[int], width: float, height: float) -> dict[int, dict[str, Any]]:
+    if not sqlite_path.is_file() or not frame_indices:
+        return {}
+    unique_frames = sorted(set(int(f) for f in frame_indices))
+    placeholders = ",".join("?" for _ in unique_frames)
+    query = f"SELECT frame_idx, bbox_json FROM frame_segmentation WHERE frame_idx IN ({placeholders})"
+    out: dict[int, dict[str, Any]] = {}
+    with sqlite3.connect(str(sqlite_path)) as conn:
+        for frame_idx, raw in conn.execute(query, unique_frames):
+            try:
+                bboxes = json.loads(raw or "{}")
+            except json.JSONDecodeError:
+                bboxes = {}
+            out[int(frame_idx)] = _bbox_pair_metrics(bboxes if isinstance(bboxes, dict) else {}, width, height)
+    return out
 
 
 def read_progress_frames(path: Path) -> list[int]:
@@ -238,6 +318,90 @@ def save_fig(fig: plt.Figure, output_dir: Path, stem: str) -> None:
     plt.close(fig)
 
 
+def _duration_group_stats(durations: np.ndarray, gaps: np.ndarray) -> dict[str, float | int]:
+    valid = np.isfinite(durations) & np.isfinite(gaps)
+    d = durations[valid]
+    g = gaps[valid]
+
+    def values(mask: np.ndarray) -> np.ndarray:
+        return d[mask]
+
+    def count(mask: np.ndarray) -> int:
+        return int(np.sum(mask))
+
+    def median(mask: np.ndarray) -> float:
+        return float(np.median(d[mask])) if np.any(mask) else math.nan
+
+    def mean(mask: np.ndarray) -> float:
+        vals = values(mask)
+        return float(np.mean(vals)) if vals.size else math.nan
+
+    def std(mask: np.ndarray) -> float:
+        vals = values(mask)
+        return float(np.std(vals, ddof=1)) if vals.size > 1 else (0.0 if vals.size == 1 else math.nan)
+
+    overlap = g <= ZERO_BBOX_GAP_EPS
+    nonzero = g > ZERO_BBOX_GAP_EPS
+    close = g < NEAR_BBOX_GAP_THRESHOLD_NORM
+    separated = g > NEAR_BBOX_GAP_THRESHOLD_NORM
+    overlap_nonzero = _compare_samples(values(overlap), values(nonzero))
+    close_separated = _compare_samples(values(close), values(separated))
+    return {
+        "labeling_overlap_bbox_count": count(overlap),
+        "labeling_nonzero_bbox_gap_count": count(nonzero),
+        "labeling_close_bbox_gap_count_lt_0p02": count(close),
+        "labeling_separated_bbox_gap_count_gt_0p02": count(separated),
+        "labeling_duration_mean_overlap_bbox_s": mean(overlap),
+        "labeling_duration_std_overlap_bbox_s": std(overlap),
+        "labeling_duration_mean_nonzero_bbox_gap_s": mean(nonzero),
+        "labeling_duration_std_nonzero_bbox_gap_s": std(nonzero),
+        "labeling_duration_mean_close_bbox_gap_lt_0p02_s": mean(close),
+        "labeling_duration_std_close_bbox_gap_lt_0p02_s": std(close),
+        "labeling_duration_mean_separated_bbox_gap_gt_0p02_s": mean(separated),
+        "labeling_duration_std_separated_bbox_gap_gt_0p02_s": std(separated),
+        "labeling_duration_median_overlap_bbox_s": median(overlap),
+        "labeling_duration_median_nonzero_bbox_gap_s": median(nonzero),
+        "labeling_duration_median_close_bbox_gap_lt_0p02_s": median(close),
+        "labeling_duration_median_separated_bbox_gap_gt_0p02_s": median(separated),
+        "labeling_duration_overlap_vs_nonzero_welch_p": overlap_nonzero["welch_p"],
+        "labeling_duration_overlap_vs_nonzero_mannwhitney_p": overlap_nonzero["mannwhitney_p"],
+        "labeling_duration_close_lt_0p02_vs_gt_0p02_welch_p": close_separated["welch_p"],
+        "labeling_duration_close_lt_0p02_vs_gt_0p02_mannwhitney_p": close_separated["mannwhitney_p"],
+    }
+
+
+def _compare_samples(a: np.ndarray, b: np.ndarray) -> dict[str, float]:
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    a = a[np.isfinite(a)]
+    b = b[np.isfinite(b)]
+    if a.size < 2 or b.size < 2:
+        return {"welch_p": math.nan, "mannwhitney_p": math.nan}
+    return {
+        "welch_p": float(stats.ttest_ind(a, b, equal_var=False, nan_policy="omit").pvalue),
+        "mannwhitney_p": float(stats.mannwhitneyu(a, b, alternative="two-sided").pvalue),
+    }
+
+
+def _format_p_value(p: float) -> str:
+    if not np.isfinite(p):
+        return "p=NA"
+    if p < 1e-4:
+        return "p<1e-4"
+    if p < 0.001:
+        return f"p={p:.1e}"
+    return f"p={p:.3f}"
+
+
+def _add_sig_bracket(ax: plt.Axes, x1: float, x2: float, y: float, p: float, h_frac: float = 0.035) -> None:
+    ymin, ymax = ax.get_ylim()
+    h = max((ymax - ymin) * h_frac, 0.5)
+    ax.plot([x1, x1, x2, x2], [y, y + h, y + h, y], color="#333333", linewidth=1.0)
+    ax.text((x1 + x2) / 2, y + h, _format_p_value(p), ha="center", va="bottom", fontsize=8)
+    if y + h > ymax:
+        ax.set_ylim(ymin, y + h * 1.25)
+
+
 def build_summary(ctx: VideoContext, frames: pd.DataFrame, progress_frames: list[int]) -> dict[str, Any]:
     meta = ctx.video_meta
     num_frames = int(meta.get("num_frames") or (int(frames["frame_idx"].max()) + 1 if not frames.empty else 0))
@@ -247,15 +411,25 @@ def build_summary(ctx: VideoContext, frames: pd.DataFrame, progress_frames: list
     prompt_counts = prompt_counts_by_frame(meta)
     timing_rows = labeling_timing_rows(meta)
     timing_durations = np.asarray([r["duration_s"] for r in timing_rows], dtype=float)
-    timing_video = (meta.get("anchor_labeling_timing") or {}).get("video") or {}
-    labeling_wall_s = (
-        float(timing_video.get("whole_video_labeling_wall_ms")) / 1000.0
-        if timing_video.get("whole_video_labeling_wall_ms") is not None
-        else (
-            float(max(r["elapsed_commit_s"] for r in timing_rows))
-            if timing_rows and all(not math.isnan(r["elapsed_commit_s"]) for r in timing_rows)
-            else math.nan
-        )
+    bbox_sep = read_bbox_separation(
+        ctx.video_dir / "masks.sqlite",
+        [int(r["frame_idx"]) for r in timing_rows],
+        float(meta.get("width") or 0.0),
+        float(meta.get("height") or 0.0),
+    )
+    edge_gaps = np.asarray(
+        [
+            bbox_sep.get(int(r["frame_idx"]), {}).get("min_bbox_edge_gap_norm", math.nan)
+            for r in timing_rows
+        ],
+        dtype=float,
+    )
+    center_distances = np.asarray(
+        [
+            bbox_sep.get(int(r["frame_idx"]), {}).get("min_bbox_center_distance_norm", math.nan)
+            for r in timing_rows
+        ],
+        dtype=float,
     )
     saved_frames = int(len(frames))
     min_saved = int(frames["frame_idx"].min()) if saved_frames else None
@@ -309,15 +483,20 @@ def build_summary(ctx: VideoContext, frames: pd.DataFrame, progress_frames: list
         "saved_tracking_frames_per_anchor_label": saved_frames / len(anchors) if anchors else math.nan,
         "anchor_label_fraction_of_video_frames": len(anchors) / num_frames if num_frames else math.nan,
         "labeling_timed_anchor_count": int(timing_durations.size),
-        "labeling_wall_s": labeling_wall_s,
         "labeling_sum_active_s": float(np.sum(timing_durations)) if timing_durations.size else math.nan,
         "labeling_duration_q25_s": float(np.percentile(timing_durations, 25)) if timing_durations.size else math.nan,
         "labeling_duration_median_s": float(np.percentile(timing_durations, 50)) if timing_durations.size else math.nan,
         "labeling_duration_q75_s": float(np.percentile(timing_durations, 75)) if timing_durations.size else math.nan,
         "labeling_duration_mean_s": float(np.mean(timing_durations)) if timing_durations.size else math.nan,
         "labeling_duration_max_s": float(np.max(timing_durations)) if timing_durations.size else math.nan,
-        "labeling_anchors_per_min_wall": (len(timing_rows) / labeling_wall_s * 60.0) if timing_rows and labeling_wall_s > 0 else math.nan,
-        "labeling_video_frames_per_min_wall": (num_frames / labeling_wall_s * 60.0) if num_frames and labeling_wall_s > 0 else math.nan,
+        "labeling_mask_distance_count": int(np.sum(np.isfinite(edge_gaps))),
+        "labeling_min_bbox_edge_gap_q25_norm": float(np.nanpercentile(edge_gaps, 25)) if np.any(np.isfinite(edge_gaps)) else math.nan,
+        "labeling_min_bbox_edge_gap_median_norm": float(np.nanpercentile(edge_gaps, 50)) if np.any(np.isfinite(edge_gaps)) else math.nan,
+        "labeling_min_bbox_edge_gap_q75_norm": float(np.nanpercentile(edge_gaps, 75)) if np.any(np.isfinite(edge_gaps)) else math.nan,
+        "labeling_min_bbox_center_distance_median_norm": float(np.nanpercentile(center_distances, 50)) if np.any(np.isfinite(center_distances)) else math.nan,
+        "labeling_duration_vs_edge_gap_spearman": float(pd.Series(timing_durations).corr(pd.Series(edge_gaps), method="spearman")) if timing_durations.size and np.sum(np.isfinite(edge_gaps)) >= 2 else math.nan,
+        "labeling_duration_vs_center_distance_spearman": float(pd.Series(timing_durations).corr(pd.Series(center_distances), method="spearman")) if timing_durations.size and np.sum(np.isfinite(center_distances)) >= 2 else math.nan,
+        **_duration_group_stats(timing_durations, edge_gaps),
         "sqlite_first_update": frames["updated_at"].min().isoformat() if saved_frames else "",
         "sqlite_last_update": frames["updated_at"].max().isoformat() if saved_frames else "",
         "sqlite_elapsed_s": elapsed_s,
@@ -341,15 +520,28 @@ def write_summary_csv(summary: dict[str, Any], output_dir: Path) -> None:
         "save_burst_throughput_q25_fps": "frames/s",
         "save_burst_throughput_median_fps": "frames/s",
         "save_burst_throughput_q75_fps": "frames/s",
-        "labeling_wall_s": "s",
         "labeling_sum_active_s": "s",
         "labeling_duration_q25_s": "s",
         "labeling_duration_median_s": "s",
         "labeling_duration_q75_s": "s",
         "labeling_duration_mean_s": "s",
         "labeling_duration_max_s": "s",
-        "labeling_anchors_per_min_wall": "anchors/min",
-        "labeling_video_frames_per_min_wall": "video frames/min",
+        "labeling_duration_median_overlap_bbox_s": "s",
+        "labeling_duration_median_nonzero_bbox_gap_s": "s",
+        "labeling_duration_median_close_bbox_gap_lt_0p02_s": "s",
+        "labeling_duration_median_separated_bbox_gap_gt_0p02_s": "s",
+        "labeling_duration_mean_overlap_bbox_s": "s",
+        "labeling_duration_std_overlap_bbox_s": "s",
+        "labeling_duration_mean_nonzero_bbox_gap_s": "s",
+        "labeling_duration_std_nonzero_bbox_gap_s": "s",
+        "labeling_duration_mean_close_bbox_gap_lt_0p02_s": "s",
+        "labeling_duration_std_close_bbox_gap_lt_0p02_s": "s",
+        "labeling_duration_mean_separated_bbox_gap_gt_0p02_s": "s",
+        "labeling_duration_std_separated_bbox_gap_gt_0p02_s": "s",
+        "labeling_min_bbox_edge_gap_q25_norm": "frame diagonal fraction",
+        "labeling_min_bbox_edge_gap_median_norm": "frame diagonal fraction",
+        "labeling_min_bbox_edge_gap_q75_norm": "frame diagonal fraction",
+        "labeling_min_bbox_center_distance_median_norm": "frame diagonal fraction",
         "processing_seconds_per_video_second": "s/s",
         "median_anchor_interval_frames": "frames",
     }
@@ -383,6 +575,22 @@ def write_anchor_csv(ctx: VideoContext, output_dir: Path) -> pd.DataFrame:
 def write_labeling_timing_csv(ctx: VideoContext, output_dir: Path) -> pd.DataFrame:
     rows = labeling_timing_rows(ctx.video_meta)
     df = pd.DataFrame(rows)
+    if not df.empty:
+        sep = read_bbox_separation(
+            ctx.video_dir / "masks.sqlite",
+            df["frame_idx"].astype(int).tolist(),
+            float(ctx.video_meta.get("width") or 0.0),
+            float(ctx.video_meta.get("height") or 0.0),
+        )
+        for col in [
+            "bbox_pair_count",
+            "nearest_bbox_pair",
+            "min_bbox_center_distance_px",
+            "min_bbox_center_distance_norm",
+            "min_bbox_edge_gap_px",
+            "min_bbox_edge_gap_norm",
+        ]:
+            df[col] = [sep.get(int(f), {}).get(col, math.nan if col != "nearest_bbox_pair" else "") for f in df["frame_idx"]]
     df.to_csv(output_dir / "labeling_timing.csv", index=False)
     return df
 
@@ -503,23 +711,11 @@ def plot_labeling_efficiency(summary: dict[str, Any], labeling_df: pd.DataFrame,
         ax.grid(True, axis="y", alpha=0.25)
 
         ax = axes[1]
-        ax.step(
-            labeling_df["elapsed_commit_s"] / 60.0,
-            labeling_df["cumulative_anchors_committed"],
-            where="post",
-            color="#59A14F",
-            linewidth=2,
-        )
-        ax.scatter(
-            labeling_df["elapsed_commit_s"] / 60.0,
-            labeling_df["cumulative_anchors_committed"],
-            s=18,
-            color="#59A14F",
-        )
-        ax.set_xlabel("Wall time from first anchor (min)")
-        ax.set_ylabel("Cumulative anchors labeled")
-        ax.set_title(f"Labeling rate: {summary['labeling_anchors_per_min_wall']:.2f} anchors/min")
-        ax.grid(True, alpha=0.25)
+        if "min_bbox_edge_gap_norm" in labeling_df:
+            _plot_distance_group_comparison(ax, labeling_df)
+        else:
+            ax.text(0.5, 0.5, "No nearest bbox gap data", ha="center", va="center")
+            ax.set_axis_off()
 
         ax = axes[2]
         ax.plot(labeling_df["anchor_number"], labeling_df["duration_s"], color="#4C78A8", linewidth=1.25)
@@ -562,6 +758,52 @@ def plot_labeling_efficiency(summary: dict[str, Any], labeling_df: pd.DataFrame,
     )
     fig.tight_layout()
     save_fig(fig, output_dir, "labeling_efficiency")
+
+
+def _plot_distance_group_comparison(ax: plt.Axes, labeling_df: pd.DataFrame) -> None:
+    gaps = pd.to_numeric(labeling_df["min_bbox_edge_gap_norm"], errors="coerce")
+    durations = pd.to_numeric(labeling_df["duration_s"], errors="coerce")
+    valid = gaps.notna() & durations.notna()
+    gaps = gaps[valid]
+    durations = durations[valid]
+
+    groups = [
+        ("0", durations[gaps <= ZERO_BBOX_GAP_EPS].to_numpy(dtype=float), "#4C78A8"),
+        (">0", durations[gaps > ZERO_BBOX_GAP_EPS].to_numpy(dtype=float), "#4C78A8"),
+        ("<0.02", durations[gaps < NEAR_BBOX_GAP_THRESHOLD_NORM].to_numpy(dtype=float), "#59A14F"),
+        (">0.02", durations[gaps > NEAR_BBOX_GAP_THRESHOLD_NORM].to_numpy(dtype=float), "#59A14F"),
+    ]
+    data = [vals for _, vals, _ in groups if vals.size]
+    positions = [i + 1 for i, (_, vals, _) in enumerate(groups) if vals.size]
+    labels = [f"{label}\n(n={len(vals)})" for label, vals, _ in groups if vals.size]
+    colors = [color for _, vals, color in groups if vals.size]
+    if not data:
+        ax.text(0.5, 0.5, "No nearest bbox gap data", ha="center", va="center")
+        ax.set_axis_off()
+        return
+
+    bp = ax.boxplot(data, positions=positions, widths=0.55, patch_artist=True, showfliers=True,
+                    medianprops={"color": "#E15759", "linewidth": 2})
+    for patch, color in zip(bp["boxes"], colors):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.25)
+        patch.set_edgecolor(color)
+    for pos, vals, color in zip(positions, data, colors):
+        jitter = np.linspace(-0.12, 0.12, len(vals)) if len(vals) > 1 else np.array([0.0])
+        ax.scatter(np.full(len(vals), pos) + jitter, vals, s=16, color=color, alpha=0.55, zorder=3)
+    ax.axvline(2.5, color="#999999", linewidth=1, linestyle=":")
+    ax.set_xticks(positions)
+    ax.set_xticklabels(labels)
+    ax.set_xlabel("Nearest bbox edge gap / frame diagonal")
+    ax.set_ylabel("Labeling duration (s)")
+    ax.set_title("Duration by bbox overlap and close-separation bins")
+    ax.grid(True, axis="y", alpha=0.25)
+    y_base = max(np.nanmax(vals) for vals in data if vals.size)
+    y_span = max(ax.get_ylim()[1] - ax.get_ylim()[0], 1.0)
+    if len(groups[0][1]) and len(groups[1][1]):
+        _add_sig_bracket(ax, 1, 2, y_base + y_span * 0.05, _compare_samples(groups[0][1], groups[1][1])["mannwhitney_p"])
+    if len(groups[2][1]) and len(groups[3][1]):
+        _add_sig_bracket(ax, 3, 4, y_base + y_span * 0.16, _compare_samples(groups[2][1], groups[3][1])["mannwhitney_p"])
 
 
 def plot_throughput(throughput: pd.DataFrame, summary: dict[str, Any], output_dir: Path) -> None:
@@ -682,6 +924,7 @@ Video id: {summary['video_id']}
 Definitions:
 - Anchor labels are frames in `annotated_anchors` plus any frame with point prompts in `config.json`.
 - Labeling timing uses `anchor_labeling_timing` in `config.json`, recorded by the frontend from landing on an anchor frame to committing it.
+- Mask separation uses the nearest pair of persisted object bounding boxes on each timed anchor frame; edge gap and center distance are normalized by frame diagonal.
 - Saved tracking frames are rows in `masks.sqlite/frame_segmentation`.
 - Throughput uses SQLite `updated_at` timestamps, so it measures persisted saved-frame rate, not GPU kernel timing. Distribution plots use nonzero save-burst intervals between distinct SQLite timestamps.
 - Coverage is saved tracking frames divided by video frames, with an additional span-normalized coverage metric.
@@ -689,7 +932,8 @@ Definitions:
 Key metrics:
 - Anchor labels: {summary['anchor_frame_count']:,}
 - Median labeling duration: {summary['labeling_duration_median_s']:.3f} s/anchor
-- Labeling wall rate: {summary['labeling_anchors_per_min_wall']:.3f} anchors/min
+- Median nearest bbox edge gap: {summary['labeling_min_bbox_edge_gap_median_norm']:.5f} frame diagonals
+- Duration vs nearest bbox edge gap Spearman: {summary['labeling_duration_vs_edge_gap_spearman']:.3f}
 - Saved tracking frames: {summary['saved_tracking_frames']:,}
 - Saved tracking frames per anchor label: {summary['saved_tracking_frames_per_anchor_label']:.2f}
 - Mean saved-frame throughput: {summary['mean_saved_frame_throughput_fps']:.3f} frames/s
