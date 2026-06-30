@@ -221,7 +221,13 @@ def _plot_missing_timeline(per_frame, results, fig_dir):
     ax1.set_title("Object-frame loss over time (missing or low IoU), with anchor frame ticks")
     h1, l1 = ax1.get_legend_handles_labels()
     h2, l2 = ax2.get_legend_handles_labels()
-    ax1.legend(h1 + h2, l1 + l2, loc="upper right", ncol=2)
+    ax1.legend(
+        h1 + h2, l1 + l2,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.22),
+        ncol=4,
+        framealpha=1.0,
+    )
     fig.tight_layout()
     _save(fig, fig_dir, "missing_objects_timeline")
 
