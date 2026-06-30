@@ -37,6 +37,7 @@ from system_tracking_analysis import (  # noqa: E402
 SUMMARY_FILE = "summary_metrics.csv"
 LABELING_FILE = "labeling_timing.csv"
 THROUGHPUT_FILE = "throughput_distribution.csv"
+LABELING_MIN_DURATION_S = 4.0
 
 
 def _save_fig(fig: plt.Figure, output_dir: Path, stem: str) -> None:
@@ -146,6 +147,91 @@ def _numeric_summary(values: pd.Series) -> dict[str, float]:
     }
 
 
+def _filter_labeling_timing(labeling_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if labeling_df.empty or "duration_s" not in labeling_df:
+        return labeling_df.copy(), pd.DataFrame()
+
+    df = labeling_df.copy()
+    durations = pd.to_numeric(df["duration_s"], errors="coerce")
+    valid_duration = durations.notna()
+    clickthrough = valid_duration & (durations < LABELING_MIN_DURATION_S)
+    filtered = df.loc[~clickthrough].copy()
+
+    rows: list[dict[str, Any]] = []
+    for vid, group in df.assign(_duration_s=durations, _clickthrough=clickthrough).groupby("video_id", dropna=False):
+        total = int(group["_duration_s"].notna().sum())
+        excluded = int(group["_clickthrough"].sum())
+        included = total - excluded
+        video_name = str(group["video_name"].iloc[0]) if "video_name" in group and not group.empty else ""
+        rows.append(
+            {
+                "video_id": vid,
+                "video_name": video_name,
+                "duration_threshold_s": LABELING_MIN_DURATION_S,
+                "timed_anchor_count_raw": total,
+                "clickthrough_anchor_count_excluded": excluded,
+                "timed_anchor_count_analyzed": included,
+                "clickthrough_fraction_excluded": excluded / total if total else math.nan,
+            }
+        )
+    return filtered, pd.DataFrame(rows)
+
+
+def _per_video_filtered_labeling_summary(labeling_df: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    if labeling_df.empty or "duration_s" not in labeling_df:
+        return pd.DataFrame(rows)
+
+    for vid, group in labeling_df.groupby("video_id", dropna=False):
+        row: dict[str, Any] = {
+            "video_id": vid,
+            "labeling_timed_anchor_count_filtered": int(pd.to_numeric(group["duration_s"], errors="coerce").notna().sum()),
+        }
+        if "video_name" in group and not group.empty:
+            row["video_name"] = str(group["video_name"].iloc[0])
+        durations = pd.to_numeric(group["duration_s"], errors="coerce")
+        row.update(
+            {
+                "labeling_sum_active_s_filtered": float(durations.dropna().sum()) if durations.notna().any() else math.nan,
+                "labeling_duration_q25_s_filtered": _numeric_summary(durations)["q25"],
+                "labeling_duration_median_s_filtered": _numeric_summary(durations)["median"],
+                "labeling_duration_q75_s_filtered": _numeric_summary(durations)["q75"],
+                "labeling_duration_mean_s_filtered": _numeric_summary(durations)["mean"],
+                "labeling_duration_max_s_filtered": _numeric_summary(durations)["max"],
+            }
+        )
+
+        if "min_bbox_edge_gap_norm" in group:
+            gaps = pd.to_numeric(group["min_bbox_edge_gap_norm"], errors="coerce")
+            centers = pd.to_numeric(group.get("min_bbox_center_distance_norm"), errors="coerce")
+            valid_gap = gaps.notna() & durations.notna()
+            row["labeling_mask_distance_count_filtered"] = int(valid_gap.sum())
+            row["labeling_min_bbox_edge_gap_q25_norm_filtered"] = _numeric_summary(gaps[valid_gap])["q25"]
+            row["labeling_min_bbox_edge_gap_median_norm_filtered"] = _numeric_summary(gaps[valid_gap])["median"]
+            row["labeling_min_bbox_edge_gap_q75_norm_filtered"] = _numeric_summary(gaps[valid_gap])["q75"]
+            row["labeling_min_bbox_center_distance_median_norm_filtered"] = _numeric_summary(centers[valid_gap])["median"]
+            if valid_gap.sum() >= 2:
+                row["labeling_duration_vs_edge_gap_spearman_filtered"] = float(durations[valid_gap].corr(gaps[valid_gap], method="spearman"))
+                row["labeling_duration_vs_center_distance_spearman_filtered"] = float(durations[valid_gap].corr(centers[valid_gap], method="spearman"))
+            else:
+                row["labeling_duration_vs_edge_gap_spearman_filtered"] = math.nan
+                row["labeling_duration_vs_center_distance_spearman_filtered"] = math.nan
+
+            groups = {
+                "overlap_bbox": valid_gap & (gaps <= ZERO_BBOX_GAP_EPS),
+                "nonzero_bbox_gap": valid_gap & (gaps > ZERO_BBOX_GAP_EPS),
+                "close_bbox_gap_lt_0p02": valid_gap & (gaps < NEAR_BBOX_GAP_THRESHOLD_NORM),
+                "separated_bbox_gap_gt_0p02": valid_gap & (gaps > NEAR_BBOX_GAP_THRESHOLD_NORM),
+            }
+            for name, mask in groups.items():
+                stats = _numeric_summary(durations[mask])
+                row[f"labeling_duration_median_{name}_s_filtered"] = stats["median"]
+                row[f"labeling_duration_mean_{name}_s_filtered"] = stats["mean"]
+                row[f"labeling_{name}_count_filtered"] = stats["n"]
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def _duration_group_rows(labeling_df: pd.DataFrame) -> list[dict[str, Any]]:
     if labeling_df.empty or "min_bbox_edge_gap_norm" not in labeling_df:
         return []
@@ -218,11 +304,45 @@ def write_aggregate_tables(
     labeling_df: pd.DataFrame,
     throughput_df: pd.DataFrame,
     output_dir: Path,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    filtered_labeling_df, clickthrough_summary_df = _filter_labeling_timing(labeling_df)
+    filtered_per_video_df = _per_video_filtered_labeling_summary(filtered_labeling_df)
+    analysis_summary_df = summary_df.copy()
+    if not filtered_per_video_df.empty and "video_id" in analysis_summary_df:
+        merge_cols = [c for c in filtered_per_video_df.columns if c != "video_name"]
+        analysis_summary_df = analysis_summary_df.merge(filtered_per_video_df[merge_cols], on="video_id", how="left")
+        filtered_to_canonical = {
+            "labeling_timed_anchor_count_filtered": "labeling_timed_anchor_count",
+            "labeling_sum_active_s_filtered": "labeling_sum_active_s",
+            "labeling_duration_q25_s_filtered": "labeling_duration_q25_s",
+            "labeling_duration_median_s_filtered": "labeling_duration_median_s",
+            "labeling_duration_q75_s_filtered": "labeling_duration_q75_s",
+            "labeling_duration_mean_s_filtered": "labeling_duration_mean_s",
+            "labeling_duration_max_s_filtered": "labeling_duration_max_s",
+            "labeling_mask_distance_count_filtered": "labeling_mask_distance_count",
+            "labeling_min_bbox_edge_gap_q25_norm_filtered": "labeling_min_bbox_edge_gap_q25_norm",
+            "labeling_min_bbox_edge_gap_median_norm_filtered": "labeling_min_bbox_edge_gap_median_norm",
+            "labeling_min_bbox_edge_gap_q75_norm_filtered": "labeling_min_bbox_edge_gap_q75_norm",
+            "labeling_min_bbox_center_distance_median_norm_filtered": "labeling_min_bbox_center_distance_median_norm",
+            "labeling_duration_vs_edge_gap_spearman_filtered": "labeling_duration_vs_edge_gap_spearman",
+            "labeling_duration_vs_center_distance_spearman_filtered": "labeling_duration_vs_center_distance_spearman",
+            "labeling_duration_median_overlap_bbox_s_filtered": "labeling_duration_median_overlap_bbox_s",
+            "labeling_duration_median_nonzero_bbox_gap_s_filtered": "labeling_duration_median_nonzero_bbox_gap_s",
+            "labeling_duration_median_close_bbox_gap_lt_0p02_s_filtered": "labeling_duration_median_close_bbox_gap_lt_0p02_s",
+            "labeling_duration_median_separated_bbox_gap_gt_0p02_s_filtered": "labeling_duration_median_separated_bbox_gap_gt_0p02_s",
+        }
+        for filtered_col, canonical_col in filtered_to_canonical.items():
+            if filtered_col in analysis_summary_df:
+                analysis_summary_df[canonical_col] = analysis_summary_df[filtered_col]
+
     summary_df.to_csv(output_dir / "per_video_system_metrics.csv", index=False)
-    labeling_df.to_csv(output_dir / "pooled_labeling_timing.csv", index=False)
+    analysis_summary_df.to_csv(output_dir / "per_video_system_metrics_filtered_labeling.csv", index=False)
+    labeling_df.to_csv(output_dir / "pooled_labeling_timing_raw.csv", index=False)
+    filtered_labeling_df.to_csv(output_dir / "pooled_labeling_timing.csv", index=False)
+    filtered_labeling_df.to_csv(output_dir / "pooled_labeling_timing_filtered.csv", index=False)
+    clickthrough_summary_df.to_csv(output_dir / "labeling_clickthrough_filter_summary.csv", index=False)
     throughput_df.to_csv(output_dir / "pooled_throughput_distribution.csv", index=False)
 
     metrics = [
@@ -249,28 +369,33 @@ def write_aggregate_tables(
     ]
     rows = []
     for metric in metrics:
-        if metric not in summary_df:
+        if metric not in analysis_summary_df:
             continue
-        stats = _numeric_summary(summary_df[metric])
+        stats = _numeric_summary(analysis_summary_df[metric])
         rows.append({"metric": metric, **stats})
 
-    if not labeling_df.empty and "duration_s" in labeling_df:
-        rows.append({"metric": "pooled_anchor_labeling_duration_s", **_numeric_summary(labeling_df["duration_s"])})
-    if not labeling_df.empty and "min_bbox_edge_gap_norm" in labeling_df:
-        rows.append({"metric": "pooled_nearest_bbox_edge_gap_norm", **_numeric_summary(labeling_df["min_bbox_edge_gap_norm"])})
-        rows.extend(_duration_group_rows(labeling_df))
-        _labeling_group_comparisons(labeling_df).to_csv(output_dir / "labeling_group_comparisons.csv", index=False)
+    if not filtered_labeling_df.empty and "duration_s" in filtered_labeling_df:
+        rows.append({"metric": "pooled_anchor_labeling_duration_s", **_numeric_summary(filtered_labeling_df["duration_s"])})
+    if not filtered_labeling_df.empty and "min_bbox_edge_gap_norm" in filtered_labeling_df:
+        rows.append({"metric": "pooled_nearest_bbox_edge_gap_norm", **_numeric_summary(filtered_labeling_df["min_bbox_edge_gap_norm"])})
+        rows.extend(_duration_group_rows(filtered_labeling_df))
+        _labeling_group_comparisons(filtered_labeling_df).to_csv(output_dir / "labeling_group_comparisons.csv", index=False)
     else:
         pd.DataFrame().to_csv(output_dir / "labeling_group_comparisons.csv", index=False)
     if not throughput_df.empty and "instantaneous_saved_fps" in throughput_df:
         rows.append({"metric": "pooled_save_burst_throughput_fps", **_numeric_summary(throughput_df["instantaneous_saved_fps"])})
+    if not clickthrough_summary_df.empty:
+        rows.append({"metric": "raw_timed_anchor_count", **_numeric_summary(clickthrough_summary_df["timed_anchor_count_raw"])})
+        rows.append({"metric": "clickthrough_anchor_count_excluded_lt_4s", **_numeric_summary(clickthrough_summary_df["clickthrough_anchor_count_excluded"])})
+        rows.append({"metric": "analyzed_timed_anchor_count_after_4s_filter", **_numeric_summary(clickthrough_summary_df["timed_anchor_count_analyzed"])})
+        rows.append({"metric": "clickthrough_fraction_excluded_lt_4s", **_numeric_summary(clickthrough_summary_df["clickthrough_fraction_excluded"])})
 
     aggregate_df = pd.DataFrame(rows)
     aggregate_df.to_csv(output_dir / "aggregate_summary_metrics.csv", index=False)
 
     per_video_dist = []
-    if not labeling_df.empty:
-        for vid, group in labeling_df.groupby("video_id"):
+    if not filtered_labeling_df.empty:
+        for vid, group in filtered_labeling_df.groupby("video_id"):
             video_name = str(group["video_name"].iloc[0])
             stats = _numeric_summary(group["duration_s"])
             per_video_dist.append({"video_id": vid, "video_name": video_name, "distribution": "labeling_duration_s", **stats})
@@ -284,7 +409,7 @@ def write_aggregate_tables(
             per_video_dist.append({"video_id": vid, "video_name": video_name, "distribution": "save_burst_throughput_fps", **stats})
     per_video_dist_df = pd.DataFrame(per_video_dist)
     per_video_dist_df.to_csv(output_dir / "per_video_distribution_summaries.csv", index=False)
-    return aggregate_df, per_video_dist_df
+    return aggregate_df, per_video_dist_df, analysis_summary_df, filtered_labeling_df, clickthrough_summary_df
 
 
 def plot_labeling_aggregate(summary_df: pd.DataFrame, labeling_df: pd.DataFrame, output_dir: Path) -> None:
@@ -302,9 +427,9 @@ def plot_labeling_aggregate(summary_df: pd.DataFrame, labeling_df: pd.DataFrame,
         ax.violinplot(central_durations, positions=[1], widths=0.7, showmedians=False)
         ax.boxplot(central_durations, positions=[1], widths=0.18, showfliers=True, medianprops={"color": "#E15759", "linewidth": 2})
         ax.set_xticks([1])
-        ax.set_xticklabels(["All anchor labels"])
+        ax.set_xticklabels([f"Anchor labels\n>= {LABELING_MIN_DURATION_S:g} s"])
         ax.set_ylabel("Duration (s)")
-        ax.set_title(f"Pooled durations, central 99% (n={len(central_durations):,}; clipped {clipped_count})")
+        ax.set_title(f"Analyzed label durations, central 99% (n={len(central_durations):,}; clipped {clipped_count})")
         ax.grid(True, axis="y", alpha=0.25)
 
         ax = axes[1]
@@ -314,7 +439,7 @@ def plot_labeling_aggregate(summary_df: pd.DataFrame, labeling_df: pd.DataFrame,
             ax.axvline(q, color="#E15759" if label == "median" else "#555555", linestyle=style, linewidth=1.8 if label == "median" else 1.2)
         ax.set_xlabel("Duration (s)")
         ax.set_ylabel("Anchor count")
-        ax.set_title("Pooled duration histogram, central 99%")
+        ax.set_title(f"Pooled duration histogram after <{LABELING_MIN_DURATION_S:g} s filter")
         ax.grid(True, axis="y", alpha=0.25)
 
         ax = axes[2]
@@ -327,7 +452,7 @@ def plot_labeling_aggregate(summary_df: pd.DataFrame, labeling_df: pd.DataFrame,
         ax.set_xticks([1])
         ax.set_xticklabels(["Video medians"])
         ax.set_ylabel("Median duration (s)")
-        ax.set_title("Distribution of per-video median labeling times")
+        ax.set_title("Per-video median labeling times after filter")
         ax.grid(True, axis="y", alpha=0.25)
 
         ax = axes[3]
@@ -383,7 +508,7 @@ def _plot_distance_group_comparison(ax: plt.Axes, labeling_df: pd.DataFrame, dis
     ax.set_xticklabels(labels)
     ax.set_xlabel("Nearest bbox edge gap / frame diagonal")
     ax.set_ylabel("Labeling duration (s)")
-    ax.set_title("Duration by bbox overlap and close-separation bins")
+    ax.set_title(f"Duration by bbox geometry after <{LABELING_MIN_DURATION_S:g} s filter")
     ax.grid(True, axis="y", alpha=0.25)
     y_base = max(np.nanmax(vals) for vals in data if vals.size)
     y_span = max(ax.get_ylim()[1] - ax.get_ylim()[0], 1.0)
@@ -481,7 +606,7 @@ def plot_system_overview(summary_df: pd.DataFrame, output_dir: Path) -> None:
     x = pd.to_numeric(summary_df.get("labeling_duration_median_s"), errors="coerce")
     y = pd.to_numeric(summary_df.get("labeling_min_bbox_edge_gap_median_norm"), errors="coerce")
     ax.scatter(x, y, s=36, color="#4C78A8", alpha=0.8)
-    ax.set_xlabel("Median label duration (s)")
+    ax.set_xlabel(f"Median analyzed label duration (s; >= {LABELING_MIN_DURATION_S:g})")
     ax.set_ylabel("Median nearest bbox gap / frame diagonal")
     ax.set_title("Labeling time vs mask separation")
     ax.grid(True, alpha=0.25)
@@ -511,7 +636,13 @@ def plot_system_overview(summary_df: pd.DataFrame, output_dir: Path) -> None:
     _save_fig(fig, output_dir, "aggregate_system_overview")
 
 
-def write_readme(project_dir: Path, output_dir: Path, summary_df: pd.DataFrame, aggregate_df: pd.DataFrame) -> None:
+def write_readme(
+    project_dir: Path,
+    output_dir: Path,
+    summary_df: pd.DataFrame,
+    aggregate_df: pd.DataFrame,
+    clickthrough_summary_df: pd.DataFrame,
+) -> None:
     n_videos = len(summary_df)
     def metric_value(metric: str, field: str = "median") -> str:
         rows = aggregate_df[aggregate_df["metric"] == metric]
@@ -522,16 +653,30 @@ def write_readme(project_dir: Path, output_dir: Path, summary_df: pd.DataFrame, 
             return "NA"
         return f"{float(value):.3f}"
 
+    raw_count = int(clickthrough_summary_df["timed_anchor_count_raw"].sum()) if not clickthrough_summary_df.empty else 0
+    excluded_count = int(clickthrough_summary_df["clickthrough_anchor_count_excluded"].sum()) if not clickthrough_summary_df.empty else 0
+    analyzed_count = int(clickthrough_summary_df["timed_anchor_count_analyzed"].sum()) if not clickthrough_summary_df.empty else 0
+    excluded_pct = (100.0 * excluded_count / raw_count) if raw_count else math.nan
+
     text = f"""# Aggregate System Tracking Analysis
 
 Project: {project_dir}
 Videos analyzed: {n_videos}
 
+Labeling timing filter:
+- Anchor labeling events with recorded duration < {LABELING_MIN_DURATION_S:g} s are treated as click-through review events and excluded from labeling-duration summaries and plots.
+- Raw timed anchors: {raw_count:,}
+- Excluded click-through anchors: {excluded_count:,} ({excluded_pct:.2f}%)
+- Analyzed timed anchors: {analyzed_count:,}
+
 Core outputs:
 - `per_video_system_metrics.csv`: one row per video from each video's `summary_metrics.csv`.
+- `per_video_system_metrics_filtered_labeling.csv`: one row per video with labeling-duration columns recomputed after the click-through filter.
 - `aggregate_summary_metrics.csv`: across-video summaries plus pooled per-anchor/per-save-burst summaries.
 - `per_video_distribution_summaries.csv`: per-video summaries of the underlying labeling and throughput distributions.
-- `pooled_labeling_timing.csv`: all anchor-label timing rows with video identifiers.
+- `pooled_labeling_timing_raw.csv`: all raw anchor-label timing rows with video identifiers.
+- `pooled_labeling_timing.csv`: analyzed anchor-label timing rows after the <{LABELING_MIN_DURATION_S:g} s click-through filter.
+- `labeling_clickthrough_filter_summary.csv`: per-video raw, excluded, and analyzed anchor-label counts.
 - `pooled_throughput_distribution.csv`: all save-burst throughput rows with video identifiers.
 - `labeling_group_comparisons.csv`: pooled mean +/- SD, medians, Welch t-test p-values, and Mann-Whitney p-values for the bbox-gap labeling comparisons.
 
@@ -562,11 +707,11 @@ def run(project_ref: str, output_dir: str | None = None, refresh: bool = False) 
     out.mkdir(parents=True, exist_ok=True)
 
     summary_df, labeling_df, throughput_df = load_project_tables(project_dir, refresh=refresh)
-    aggregate_df, _ = write_aggregate_tables(summary_df, labeling_df, throughput_df, out)
-    plot_labeling_aggregate(summary_df, labeling_df, out)
+    aggregate_df, _, analysis_summary_df, filtered_labeling_df, clickthrough_summary_df = write_aggregate_tables(summary_df, labeling_df, throughput_df, out)
+    plot_labeling_aggregate(analysis_summary_df, filtered_labeling_df, out)
     plot_throughput_aggregate(summary_df, throughput_df, out)
-    plot_system_overview(summary_df, out)
-    write_readme(project_dir, out, summary_df, aggregate_df)
+    plot_system_overview(analysis_summary_df, out)
+    write_readme(project_dir, out, summary_df, aggregate_df, clickthrough_summary_df)
     return out
 
 
