@@ -63,6 +63,53 @@ def _get_predictor():
     )
 
 
+def _extract_tracker_output(slot: object) -> dict | None:
+    """Pull the tracker output dict from a cached_frame_outputs slot."""
+    if not isinstance(slot, dict):
+        return None
+    if "out_obj_ids" in slot:
+        return slot
+    for v in slot.values():
+        if isinstance(v, dict) and "out_obj_ids" in v:
+            return v
+    return None
+
+
+def _swap_tracker_output_masks(out: dict, obj_a: int, obj_b: int) -> bool:
+    """Swap mask assignments for two object ids in a SAM tracker output dict."""
+    obj_ids = [int(x) for x in (out.get("out_obj_ids") or [])]
+    masks = list(out.get("out_binary_masks") or [])
+    boxes = list(out.get("out_boxes_xywh") or [])
+    probs = list(out.get("out_probs") or [])
+    if not obj_ids:
+        return False
+
+    idx_a = next((i for i, o in enumerate(obj_ids) if o == obj_a), None)
+    idx_b = next((i for i, o in enumerate(obj_ids) if o == obj_b), None)
+    if idx_a is None and idx_b is None:
+        return False
+
+    if idx_a is not None and idx_b is not None:
+        if idx_a < len(masks) and idx_b < len(masks):
+            masks[idx_a], masks[idx_b] = masks[idx_b], masks[idx_a]
+        if boxes and idx_a < len(boxes) and idx_b < len(boxes):
+            boxes[idx_a], boxes[idx_b] = boxes[idx_b], boxes[idx_a]
+        if probs and idx_a < len(probs) and idx_b < len(probs):
+            probs[idx_a], probs[idx_b] = probs[idx_b], probs[idx_a]
+    elif idx_a is not None:
+        obj_ids[idx_a] = obj_b
+    elif idx_b is not None:
+        obj_ids[idx_b] = obj_a
+
+    out["out_obj_ids"] = obj_ids
+    out["out_binary_masks"] = masks
+    if boxes:
+        out["out_boxes_xywh"] = boxes
+    if probs:
+        out["out_probs"] = probs
+    return True
+
+
 class SAMPredictor:
     """
     Manages SAM video sessions for multiple projects/videos.
@@ -470,6 +517,41 @@ class SAMPredictor:
     def clear_object_prompts(self, pid: str, vid: str, obj_id: int):
         """Clear all points for an object (remove it, then it can be re-added)."""
         self.remove_object(pid, vid, obj_id)
+
+    def swap_object_masks_in_session(
+        self,
+        pid: str,
+        vid: str,
+        obj_a: str,
+        obj_b: str,
+        from_frame: int = -1,
+        to_frame: int = -1,
+    ) -> int:
+        """
+        Swap cached tracker masks between two object ids for frames in range.
+        Mirrors disk swap semantics on SAM3 ``cached_frame_outputs``.
+        """
+        with self.lock:
+            session_id = self.get_session_id(pid, vid)
+            if session_id is None or _model_name != "sam3":
+                return 0
+            predictor = _get_predictor()
+            state = predictor._ALL_INFERENCE_STATES.get(session_id, {}).get("state")
+            if not state:
+                return 0
+            cached = state.get("cached_frame_outputs") or {}
+            int_a, int_b = int(obj_a), int(obj_b)
+            swapped = 0
+            for sam_idx, slot in cached.items():
+                real_idx = self.to_real_idx(pid, vid, int(sam_idx))
+                if from_frame >= 0 and real_idx < from_frame:
+                    continue
+                if to_frame >= 0 and real_idx > to_frame:
+                    continue
+                out = _extract_tracker_output(slot)
+                if out and _swap_tracker_output_masks(out, int_a, int_b):
+                    swapped += 1
+            return swapped
 
     # ── Propagation ──────────────────────────────────────────────────────────
 

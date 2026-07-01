@@ -12,7 +12,7 @@ from pathlib import Path
 
 import numpy as np
 
-from mask_seg_codec import decode_masks_blob, encode_masks_blob
+from mask_seg_codec import decode_masks_blob, encode_masks_blob, swap_keys_in_masks_blob
 from video_processor import (
     bbox_norm_xywh_score_from_mask,
     load_masks_npz,
@@ -203,6 +203,8 @@ class VideoMaskStorage:
         return sorted(seen)
 
     def iter_frame_indices_in_range(self, from_frame: int, to_frame: int) -> list[int]:
+        if self.sqlite_path.is_file():
+            return self._sql_frame_indices_in_range(from_frame, to_frame)
         out: list[int] = []
         for fidx in self.iter_saved_frame_indices_sorted():
             if from_frame >= 0 and fidx < from_frame:
@@ -211,6 +213,152 @@ class VideoMaskStorage:
                 continue
             out.append(fidx)
         return out
+
+    def _sql_frame_indices_in_range(self, from_frame: int, to_frame: int) -> list[int]:
+        clauses: list[str] = []
+        args: list[int] = []
+        if from_frame >= 0:
+            clauses.append("frame_idx >= ?")
+            args.append(from_frame)
+        if to_frame >= 0:
+            clauses.append("frame_idx <= ?")
+            args.append(to_frame)
+        where_sql = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        conn = self._connect()
+        try:
+            return [
+                int(fi)
+                for (fi,) in conn.execute(
+                    f"SELECT frame_idx FROM frame_segmentation{where_sql} ORDER BY frame_idx",
+                    args,
+                )
+            ]
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _swap_bbox_json_keys(bbox_json: str, obj_a: str, obj_b: str) -> tuple[str, bool]:
+        try:
+            bboxes = json.loads(bbox_json or "{}")
+        except json.JSONDecodeError:
+            bboxes = {}
+        has_a = obj_a in bboxes
+        has_b = obj_b in bboxes
+        if not has_a and not has_b:
+            return bbox_json or "{}", False
+        a_bbox = bboxes.pop(obj_a, None)
+        b_bbox = bboxes.pop(obj_b, None)
+        if b_bbox is not None:
+            bboxes[obj_a] = b_bbox
+        if a_bbox is not None:
+            bboxes[obj_b] = a_bbox
+        return json.dumps(bboxes, separators=(",", ":")), True
+
+    def swap_object_masks_in_range(
+        self,
+        obj_a: str,
+        obj_b: str,
+        from_frame: int = -1,
+        to_frame: int = -1,
+        *,
+        dual_write_legacy: bool = False,
+    ) -> int:
+        """
+        Swap mask (and bbox) assignments between two object ids across a frame range.
+
+        Uses in-blob RLE key swaps in SQLite — no dense decode/encode, no NPZ writes
+        unless ``dual_write_legacy`` is True.
+        """
+        obj_a, obj_b = str(obj_a), str(obj_b)
+        if obj_a == obj_b:
+            return 0
+
+        if self.sqlite_path.is_file():
+            return self._swap_object_masks_sqlite(
+                obj_a, obj_b, from_frame, to_frame, dual_write_legacy=dual_write_legacy
+            )
+
+        swapped = 0
+        for fidx in self.iter_frame_indices_in_range(from_frame, to_frame):
+            masks = self.load_masks_dense(fidx)
+            has_a = obj_a in masks
+            has_b = obj_b in masks
+            if not has_a and not has_b:
+                continue
+            a_mask = masks.pop(obj_a, None)
+            b_mask = masks.pop(obj_b, None)
+            if b_mask is not None:
+                masks[obj_a] = b_mask
+            if a_mask is not None:
+                masks[obj_b] = a_mask
+            bboxes = self.load_bboxes(fidx)
+            a_bbox = bboxes.pop(obj_a, None)
+            b_bbox = bboxes.pop(obj_b, None)
+            if b_bbox is not None:
+                bboxes[obj_a] = b_bbox
+            if a_bbox is not None:
+                bboxes[obj_b] = a_bbox
+            self.save_frame(fidx, masks, bboxes)
+            swapped += 1
+        return swapped
+
+    def _swap_object_masks_sqlite(
+        self,
+        obj_a: str,
+        obj_b: str,
+        from_frame: int,
+        to_frame: int,
+        *,
+        dual_write_legacy: bool,
+    ) -> int:
+        clauses: list[str] = []
+        args: list[int] = []
+        if from_frame >= 0:
+            clauses.append("frame_idx >= ?")
+            args.append(from_frame)
+        if to_frame >= 0:
+            clauses.append("frame_idx <= ?")
+            args.append(to_frame)
+        where_sql = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+
+        swapped = 0
+        touched_frames: list[int] = []
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                f"SELECT frame_idx, seg_blob, bbox_json FROM frame_segmentation{where_sql} ORDER BY frame_idx",
+                args,
+            ).fetchall()
+            for frame_idx, seg_blob, bbox_json in rows:
+                new_blob, changed_blob = swap_keys_in_masks_blob(seg_blob, obj_a, obj_b)
+                new_bbox_json, changed_bbox = self._swap_bbox_json_keys(
+                    bbox_json or "{}", obj_a, obj_b
+                )
+                if not changed_blob and not changed_bbox:
+                    continue
+                conn.execute(
+                    """UPDATE frame_segmentation
+                       SET seg_blob=?, bbox_json=?, updated_at=datetime('now')
+                       WHERE frame_idx=?""",
+                    (new_blob, new_bbox_json, frame_idx),
+                )
+                swapped += 1
+                touched_frames.append(int(frame_idx))
+            if swapped:
+                self._bump_revision_locked(conn)
+            conn.commit()
+        finally:
+            conn.close()
+
+        if dual_write_legacy and touched_frames:
+            for fidx in touched_frames:
+                masks = self.load_masks_dense(fidx)
+                bboxes = self.load_bboxes(fidx)
+                save_masks_npz(str(self.masks_dir / f"{fidx:06d}.npz"), masks)
+                save_bboxes_json(str(self.bboxes_dir / f"{fidx:06d}.json"), bboxes)
+
+        return swapped
 
     def save_frame(
         self,

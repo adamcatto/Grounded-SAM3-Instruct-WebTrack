@@ -2127,35 +2127,19 @@ class SwapMasksRequest(BaseModel):
 def swap_object_masks(pid: str, vid: str, req: SwapMasksRequest):
     """Swap masks (and bboxes) between two objects across a range of frames."""
     ms = VideoMaskStorage(pm.video_dir(pid, vid))
-    indices = ms.iter_frame_indices_in_range(req.from_frame, req.to_frame)
-    swapped = 0
-    for fidx in indices:
-        masks = ms.load_masks_dense(fidx)
-        has_a = req.obj_a in masks
-        has_b = req.obj_b in masks
-        if not has_a and not has_b:
-            continue
-
-        a_mask = masks.pop(req.obj_a, None)
-        b_mask = masks.pop(req.obj_b, None)
-        if b_mask is not None:
-            masks[req.obj_a] = b_mask
-        if a_mask is not None:
-            masks[req.obj_b] = a_mask
-
-        bboxes = ms.load_bboxes(fidx)
-        a_bbox = bboxes.pop(req.obj_a, None)
-        b_bbox = bboxes.pop(req.obj_b, None)
-        if b_bbox is not None:
-            bboxes[req.obj_a] = b_bbox
-        if a_bbox is not None:
-            bboxes[req.obj_b] = a_bbox
-
-        ms.save_frame(fidx, masks, bboxes)
-        swapped += 1
+    swapped = ms.swap_object_masks_in_range(
+        req.obj_a, req.obj_b, req.from_frame, req.to_frame, dual_write_legacy=False,
+    )
+    session_swapped = 0
+    try:
+        session_swapped = sam.swap_object_masks_in_session(
+            pid, vid, req.obj_a, req.obj_b, req.from_frame, req.to_frame,
+        )
+    except Exception as e:
+        logger.warning(f"SAM session mask swap failed for {pid}/{vid}: {e}")
 
     _invalidate_mask_cache(pid, vid)
-    return {"status": "ok", "frames_swapped": swapped}
+    return {"status": "ok", "frames_swapped": swapped, "session_frames_swapped": session_swapped}
 
 
 # ─── Saved Masks (post-propagation) ──────────────────────────────────────────

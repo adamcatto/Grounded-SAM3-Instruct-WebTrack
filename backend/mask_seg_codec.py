@@ -33,8 +33,7 @@ def encode_masks_blob(masks: dict[str, np.ndarray]) -> bytes:
     return MAGIC + VERSION_U32.to_bytes(4, "big") + blob
 
 
-def decode_masks_blob(blob: bytes) -> dict[str, np.ndarray]:
-    """Blob → dense bool masks keyed by obj id string."""
+def _unpack_rle_payload(blob: bytes) -> dict:
     if len(blob) < len(MAGIC) + 4:
         raise ValueError("seg_blob too short")
     if blob[: len(MAGIC)] != MAGIC:
@@ -43,7 +42,35 @@ def decode_masks_blob(blob: bytes) -> dict[str, np.ndarray]:
     if ver != VERSION_U32:
         raise ValueError(f"unsupported seg_blob version {ver}")
     raw = zlib.decompress(blob[len(MAGIC) + 4 :])
-    payload = pickle.loads(raw)
+    return pickle.loads(raw)
+
+
+def _pack_rle_payload(payload: dict) -> bytes:
+    blob = zlib.compress(pickle.dumps(payload, protocol=4))
+    return MAGIC + VERSION_U32.to_bytes(4, "big") + blob
+
+
+def swap_keys_in_masks_blob(blob: bytes, obj_a: str, obj_b: str) -> tuple[bytes, bool]:
+    """Swap two object-id keys in the RLE dict without decoding masks to dense arrays."""
+    payload = _unpack_rle_payload(blob)
+    rles: dict[str, Any] = dict(payload.get("rles") or {})
+    has_a = obj_a in rles
+    has_b = obj_b in rles
+    if not has_a and not has_b:
+        return blob, False
+    a_rle = rles.pop(obj_a, None)
+    b_rle = rles.pop(obj_b, None)
+    if b_rle is not None:
+        rles[obj_a] = b_rle
+    if a_rle is not None:
+        rles[obj_b] = a_rle
+    payload["rles"] = rles
+    return _pack_rle_payload(payload), True
+
+
+def decode_masks_blob(blob: bytes) -> dict[str, np.ndarray]:
+    """Blob → dense bool masks keyed by obj id string."""
+    payload = _unpack_rle_payload(blob)
     h: int = int(payload["h"])
     w: int = int(payload["w"])
     rles: dict[str, Any] = payload.get("rles") or {}
