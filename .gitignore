@@ -4,6 +4,14 @@ assets/ai/
 frontend/node_modules/
 frontend/dist/
 
+# E2E / Playwright (generated artifacts and deps only)
+e2e/node_modules/
+e2e/test-results/
+e2e/playwright-report/
+e2e/blob-report/
+e2e/.cache/
+e2e/ms-playwright/
+
 # Model weights
 pretrained_models/
 

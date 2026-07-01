@@ -1,0 +1,14 @@
+{
+  "name": "sam3-web-tracker-e2e",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "playwright test",
+    "test:headed": "playwright test --headed",
+    "test:ui": "playwright test --ui",
+    "postinstall": "playwright install chromium || true"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.0"
+  }
+}

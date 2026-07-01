@@ -32,6 +32,8 @@ echo "Python: $(which python)"
 echo "Conda prefix: $CONDA_PREFIX"
 
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
+export SAM3_TRACKING_PROJECTS_DIR="${SAM3_TRACKING_PROJECTS_DIR:-/opt/projects/segmentation_tracking_projects/}"
+echo "SAM3 projects dir: $SAM3_TRACKING_PROJECTS_DIR"
 
 fuser -k 8000/tcp >/dev/null 2>&1 || true
 sleep 0.3
