@@ -1,11 +1,13 @@
 import { create } from 'zustand'
 import type { Project, VideoMeta, MaskData } from '../types'
 import { evictMaskImages } from '../utils/maskUtils'
+import { invalidateMaskLoaderFrame } from '../utils/maskLoader'
+import { clearCompositeCache } from '../utils/compositeMaskCache'
 import type { HistoryCommand } from '../history/undoHistory'
 import { MAX_UNDO_STACK } from '../history/undoHistory'
 
 // Max number of frames to keep in the in-memory mask cache.
-const MAX_SAVED_MASK_FRAMES = 200
+const MAX_SAVED_MASK_FRAMES = 40
 
 // Insertion-order tracking for FIFO eviction of savedMaskCache.
 let _savedMaskCacheOrder: number[] = []
@@ -379,6 +381,10 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   clearSavedMaskCache: () => {
+    const { savedMaskCache } = get()
+    const b64s = Object.values(savedMaskCache).flatMap(m => Object.values(m))
+    if (b64s.length > 0) evictMaskImages(b64s)
+    clearCompositeCache()
     _savedMaskCacheOrder = []
     set({ savedMaskCache: {} })
   },
@@ -476,11 +482,16 @@ export const useStore = create<AppState>((set, get) => ({
   setAnchorRemainderInferencing: v => set({ anchorRemainderInferencing: v }),
   setAnchorRemainderAwaitingCommit: v => set({ anchorRemainderAwaitingCommit: v }),
   invalidateSavedMaskFrame: fidx => {
-    const { savedMaskCache } = get()
+    const { savedMaskCache, project, currentVideoId } = get()
+    const pid = project?.id
+    const vid = currentVideoId
+    if (pid && vid) invalidateMaskLoaderFrame(pid, vid, fidx)
     if (savedMaskCache[fidx] === undefined) return
+    const b64s = Object.values(savedMaskCache[fidx] ?? {})
     const next = { ...savedMaskCache }
     delete next[fidx]
     _savedMaskCacheOrder = _savedMaskCacheOrder.filter(f => f !== fidx)
+    if (b64s.length > 0) evictMaskImages(b64s)
     set({ savedMaskCache: next })
   },
   resetAnchorState: () => set({

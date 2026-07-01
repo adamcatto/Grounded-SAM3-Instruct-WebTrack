@@ -288,9 +288,8 @@ export const swapObjectMasks = (
   ).then(r => r.data)
 
 export const getSavedMask = (pid: string, vid: string, fidx: number) =>
-  api.get<{ frame_idx: number; masks: MaskData }>(`/projects/${pid}/videos/${vid}/masks/${fidx}`, {
-    headers: { 'Cache-Control': 'no-cache' }
-  }).then(r => r.data)
+  api.get<{ frame_idx: number; masks: MaskData }>(`/projects/${pid}/videos/${vid}/masks/${fidx}`)
+    .then(r => r.data)
 
 /**
  * Predict masks for all objects on a single frame using the annotated inference

@@ -57,6 +57,7 @@ export default function FrameViewer() {
   const [dimensions, setDimensions] = useState({ width: 0, height: 0 })
   const [anchorReturnOffsets, setAnchorReturnOffsets] = useState({ right: 12, bottom: 12 })
   const [showTip, setShowTip] = useState(true)
+  const [frameSettled, setFrameSettled] = useState(true)
 
   // Prevent feedback loop: video timeupdate -> setCurrentFrame -> seek effect
   const videoIsDriving = useRef(false)
@@ -67,6 +68,13 @@ export default function FrameViewer() {
   const fps = video?.fps || 30
 
   useEffect(() => { fpsRef.current = fps }, [fps])
+
+  // Defer high-fidelity JPEG overlay while the user is stepping frames rapidly.
+  useEffect(() => {
+    setFrameSettled(false)
+    const t = setTimeout(() => setFrameSettled(true), 150)
+    return () => clearTimeout(t)
+  }, [currentFrame])
 
   // ── Compute displayed dimensions ──────────────────────────────────────────
 
@@ -382,8 +390,8 @@ export default function FrameViewer() {
             <source src={videoSrc} type="video/mp4" />
           </video>
 
-          {/* Layer 1b: JPEG frame (shown when paused — instant vs. video seek latency) */}
-          {!isPlaying && pid && vid && (
+          {/* Layer 1b: JPEG frame — only after scrubbing settles (video shows meanwhile) */}
+          {!isPlaying && frameSettled && pid && vid && (
             <img
               src={frameUrl(pid, vid, currentFrame)}
               style={{
@@ -398,7 +406,12 @@ export default function FrameViewer() {
           )}
 
           {/* Layer 2: Annotation canvas */}
-          <AnnotationCanvas width={dimensions.width} height={dimensions.height} videoRef={videoRef} />
+          <AnnotationCanvas
+            width={dimensions.width}
+            height={dimensions.height}
+            videoRef={videoRef}
+            scrubbing={!frameSettled}
+          />
 
           {showAnchorReturnChip && targetAnchorFrame != null && (
             <div

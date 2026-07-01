@@ -16,6 +16,7 @@ import LoadingScreen from './components/LoadingScreen'
 import ResizeHandle from './components/ResizeHandle'
 import ToastContainer from './components/ToastContainer'
 import { useResizable } from './hooks/useResizable'
+import { useMaskLoader } from './hooks/useMaskLoader'
 
 function TabButton({ active, icon, label, onClick, badge }: {
   active: boolean
@@ -76,6 +77,9 @@ export default function App() {
   const handleBackendReady = useCallback(() => {
     setBackendReady(true)
   }, [])
+
+  // Central mask fetch + prefetch while annotating.
+  useMaskLoader()
 
   // ── Load initial project on mount (after backend is ready) ────────────────
 

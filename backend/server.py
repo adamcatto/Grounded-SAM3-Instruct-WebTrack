@@ -22,7 +22,7 @@ import io
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
@@ -606,6 +606,20 @@ def _invalidate_mask_cache(pid: str, vid: str) -> None:
     prefix = ("masks_png", pid, vid)
     for k in [k for k in _mask_encode_cache if isinstance(k, tuple) and len(k) >= 4 and k[:3] == prefix]:
         del _mask_encode_cache[k]
+
+
+def _mask_storage_etag(pid: str, vid: str, fidx: int) -> str:
+    """Stable ETag from on-disk mask storage revision (invalidates on edit)."""
+    ms = VideoMaskStorage(pm.video_dir(pid, vid))
+    rev_kind, rev_val = ms.png_cache_revision_part(fidx)
+    return f'"{pid}/{vid}/{fidx}/{rev_kind}/{rev_val}"'
+
+
+def _mask_cache_headers(etag: str) -> dict[str, str]:
+    return {
+        "ETag": etag,
+        "Cache-Control": "public, max-age=86400, immutable",
+    }
 
 
 def _get_prop_state(pid: str, vid: str) -> PropagationState:
@@ -2200,10 +2214,8 @@ def swap_object_masks(pid: str, vid: str, req: SwapMasksRequest):
 # ─── Saved Masks (post-propagation) ──────────────────────────────────────────
 
 @app.get("/api/projects/{pid}/videos/{vid}/masks/{fidx}")
-def get_saved_mask(pid: str, vid: str, fidx: int):
-    """
-    Return a composite mask overlay PNG for a frame (after propagation).
-    """
+def get_saved_mask(pid: str, vid: str, fidx: int, request: Request):
+    """Return per-object mask PNGs (base64) for a frame."""
     video = pm.get_video(pid, vid)
     if video is None:
         raise HTTPException(404, "Video not found")
@@ -2212,10 +2224,14 @@ def get_saved_mask(pid: str, vid: str, fidx: int):
     if not ms.has_masks(fidx):
         return JSONResponse({"masks": {}}, headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
 
+    etag = _mask_storage_etag(pid, vid, fidx)
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers=_mask_cache_headers(etag))
+
     mask_b64 = _get_encoded_masks(pid, vid, fidx, video["objects"])
     return JSONResponse(
         {"frame_idx": fidx, "masks": mask_b64},
-        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+        headers=_mask_cache_headers(etag),
     )
 
 
@@ -2324,7 +2340,7 @@ def bulk_delete_masks(
 
 
 @app.get("/api/projects/{pid}/videos/{vid}/masks/{fidx}/composite")
-def get_composite_mask(pid: str, vid: str, fidx: int):
+def get_composite_mask(pid: str, vid: str, fidx: int, request: Request):
     """Return a single composite RGBA PNG for the frame."""
     video = pm.get_video(pid, vid)
     if video is None:
@@ -2334,14 +2350,21 @@ def get_composite_mask(pid: str, vid: str, fidx: int):
     if not ms.has_masks(fidx):
         raise HTTPException(404, "No mask for this frame")
 
+    etag = _mask_storage_etag(pid, vid, fidx)
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers=_mask_cache_headers(etag))
+
     raw_masks = ms.load_masks_dense(fidx)
     objects = video["objects"]
     colors = {obj_id: obj.get("color", "#5B8DD9") for obj_id, obj in objects.items()}
 
     b64 = composite_masks_as_png(raw_masks, colors, video["width"], video["height"])
-    import base64, io
     png_bytes = base64.b64decode(b64)
-    return StreamingResponse(io.BytesIO(png_bytes), media_type="image/png")
+    return StreamingResponse(
+        io.BytesIO(png_bytes),
+        media_type="image/png",
+        headers=_mask_cache_headers(etag),
+    )
 
 
 @app.delete("/api/projects/{pid}/videos/{vid}/frames/{frame_idx}/prompts", status_code=200)
