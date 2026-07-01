@@ -110,6 +110,47 @@ def _swap_tracker_output_masks(out: dict, obj_a: int, obj_b: int) -> bool:
     return True
 
 
+def _remove_object_from_tracker_output(out: dict, obj_id: int) -> bool:
+    """Remove one object's mask from a SAM tracker output dict."""
+    obj_ids = [int(x) for x in (out.get("out_obj_ids") or [])]
+    idx = next((i for i, o in enumerate(obj_ids) if o == obj_id), None)
+    if idx is None:
+        return False
+    obj_ids.pop(idx)
+    masks = list(out.get("out_binary_masks") or [])
+    boxes = list(out.get("out_boxes_xywh") or [])
+    probs = list(out.get("out_probs") or [])
+    if idx < len(masks):
+        masks.pop(idx)
+    if boxes and idx < len(boxes):
+        boxes.pop(idx)
+    if probs and idx < len(probs):
+        probs.pop(idx)
+    out["out_obj_ids"] = obj_ids
+    out["out_binary_masks"] = masks
+    out["out_boxes_xywh"] = boxes
+    out["out_probs"] = probs
+    return True
+
+
+def _clear_tracker_output(out: dict) -> bool:
+    """Drop all object masks from a tracker output dict."""
+    if not out.get("out_obj_ids"):
+        return False
+    out["out_obj_ids"] = []
+    out["out_binary_masks"] = []
+    out["out_boxes_xywh"] = []
+    out["out_probs"] = []
+    return True
+
+
+def _config_obj_id_to_sam(obj_id_str: str) -> int:
+    if "_" in obj_id_str:
+        parts = obj_id_str.split("_")
+        return int(parts[0]) * 1000 + int(parts[1])
+    return int(obj_id_str)
+
+
 class SAMPredictor:
     """
     Manages SAM video sessions for multiple projects/videos.
@@ -552,6 +593,57 @@ class SAMPredictor:
                 if out and _swap_tracker_output_masks(out, int_a, int_b):
                     swapped += 1
             return swapped
+
+    def clear_object_mask_in_session(
+        self, pid: str, vid: str, obj_id_str: str, frame_idx: int
+    ) -> bool:
+        """Remove one object's cached mask on a single frame (SAM3 session)."""
+        with self.lock:
+            session_id = self.get_session_id(pid, vid)
+            if session_id is None or _model_name != "sam3":
+                return False
+            try:
+                sam_frame_idx = self._to_sam_idx(pid, vid, frame_idx)
+            except ValueError:
+                return False
+            predictor = _get_predictor()
+            state = predictor._ALL_INFERENCE_STATES.get(session_id, {}).get("state")
+            if not state:
+                return False
+            slot = (state.get("cached_frame_outputs") or {}).get(sam_frame_idx)
+            out = _extract_tracker_output(slot)
+            if not out:
+                return False
+            return _remove_object_from_tracker_output(out, _config_obj_id_to_sam(obj_id_str))
+
+    def clear_frame_masks_in_session(
+        self,
+        pid: str,
+        vid: str,
+        from_frame: int = -1,
+        to_frame: int = -1,
+    ) -> int:
+        """Clear all cached tracker masks for real frames in [from_frame, to_frame]."""
+        with self.lock:
+            session_id = self.get_session_id(pid, vid)
+            if session_id is None or _model_name != "sam3":
+                return 0
+            predictor = _get_predictor()
+            state = predictor._ALL_INFERENCE_STATES.get(session_id, {}).get("state")
+            if not state:
+                return 0
+            cached = state.get("cached_frame_outputs") or {}
+            cleared = 0
+            for sam_idx, slot in cached.items():
+                real_idx = self.to_real_idx(pid, vid, int(sam_idx))
+                if from_frame >= 0 and real_idx < from_frame:
+                    continue
+                if to_frame >= 0 and real_idx > to_frame:
+                    continue
+                out = _extract_tracker_output(slot)
+                if out and _clear_tracker_output(out):
+                    cleared += 1
+            return cleared
 
     # ── Propagation ──────────────────────────────────────────────────────────
 

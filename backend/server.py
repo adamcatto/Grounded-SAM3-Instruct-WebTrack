@@ -1767,13 +1767,11 @@ def replace_object_frame_prompts(pid: str, vid: str, oid: str, frame_idx: int, r
     if prop_state is not None and prop_state.is_running:
         raise HTTPException(409, "Propagation is running — pause first.")
     if not req.points:
+        had_prompt = _object_frame_had_prompt(pid, vid, oid, frame_idx)
         pm.clear_object_frame_prompt(pid, vid, oid, frame_idx)
-        ms = VideoMaskStorage(pm.video_dir(pid, vid))
-        if ms.has_masks(frame_idx):
-            existing = ms.load_masks_dense(frame_idx)
-            remaining = {k: v for k, v in existing.items() if k != oid}
-            ms.save_frame(frame_idx, remaining, None)
-            _invalidate_mask_cache(pid, vid)
+        _clear_object_frame_masks_on_disk(pid, vid, oid, frame_idx)
+        sync = _sync_object_frame_clear_session(pid, vid, oid, frame_idx, had_prompt=had_prompt)
+        return {"status": "ok", **sync}
     else:
         pm.save_point_prompts(pid, vid, oid, frame_idx, req.points, req.labels)
     return {"status": "ok"}
@@ -1881,6 +1879,66 @@ def _persist_merged_masks_for_frame(
     merged = {**existing, **{str(k): np.asarray(v) for k, v in raw_masks.items()}}
     ms.save_frame(frame_idx, merged, None)
     _invalidate_mask_cache(pid, vid)
+
+
+def _object_frame_had_prompt(pid: str, vid: str, oid: str, frame_idx: int) -> bool:
+    video = pm.get_video(pid, vid)
+    if video is None:
+        return False
+    return str(frame_idx) in (video.get("point_prompts", {}).get(oid, {}) or {})
+
+
+def _clear_object_frame_masks_on_disk(pid: str, vid: str, oid: str, frame_idx: int) -> None:
+    ms = VideoMaskStorage(pm.video_dir(pid, vid))
+    if not ms.has_masks(frame_idx):
+        return
+    existing = ms.load_masks_dense(frame_idx)
+    remaining = {k: v for k, v in existing.items() if k != oid}
+    if remaining:
+        ms.save_frame(frame_idx, remaining, None)
+    else:
+        ms.delete_frame(frame_idx)
+    _invalidate_mask_cache(pid, vid)
+
+
+def _sync_object_frame_clear_session(
+    pid: str, vid: str, oid: str, frame_idx: int, *, had_prompt: bool
+) -> dict:
+    """Update SAM session after clearing one object's mask/prompt on a frame."""
+    if not sam.get_session_id(pid, vid):
+        return {"session_mask_cleared": False, "session_resynced": False}
+    session_mask_cleared = False
+    session_resynced = False
+    try:
+        session_mask_cleared = sam.clear_object_mask_in_session(pid, vid, oid, frame_idx)
+        if had_prompt:
+            ann_dir = pm.annotated_frames_dir(pid, vid)
+            if ann_dir.exists() and list(ann_dir.glob("*.jpg")):
+                _full_ann_session_reinit_and_replay(
+                    pid, vid, str(ann_dir), collect_last_outputs=False
+                )
+                session_resynced = True
+    except Exception as e:
+        logger.warning(f"SAM session sync after object frame clear failed: {e}")
+    return {
+        "session_mask_cleared": session_mask_cleared,
+        "session_resynced": session_resynced,
+    }
+
+
+def _sync_frame_prompts_clear_session(pid: str, vid: str) -> bool:
+    """Re-init SAM from config after all prompts on a frame were removed."""
+    if not sam.get_session_id(pid, vid):
+        return False
+    try:
+        ann_dir = pm.annotated_frames_dir(pid, vid)
+        if not ann_dir.exists() or not list(ann_dir.glob("*.jpg")):
+            return False
+        _full_ann_session_reinit_and_replay(pid, vid, str(ann_dir), collect_last_outputs=False)
+        return True
+    except Exception as e:
+        logger.warning(f"SAM session resync after frame prompt clear failed: {e}")
+        return False
 
 
 def _full_ann_session_reinit_and_replay(
@@ -2106,14 +2164,11 @@ def clear_object_points(pid: str, vid: str, oid: str):
 @app.delete("/api/projects/{pid}/videos/{vid}/objects/{oid}/frames/{frame_idx}/points")
 def clear_object_frame_points(pid: str, vid: str, oid: str, frame_idx: int):
     """Clear point prompts and saved mask for a single object on a single frame."""
+    had_prompt = _object_frame_had_prompt(pid, vid, oid, frame_idx)
     pm.clear_object_frame_prompt(pid, vid, oid, frame_idx)
-    ms = VideoMaskStorage(pm.video_dir(pid, vid))
-    if ms.has_masks(frame_idx):
-        existing = ms.load_masks_dense(frame_idx)
-        remaining = {k: v for k, v in existing.items() if k != oid}
-        ms.save_frame(frame_idx, remaining, None)
-        _invalidate_mask_cache(pid, vid)
-    return {"status": "ok"}
+    _clear_object_frame_masks_on_disk(pid, vid, oid, frame_idx)
+    sync = _sync_object_frame_clear_session(pid, vid, oid, frame_idx, had_prompt=had_prompt)
+    return {"status": "ok", **sync}
 
 
 class SwapMasksRequest(BaseModel):
@@ -2197,8 +2252,19 @@ def delete_frame_masks(pid: str, vid: str, fidx: int):
     if had_bbox:
         deleted.append("bboxes")
 
+    session_frames_cleared = 0
+    try:
+        session_frames_cleared = sam.clear_frame_masks_in_session(pid, vid, fidx, fidx)
+    except Exception as e:
+        logger.warning(f"SAM session mask clear failed for frame {fidx}: {e}")
+
     _invalidate_mask_cache(pid, vid)
-    return JSONResponse({"status": "ok", "frame_idx": fidx, "deleted": deleted})
+    return JSONResponse({
+        "status": "ok",
+        "frame_idx": fidx,
+        "deleted": deleted,
+        "session_frames_cleared": session_frames_cleared,
+    })
 
 
 @app.delete("/api/projects/{pid}/videos/{vid}/masks")
@@ -2238,8 +2304,23 @@ def bulk_delete_masks(
     else:
         raise HTTPException(422, f"Unknown mode: {mode}")
 
+    session_frames_cleared = 0
+    try:
+        ff = from_frame if mode in ("from_frame", "range") else -1
+        tf = to_frame if mode in ("to_frame", "range") else -1
+        if mode == "all":
+            ff, tf = -1, -1
+        session_frames_cleared = sam.clear_frame_masks_in_session(pid, vid, ff, tf)
+    except Exception as e:
+        logger.warning(f"SAM session bulk mask clear failed: {e}")
+
     _invalidate_mask_cache(pid, vid)
-    return JSONResponse({"status": "ok", "mode": mode, "deleted_frames": deleted})
+    return JSONResponse({
+        "status": "ok",
+        "mode": mode,
+        "deleted_frames": deleted,
+        "session_frames_cleared": session_frames_cleared,
+    })
 
 
 @app.get("/api/projects/{pid}/videos/{vid}/masks/{fidx}/composite")
@@ -2273,7 +2354,8 @@ def clear_frame_from_inference(pid: str, vid: str, frame_idx: int):
     if video is None:
         raise HTTPException(404, "Video not found")
     pm.clear_frame_prompts(pid, vid, frame_idx)
-    return {"status": "cleared", "frame_idx": frame_idx}
+    session_resynced = _sync_frame_prompts_clear_session(pid, vid)
+    return {"status": "cleared", "frame_idx": frame_idx, "session_resynced": session_resynced}
 
 
 # ─── Video Export (SSE) ──────────────────────────────────────────────────────
