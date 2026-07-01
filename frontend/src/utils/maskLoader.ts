@@ -83,7 +83,7 @@ export function invalidateMaskLoaderFrame(pid: string, vid: string, fidx: number
   evictCompositeFrame(pid, vid, fidx)
 }
 
-/** Prefetch masks around `center` in the direction of recent travel. */
+/** Prefetch per-object masks around `center` in the direction of recent travel. */
 export function prefetchMaskWindow(
   pid: string,
   vid: string,
@@ -101,8 +101,6 @@ export function prefetchMaskWindow(
   for (const delta of offsets) {
     const fidx = center + delta
     if (fidx < 0 || !propagatedFrames.has(fidx)) continue
-
-    void loadCompositeBitmap(pid, vid, fidx)
 
     void loadPerObjectMasks(pid, vid, fidx).then(masks => {
       if (masks) onPerObject(fidx, masks)

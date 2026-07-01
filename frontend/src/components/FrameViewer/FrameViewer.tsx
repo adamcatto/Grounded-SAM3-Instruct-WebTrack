@@ -57,7 +57,8 @@ export default function FrameViewer() {
   const [dimensions, setDimensions] = useState({ width: 0, height: 0 })
   const [anchorReturnOffsets, setAnchorReturnOffsets] = useState({ right: 12, bottom: 12 })
   const [showTip, setShowTip] = useState(true)
-  const [frameSettled, setFrameSettled] = useState(true)
+  // Keep showing the last loaded JPEG while stepping frames (avoids black flash).
+  const [jpegFrame, setJpegFrame] = useState(currentFrame)
 
   // Prevent feedback loop: video timeupdate -> setCurrentFrame -> seek effect
   const videoIsDriving = useRef(false)
@@ -69,12 +70,15 @@ export default function FrameViewer() {
 
   useEffect(() => { fpsRef.current = fps }, [fps])
 
-  // Defer high-fidelity JPEG overlay while the user is stepping frames rapidly.
+  // Debounce JPEG src updates during rapid arrow-key scrubbing.
   useEffect(() => {
-    setFrameSettled(false)
-    const t = setTimeout(() => setFrameSettled(true), 150)
+    const t = setTimeout(() => setJpegFrame(currentFrame), 150)
     return () => clearTimeout(t)
   }, [currentFrame])
+
+  useEffect(() => {
+    setJpegFrame(currentFrame)
+  }, [vid])
 
   // ── Compute displayed dimensions ──────────────────────────────────────────
 
@@ -390,10 +394,10 @@ export default function FrameViewer() {
             <source src={videoSrc} type="video/mp4" />
           </video>
 
-          {/* Layer 1b: JPEG frame — only after scrubbing settles (video shows meanwhile) */}
-          {!isPlaying && frameSettled && pid && vid && (
+          {/* Layer 1b: JPEG frame — stale-while-revalidate during scrubbing */}
+          {!isPlaying && pid && vid && (
             <img
-              src={frameUrl(pid, vid, currentFrame)}
+              src={frameUrl(pid, vid, jpegFrame)}
               style={{
                 position: 'absolute', top: 0, left: 0,
                 width: '100%', height: '100%',
@@ -410,7 +414,7 @@ export default function FrameViewer() {
             width={dimensions.width}
             height={dimensions.height}
             videoRef={videoRef}
-            scrubbing={!frameSettled}
+            scrubbing={jpegFrame !== currentFrame}
           />
 
           {showAnchorReturnChip && targetAnchorFrame != null && (
