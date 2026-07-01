@@ -154,6 +154,20 @@ export const clearFramePrompts = (pid: string, vid: string, frameIdx: number) =>
 export const frameUrl = (pid: string, vid: string, fidx: number) =>
   `/api/projects/${pid}/videos/${vid}/frames/${fidx}`
 
+export const displayMaskUrl = (pid: string, vid: string, fidx: number) =>
+  `/api/projects/${pid}/videos/${vid}/display/${fidx}`
+
+export interface CacheManifest {
+  cache_revision: number
+  display: { dir: string; ext: string; width: number; height: number; count: number; bytes: number }
+  frames: { dir: string; ext: string; count: number; bytes: number }
+  propagated_frames: number[]
+  bytes_total: number
+}
+
+export const getCacheManifest = (pid: string, vid: string) =>
+  api.get<CacheManifest>(`/projects/${pid}/videos/${vid}/cache/manifest`).then(r => r.data)
+
 export const thumbUrl = frameUrl
 
 // Video needs HTTP Range request support for seeking. In dev, bypass Vite proxy.

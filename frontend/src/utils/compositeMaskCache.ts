@@ -1,6 +1,6 @@
 /** LRU cache of decoded composite mask bitmaps (one per frame). */
 
-const MAX_COMPOSITE_CACHE = 40
+const MAX_COMPOSITE_CACHE = 80
 const cache = new Map<string, ImageBitmap>()
 
 function key(pid: string, vid: string, fidx: number): string {

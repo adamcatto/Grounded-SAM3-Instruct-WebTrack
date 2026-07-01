@@ -1,7 +1,9 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useStore, currentVideo as selectCurrentVideo } from '../../store/useStore'
 import { extractFrame, addPoints, rebuildFromConfig, replaceFramePromptsData, removeObject } from '../../api/client'
-import { drawMasks, drawPoints, loadMaskBitmap } from '../../utils/maskUtils'
+import { drawCompositeMask, drawMasks, drawPoints, loadMaskBitmap } from '../../utils/maskUtils'
+import { getCompositeBitmap } from '../../utils/compositeMaskCache'
+import { loadDisplayBitmap } from '../../utils/maskLoader'
 import { applyRebuildMasksToStore, localAnnotationsToPointPrompts, stripObjectMaskFromFrameCaches } from '../../history/applyRebuild'
 
 interface Props {
@@ -29,6 +31,7 @@ export default function AnnotationCanvas({ width, height, scrubbing = false }: P
 
   const [hoverLabel, setHoverLabel] = useState<string | null>(null)
   const [hoverPos, setHoverPos] = useState<{ x: number; y: number } | null>(null)
+  const [displayReady, setDisplayReady] = useState(0)
   const maskPixelDataRef = useRef<Map<string, ImageData>>(new Map())
 
   const pid = project?.id ?? ''
@@ -40,6 +43,20 @@ export default function AnnotationCanvas({ width, height, scrubbing = false }: P
     }
     return savedMaskCache[currentFrame] ?? {}
   }, [currentFrame, currentFrameMasks, currentFrameMasksFrame, savedMaskCache])
+
+  // Load pre-materialized display WebP when available (optional fast path).
+  useEffect(() => {
+    if (!config.showMasks || !pid || !vid) return
+    if (getCompositeBitmap(pid, vid, currentFrame)) {
+      setDisplayReady(t => t + 1)
+      return
+    }
+    let cancelled = false
+    void loadDisplayBitmap(pid, vid, currentFrame).then(() => {
+      if (!cancelled) setDisplayReady(t => t + 1)
+    })
+    return () => { cancelled = true }
+  }, [currentFrame, pid, vid, config.showMasks])
 
   // Per-object alpha maps for hover hit-testing (disabled while scrubbing).
   useEffect(() => {
@@ -81,8 +98,7 @@ export default function AnnotationCanvas({ width, height, scrubbing = false }: P
 
     let stale = false
 
-    const masksToDraw = config.showMasks ? masksToShow : {}
-    drawMasks(ctx, masksToDraw, width, height, config.maskOpacity, objectNames, config.showMasks).then(() => {
+    const finishPoints = () => {
       if (stale) return
       const allPoints: { x: number; y: number; label: 0 | 1 }[] = []
       for (const [, framePts] of Object.entries(localAnnotations)) {
@@ -94,11 +110,26 @@ export default function AnnotationCanvas({ width, height, scrubbing = false }: P
         }
       }
       drawPoints(ctx, allPoints, width, height, config.pointSize)
-    })
+    }
+
+    const displayBitmap = config.showMasks && pid && vid
+      ? getCompositeBitmap(pid, vid, currentFrame)
+      : undefined
+
+    if (displayBitmap) {
+      drawCompositeMask(ctx, displayBitmap, width, height, config.maskOpacity)
+      finishPoints()
+      return () => { stale = true }
+    }
+
+    const masksToDraw = config.showMasks ? masksToShow : {}
+    const showLabels = config.showMasks && !scrubbing
+    drawMasks(ctx, masksToDraw, width, height, config.maskOpacity, objectNames, showLabels).then(finishPoints)
     return () => { stale = true }
   }, [
     width, height, masksToShow, localAnnotations, currentFrame,
     config.showMasks, config.maskOpacity, config.pointSize, objectNames,
+    scrubbing, pid, vid, displayReady,
   ])
 
   const handleMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {

@@ -394,9 +394,12 @@ export default function FrameViewer() {
             <source src={videoSrc} type="video/mp4" />
           </video>
 
-          {/* Layer 1b: JPEG frame — stale-while-revalidate during scrubbing */}
-          {!isPlaying && pid && vid && (
+          {/* Layer 1b: high-fidelity JPEG — only when settled on this frame.
+              While scrubbing, hide the overlay so a stale frame-0 JPEG does not
+              cover the seeked video underneath. */}
+          {!isPlaying && pid && vid && jpegFrame === currentFrame && (
             <img
+              key={`${pid}/${vid}/${jpegFrame}`}
               src={frameUrl(pid, vid, jpegFrame)}
               style={{
                 position: 'absolute', top: 0, left: 0,

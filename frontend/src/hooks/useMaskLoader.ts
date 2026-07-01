@@ -1,10 +1,10 @@
 import { useEffect, useRef } from 'react'
 import { useStore, currentVideo as selectCurrentVideo } from '../store/useStore'
-import { loadPerObjectMasks, prefetchMaskWindow } from '../utils/maskLoader'
+import { clearDisplayMissCache, loadDisplayBitmap, loadPerObjectMasks, prefetchMaskWindow } from '../utils/maskLoader'
 
 /**
  * Central mask fetch + prefetch for frame scrubbing.
- * Replaces duplicate effects in AnnotationCanvas and Timeline.
+ * Per-object JSON is the reliable path; display WebP is an optional fast overlay.
  */
 export function useMaskLoader(): void {
   const store = useStore()
@@ -21,6 +21,10 @@ export function useMaskLoader(): void {
   const lastFrameRef = useRef(currentFrame)
 
   useEffect(() => {
+    if (pid && vid) clearDisplayMissCache(pid, vid)
+  }, [pid, vid])
+
+  useEffect(() => {
     if (!pid || !vid) return
 
     const propagated = video?.propagated_frames ?? []
@@ -31,15 +35,18 @@ export function useMaskLoader(): void {
       currentFrame > prev ? 1 : currentFrame < prev ? -1 : 0
     lastFrameRef.current = currentFrame
 
-    // Always try to load masks for the current frame (annotation + review).
-    if (!useStore.getState().savedMaskCache[currentFrame]) {
-      void loadPerObjectMasks(pid, vid, currentFrame).then(masks => {
-        if (masks) setSavedMask(currentFrame, masks)
-      })
-    }
+    // Current frame first — masks must always load even without display WebP.
+    void loadPerObjectMasks(pid, vid, currentFrame).then(masks => {
+      if (masks) setSavedMask(currentFrame, masks)
+    })
 
-    // Directional prefetch once propagation has written frames to disk.
-    if (propagatedSet.size > 0) {
+    // Display WebP is optional; only fetch for the visible frame.
+    void loadDisplayBitmap(pid, vid, currentFrame)
+
+    if (propagatedSet.size === 0) return
+
+    // Defer adjacent prefetch so current-frame work is not starved.
+    const t = window.setTimeout(() => {
       prefetchMaskWindow(
         pid,
         vid,
@@ -52,6 +59,8 @@ export function useMaskLoader(): void {
           }
         },
       )
-    }
+    }, 32)
+
+    return () => { window.clearTimeout(t) }
   }, [pid, vid, currentFrame, video?.propagated_frames, setSavedMask])
 }

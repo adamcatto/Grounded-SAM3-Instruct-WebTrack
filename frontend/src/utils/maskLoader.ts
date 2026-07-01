@@ -1,4 +1,4 @@
-import { getSavedMask } from '../api/client'
+import { getSavedMask, displayMaskUrl } from '../api/client'
 import type { MaskData } from '../types'
 import {
   evictCompositeFrame,
@@ -6,26 +6,23 @@ import {
   setCompositeBitmap,
 } from './compositeMaskCache'
 
-const PREFETCH_RADIUS = 3
+const PREFETCH_RADIUS = 2
 
 type InFlightKey = string
 
 const inFlightPerObject = new Map<InFlightKey, Promise<MaskData | null>>()
-const inFlightComposite = new Map<InFlightKey, Promise<ImageBitmap | null>>()
+const inFlightDisplay = new Map<InFlightKey, Promise<ImageBitmap | null>>()
+const displayMissKeys = new Set<InFlightKey>()
 
 function perObjectKey(pid: string, vid: string, fidx: number): InFlightKey {
   return `obj:${pid}/${vid}/${fidx}`
 }
 
-function compositeKey(pid: string, vid: string, fidx: number): InFlightKey {
-  return `cmp:${pid}/${vid}/${fidx}`
+function displayKey(pid: string, vid: string, fidx: number): InFlightKey {
+  return `dsp:${pid}/${vid}/${fidx}`
 }
 
-function compositeUrl(pid: string, vid: string, fidx: number): string {
-  return `/api/projects/${pid}/videos/${vid}/masks/${fidx}/composite`
-}
-
-/** Fetch per-object masks (JSON base64). Dedupes concurrent requests. */
+/** Fetch per-object masks (JSON base64). Used for hover labels and annotation. */
 export async function loadPerObjectMasks(
   pid: string,
   vid: string,
@@ -47,8 +44,8 @@ export async function loadPerObjectMasks(
   return promise
 }
 
-/** Fetch composite PNG for fast scrub display. Uses browser HTTP cache when ETag matches. */
-export async function loadCompositeBitmap(
+/** Fetch pre-materialized display WebP (Phase A scrub cache). */
+export async function loadDisplayBitmap(
   pid: string,
   vid: string,
   fidx: number,
@@ -56,14 +53,19 @@ export async function loadCompositeBitmap(
   const cached = getCompositeBitmap(pid, vid, fidx)
   if (cached) return cached
 
-  const k = compositeKey(pid, vid, fidx)
-  const existing = inFlightComposite.get(k)
+  const k = displayKey(pid, vid, fidx)
+  if (displayMissKeys.has(k)) return null
+
+  const existing = inFlightDisplay.get(k)
   if (existing) return existing
 
-  const promise = fetch(compositeUrl(pid, vid, fidx))
+  const promise = fetch(displayMaskUrl(pid, vid, fidx))
     .then(async resp => {
-      if (resp.status === 404) return null
-      if (!resp.ok) throw new Error(`composite ${resp.status}`)
+      if (resp.status === 404) {
+        displayMissKeys.add(k)
+        return null
+      }
+      if (!resp.ok) throw new Error(`display ${resp.status}`)
       const blob = await resp.blob()
       if (blob.size === 0) return null
       const bitmap = await createImageBitmap(blob)
@@ -71,19 +73,34 @@ export async function loadCompositeBitmap(
       return bitmap
     })
     .catch(() => null)
-    .finally(() => { inFlightComposite.delete(k) })
+    .finally(() => { inFlightDisplay.delete(k) })
 
-  inFlightComposite.set(k, promise)
+  inFlightDisplay.set(k, promise)
   return promise
 }
 
+/** @deprecated Use loadDisplayBitmap — kept as alias for callers. */
+export const loadCompositeBitmap = loadDisplayBitmap
+
 export function invalidateMaskLoaderFrame(pid: string, vid: string, fidx: number): void {
   inFlightPerObject.delete(perObjectKey(pid, vid, fidx))
-  inFlightComposite.delete(compositeKey(pid, vid, fidx))
+  inFlightDisplay.delete(displayKey(pid, vid, fidx))
+  displayMissKeys.delete(displayKey(pid, vid, fidx))
   evictCompositeFrame(pid, vid, fidx)
 }
 
-/** Prefetch per-object masks around `center` in the direction of recent travel. */
+export function clearDisplayMissCache(pid?: string, vid?: string): void {
+  if (!pid || !vid) {
+    displayMissKeys.clear()
+    return
+  }
+  const prefix = `dsp:${pid}/${vid}/`
+  for (const k of [...displayMissKeys]) {
+    if (k.startsWith(prefix)) displayMissKeys.delete(k)
+  }
+}
+
+/** Prefetch per-object masks around `center` (display WebP is current-frame only). */
 export function prefetchMaskWindow(
   pid: string,
   vid: string,
