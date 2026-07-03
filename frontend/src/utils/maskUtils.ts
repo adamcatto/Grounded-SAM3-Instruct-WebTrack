@@ -6,7 +6,7 @@
  * The cache is bounded to MAX_IMAGE_CACHE entries (FIFO eviction).
  */
 
-const MAX_IMAGE_CACHE = 100  // decoded bitmaps; each full-res RGBA mask is ~8 MB
+const MAX_IMAGE_CACHE = 40  // decoded bitmaps; each full-res RGBA mask is ~8 MB
 const imageCache = new Map<string, ImageBitmap>()
 
 function b64ToBlob(b64: string): Blob {
@@ -41,6 +41,19 @@ export function evictMaskImages(b64s: string[]) {
     imageCache.get(b64)?.close()
     imageCache.delete(b64)
   }
+}
+
+export function drawCompositeMask(
+  ctx: CanvasRenderingContext2D,
+  bitmap: ImageBitmap,
+  width: number,
+  height: number,
+  opacity = 1.0,
+): void {
+  const prev = ctx.globalAlpha
+  ctx.globalAlpha = Math.max(0, Math.min(1, opacity))
+  ctx.drawImage(bitmap, 0, 0, width, height)
+  ctx.globalAlpha = prev
 }
 
 export async function drawMasks(

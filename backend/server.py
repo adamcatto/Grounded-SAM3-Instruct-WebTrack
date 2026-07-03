@@ -22,7 +22,7 @@ import io
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
@@ -37,6 +37,7 @@ from anchor_helpers import (
 from project_manager import ProjectManager
 from sam_predictor import SAMPredictor, _get_predictor
 from mask_store import VideoMaskStorage
+import display_cache as dc
 from video_processor import (
     compute_ds_dims,
     composite_masks_as_png,
@@ -308,6 +309,7 @@ def _persist_predicted_anchor_frame(pid: str, vid: str, frame_idx: int,
         bbox_json[cfg_key] = list(bx) + [score]
 
     ms.save_frame(frame_idx, merged_masks, bbox_json)
+    _materialize_scrub_cache(pid, vid, frame_idx, merged_masks)
     _invalidate_mask_cache(pid, vid)
 
 
@@ -606,6 +608,104 @@ def _invalidate_mask_cache(pid: str, vid: str) -> None:
     prefix = ("masks_png", pid, vid)
     for k in [k for k in _mask_encode_cache if isinstance(k, tuple) and len(k) >= 4 and k[:3] == prefix]:
         del _mask_encode_cache[k]
+
+
+def _mask_storage_etag(pid: str, vid: str, fidx: int) -> str:
+    """Stable ETag from on-disk mask storage revision (invalidates on edit)."""
+    ms = VideoMaskStorage(pm.video_dir(pid, vid))
+    rev_kind, rev_val = ms.png_cache_revision_part(fidx)
+    return f'"{pid}/{vid}/{fidx}/{rev_kind}/{rev_val}"'
+
+
+def _mask_cache_headers(etag: str) -> dict[str, str]:
+    return {
+        "ETag": etag,
+        "Cache-Control": "public, max-age=86400, immutable",
+    }
+
+
+def _object_display_colors(objects: dict) -> dict[str, str]:
+    return {
+        str(oid): _get_instance_color(str(oid), objects)
+        for oid in objects
+    }
+
+
+def _materialize_scrub_cache(
+    pid: str,
+    vid: str,
+    frame_idx: int,
+    masks: dict[str, np.ndarray] | None,
+    *,
+    frames_src_dir: str | None = None,
+) -> None:
+    """Persist frames/ JPG (optional) and display/ WebP for one frame."""
+    video = pm.get_video(pid, vid)
+    if video is None:
+        return
+    video_dir = pm.video_dir(pid, vid)
+    if frames_src_dir:
+        dc.copy_frame_jpg(frames_src_dir, frame_idx, pm.frames_dir(pid, vid))
+    if masks:
+        colors = _object_display_colors(video.get("objects", {}))
+        w = int(video.get("width") or 1)
+        h = int(video.get("height") or 1)
+        dc.write_display_webp(
+            video_dir, frame_idx,
+            {str(k): np.asarray(v).astype(np.uint8) for k, v in masks.items()},
+            colors, w, h,
+        )
+    else:
+        dc.delete_display_frame(video_dir, frame_idx)
+
+
+def _refresh_scrub_manifest(pid: str, vid: str) -> None:
+    video = pm.get_video(pid, vid)
+    if video is None:
+        return
+    video_dir = pm.video_dir(pid, vid)
+    ms = VideoMaskStorage(video_dir)
+    propagated = pm._read_propagated_frames(pid, vid)
+    dc.write_manifest(
+        video_dir,
+        ms.cache_revision_int(),
+        int(video.get("width") or 0),
+        int(video.get("height") or 0),
+        propagated,
+    )
+
+
+def _display_webp_path(pid: str, vid: str, fidx: int) -> Path | None:
+    """Return display WebP path if already materialized."""
+    video = pm.get_video(pid, vid)
+    if video is None:
+        return None
+    out = dc.display_path(pm.video_dir(pid, vid), fidx)
+    return out if out.is_file() else None
+
+
+def _ensure_display_webp_path(pid: str, vid: str, fidx: int, video: dict) -> Path | None:
+    """
+    Return a display WebP path, lazily materializing it from mask storage.
+
+    The scrub UI renders this single composited bitmap instead of waiting for
+    per-object PNG JSON. Existing projects may have SQLite masks without a
+    populated display/ cache, so GET /display must be able to repair that cache
+    on demand.
+    """
+    video_dir = pm.video_dir(pid, vid)
+    out = dc.display_path(video_dir, fidx)
+    if out.is_file():
+        return out
+
+    masks = VideoMaskStorage(video_dir).load_masks_dense(fidx)
+    if not masks:
+        return None
+
+    colors = _object_display_colors(video.get("objects", {}))
+    w = int(video.get("width") or 1)
+    h = int(video.get("height") or 1)
+    return dc.write_display_webp(video_dir, fidx, masks, colors, w, h)
 
 
 def _get_prop_state(pid: str, vid: str) -> PropagationState:
@@ -1179,6 +1279,7 @@ def reset_video(pid: str, vid: str):
 
     # Invalidate in-memory mask cache for this video
     _invalidate_mask_cache(pid, vid)
+    dc.clear_display_cache(pm.video_dir(pid, vid))
 
     VideoMaskStorage(pm.video_dir(pid, vid)).wipe_sqlite_file()
 
@@ -1742,10 +1843,13 @@ def restore_mask_frames(pid: str, vid: str, req: RestoreMasksRequest):
         dense = decode_masks_png_base64_to_binary(masks_b64)
         if dense:
             ms.save_frame(fidx, dense, None)
+            _materialize_scrub_cache(pid, vid, fidx, dense)
         else:
             ms.delete_frame(fidx)
+            _materialize_scrub_cache(pid, vid, fidx, None)
         n += 1
     _invalidate_mask_cache(pid, vid)
+    _refresh_scrub_manifest(pid, vid)
     return {"status": "ok", "restored": n}
 
 
@@ -1878,6 +1982,7 @@ def _persist_merged_masks_for_frame(
     existing = ms.load_masks_dense(frame_idx)
     merged = {**existing, **{str(k): np.asarray(v) for k, v in raw_masks.items()}}
     ms.save_frame(frame_idx, merged, None)
+    _materialize_scrub_cache(pid, vid, frame_idx, merged)
     _invalidate_mask_cache(pid, vid)
 
 
@@ -1896,8 +2001,10 @@ def _clear_object_frame_masks_on_disk(pid: str, vid: str, oid: str, frame_idx: i
     remaining = {k: v for k, v in existing.items() if k != oid}
     if remaining:
         ms.save_frame(frame_idx, remaining, None)
+        _materialize_scrub_cache(pid, vid, frame_idx, remaining)
     else:
         ms.delete_frame(frame_idx)
+        _materialize_scrub_cache(pid, vid, frame_idx, None)
     _invalidate_mask_cache(pid, vid)
 
 
@@ -2194,16 +2301,66 @@ def swap_object_masks(pid: str, vid: str, req: SwapMasksRequest):
         logger.warning(f"SAM session mask swap failed for {pid}/{vid}: {e}")
 
     _invalidate_mask_cache(pid, vid)
+    video = pm.get_video(pid, vid)
+    if video and swapped:
+        lo = req.from_frame if req.from_frame >= 0 else 0
+        hi = req.to_frame if req.to_frame >= 0 else 10**9
+        for fidx in pm._read_propagated_frames(pid, vid):
+            if lo <= fidx <= hi and ms.has_masks(fidx):
+                _materialize_scrub_cache(pid, vid, fidx, ms.load_masks_dense(fidx))
+        _refresh_scrub_manifest(pid, vid)
     return {"status": "ok", "frames_swapped": swapped, "session_frames_swapped": session_swapped}
+
+
+# ─── Scrub cache (materialized frames + display WebP) ────────────────────────
+
+@app.get("/api/projects/{pid}/videos/{vid}/cache/manifest")
+def get_cache_manifest(pid: str, vid: str):
+    """Return cache manifest for pre-materialized frames and display overlays."""
+    video = pm.get_video(pid, vid)
+    if video is None:
+        raise HTTPException(404, "Video not found")
+    video_dir = pm.video_dir(pid, vid)
+    ms = VideoMaskStorage(video_dir)
+    propagated = pm._read_propagated_frames(pid, vid)
+    manifest = dc.build_manifest(
+        video_dir,
+        ms.cache_revision_int(),
+        int(video.get("width") or 0),
+        int(video.get("height") or 0),
+        propagated,
+    )
+    etag = f'"manifest/{pid}/{vid}/{manifest["cache_revision"]}"'
+    return JSONResponse(manifest, headers=_mask_cache_headers(etag))
+
+
+@app.get("/api/projects/{pid}/videos/{vid}/display/{fidx}")
+def get_display_mask(pid: str, vid: str, fidx: int, request: Request):
+    """Serve display WebP for a frame, materializing missing cache entries."""
+    video = pm.get_video(pid, vid)
+    if video is None:
+        raise HTTPException(404, "Video not found")
+
+    path = _ensure_display_webp_path(pid, vid, fidx, video)
+    if path is None:
+        raise HTTPException(404, "No display cache for this frame")
+
+    etag = _mask_storage_etag(pid, vid, fidx)
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers=_mask_cache_headers(etag))
+
+    return FileResponse(
+        str(path),
+        media_type="image/webp",
+        headers=_mask_cache_headers(etag),
+    )
 
 
 # ─── Saved Masks (post-propagation) ──────────────────────────────────────────
 
 @app.get("/api/projects/{pid}/videos/{vid}/masks/{fidx}")
-def get_saved_mask(pid: str, vid: str, fidx: int):
-    """
-    Return a composite mask overlay PNG for a frame (after propagation).
-    """
+def get_saved_mask(pid: str, vid: str, fidx: int, request: Request):
+    """Return per-object mask PNGs (base64) for a frame."""
     video = pm.get_video(pid, vid)
     if video is None:
         raise HTTPException(404, "Video not found")
@@ -2212,10 +2369,14 @@ def get_saved_mask(pid: str, vid: str, fidx: int):
     if not ms.has_masks(fidx):
         return JSONResponse({"masks": {}}, headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
 
+    etag = _mask_storage_etag(pid, vid, fidx)
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers=_mask_cache_headers(etag))
+
     mask_b64 = _get_encoded_masks(pid, vid, fidx, video["objects"])
     return JSONResponse(
         {"frame_idx": fidx, "masks": mask_b64},
-        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+        headers=_mask_cache_headers(etag),
     )
 
 
@@ -2247,6 +2408,7 @@ def delete_frame_masks(pid: str, vid: str, fidx: int):
     had_masks = ms.has_masks(fidx) or masks_path.exists()
     had_bbox = bboxes_path.exists()
     ms.delete_frame(fidx)
+    dc.delete_display_frame(pm.video_dir(pid, vid), fidx)
     if had_masks:
         deleted.append("masks")
     if had_bbox:
@@ -2259,6 +2421,7 @@ def delete_frame_masks(pid: str, vid: str, fidx: int):
         logger.warning(f"SAM session mask clear failed for frame {fidx}: {e}")
 
     _invalidate_mask_cache(pid, vid)
+    _refresh_scrub_manifest(pid, vid)
     return JSONResponse({
         "status": "ok",
         "frame_idx": fidx,
@@ -2315,6 +2478,31 @@ def bulk_delete_masks(
         logger.warning(f"SAM session bulk mask clear failed: {e}")
 
     _invalidate_mask_cache(pid, vid)
+    video_dir = pm.video_dir(pid, vid)
+    if mode == "all":
+        display_d = video_dir / dc.DISPLAY_SUBDIR
+        if display_d.is_dir():
+            shutil.rmtree(display_d)
+    else:
+        lo = 0
+        hi = 10**9
+        if mode == "from_frame":
+            lo = from_frame if from_frame is not None else 0
+        elif mode == "to_frame":
+            hi = to_frame if to_frame is not None else 10**9
+        elif mode == "range":
+            lo = from_frame if from_frame is not None else 0
+            hi = to_frame if to_frame is not None else 10**9
+        display_d = video_dir / dc.DISPLAY_SUBDIR
+        if display_d.is_dir():
+            for p in display_d.glob("*.webp"):
+                try:
+                    fidx = int(p.stem)
+                except ValueError:
+                    continue
+                if lo <= fidx <= hi:
+                    p.unlink(missing_ok=True)
+    _refresh_scrub_manifest(pid, vid)
     return JSONResponse({
         "status": "ok",
         "mode": mode,
@@ -2324,7 +2512,7 @@ def bulk_delete_masks(
 
 
 @app.get("/api/projects/{pid}/videos/{vid}/masks/{fidx}/composite")
-def get_composite_mask(pid: str, vid: str, fidx: int):
+def get_composite_mask(pid: str, vid: str, fidx: int, request: Request):
     """Return a single composite RGBA PNG for the frame."""
     video = pm.get_video(pid, vid)
     if video is None:
@@ -2334,14 +2522,21 @@ def get_composite_mask(pid: str, vid: str, fidx: int):
     if not ms.has_masks(fidx):
         raise HTTPException(404, "No mask for this frame")
 
+    etag = _mask_storage_etag(pid, vid, fidx)
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers=_mask_cache_headers(etag))
+
     raw_masks = ms.load_masks_dense(fidx)
     objects = video["objects"]
     colors = {obj_id: obj.get("color", "#5B8DD9") for obj_id, obj in objects.items()}
 
     b64 = composite_masks_as_png(raw_masks, colors, video["width"], video["height"])
-    import base64, io
     png_bytes = base64.b64decode(b64)
-    return StreamingResponse(io.BytesIO(png_bytes), media_type="image/png")
+    return StreamingResponse(
+        io.BytesIO(png_bytes),
+        media_type="image/png",
+        headers=_mask_cache_headers(etag),
+    )
 
 
 @app.delete("/api/projects/{pid}/videos/{vid}/frames/{frame_idx}/prompts", status_code=200)
@@ -2853,11 +3048,16 @@ async def _run_propagation_bg(
                     frame_results[real_frame] = (frame_masks, frame_bboxes)
 
                 def _persist_propagation_frame(rf: int, fm: dict, fb: dict):
+                    masks_norm = {str(k): v for k, v in fm.items()}
                     VideoMaskStorage(video_dir).save_frame(
                         rf,
-                        {str(k): v for k, v in fm.items()},
+                        masks_norm,
                         {str(k): v for k, v in fb.items()} if fb else None,
                     )
+                    if masks_norm:
+                        _materialize_scrub_cache(
+                            pid, vid, rf, masks_norm, frames_src_dir=tmp_dir,
+                        )
 
                 for real_frame, (frame_masks, frame_bboxes) in sorted(frame_results.items()):
                     if frame_masks:
@@ -2879,6 +3079,7 @@ async def _run_propagation_bg(
 
         pm.mark_propagation_complete(pid, vid)
         state.is_running = False
+        _refresh_scrub_manifest(pid, vid)
         propagated = pm.get_video(pid, vid).get("propagated_frames", [])
         last_frame = max(propagated) if propagated else -1
         await publish("done", {"frame": last_frame})

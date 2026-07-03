@@ -57,6 +57,8 @@ export default function FrameViewer() {
   const [dimensions, setDimensions] = useState({ width: 0, height: 0 })
   const [anchorReturnOffsets, setAnchorReturnOffsets] = useState({ right: 12, bottom: 12 })
   const [showTip, setShowTip] = useState(true)
+  // Keep showing the last loaded JPEG while stepping frames (avoids black flash).
+  const [jpegFrame, setJpegFrame] = useState(currentFrame)
 
   // Prevent feedback loop: video timeupdate -> setCurrentFrame -> seek effect
   const videoIsDriving = useRef(false)
@@ -67,6 +69,16 @@ export default function FrameViewer() {
   const fps = video?.fps || 30
 
   useEffect(() => { fpsRef.current = fps }, [fps])
+
+  // Debounce JPEG src updates during rapid arrow-key scrubbing.
+  useEffect(() => {
+    const t = setTimeout(() => setJpegFrame(currentFrame), 150)
+    return () => clearTimeout(t)
+  }, [currentFrame])
+
+  useEffect(() => {
+    setJpegFrame(currentFrame)
+  }, [vid])
 
   // ── Compute displayed dimensions ──────────────────────────────────────────
 
@@ -382,10 +394,13 @@ export default function FrameViewer() {
             <source src={videoSrc} type="video/mp4" />
           </video>
 
-          {/* Layer 1b: JPEG frame (shown when paused — instant vs. video seek latency) */}
-          {!isPlaying && pid && vid && (
+          {/* Layer 1b: high-fidelity JPEG — only when settled on this frame.
+              While scrubbing, hide the overlay so a stale frame-0 JPEG does not
+              cover the seeked video underneath. */}
+          {!isPlaying && pid && vid && jpegFrame === currentFrame && (
             <img
-              src={frameUrl(pid, vid, currentFrame)}
+              key={`${pid}/${vid}/${jpegFrame}`}
+              src={frameUrl(pid, vid, jpegFrame)}
               style={{
                 position: 'absolute', top: 0, left: 0,
                 width: '100%', height: '100%',
@@ -398,7 +413,12 @@ export default function FrameViewer() {
           )}
 
           {/* Layer 2: Annotation canvas */}
-          <AnnotationCanvas width={dimensions.width} height={dimensions.height} videoRef={videoRef} />
+          <AnnotationCanvas
+            width={dimensions.width}
+            height={dimensions.height}
+            videoRef={videoRef}
+            scrubbing={jpegFrame !== currentFrame}
+          />
 
           {showAnchorReturnChip && targetAnchorFrame != null && (
             <div

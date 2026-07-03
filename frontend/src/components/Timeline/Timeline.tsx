@@ -1,7 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { Play, Pause, SkipBack, SkipForward } from 'lucide-react'
 import { useStore, currentVideo as selectCurrentVideo } from '../../store/useStore'
-import { getSavedMask } from '../../api/client'
 import ObjectTrackRow from './ObjectTrackRow'
 
 function JumpToFrame({ currentFrame, min, max, onJump }: {
@@ -42,37 +41,11 @@ export default function Timeline() {
   const store = useStore()
   const video = selectCurrentVideo(store)
   const {
-    project, currentVideoId,
     currentFrame, setCurrentFrame,
     isPlaying, setPlaying,
-    propagationStatus, savedMaskCache, setSavedMask,
     propagationStartFrame,
     frameJump, setFrameJump,
   } = store
-
-  const pid = project?.id ?? ''
-  const vid = currentVideoId ?? ''
-
-  // ── Prefetch saved masks when frame changes (post-propagation) ────────────
-
-  useEffect(() => {
-    if (
-      !(propagationStatus === 'done' || propagationStatus === 'running') ||
-      savedMaskCache[currentFrame] ||
-      !video?.propagated_frames?.includes(currentFrame)
-    ) return
-
-    const frame = currentFrame
-    const timer = setTimeout(() => {
-      getSavedMask(pid, vid, frame)
-        .then(data => {
-          if (data.masks) setSavedMask(frame, data.masks)
-        })
-        .catch(() => {})
-    }, 80)
-
-    return () => clearTimeout(timer)
-  }, [currentFrame, propagationStatus])
 
   // ── Time formatting ───────────────────────────────────────────────────────
 
