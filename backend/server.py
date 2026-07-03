@@ -676,12 +676,36 @@ def _refresh_scrub_manifest(pid: str, vid: str) -> None:
 
 
 def _display_webp_path(pid: str, vid: str, fidx: int) -> Path | None:
-    """Return display WebP path if already materialized (no runtime encode on GET)."""
+    """Return display WebP path if already materialized."""
     video = pm.get_video(pid, vid)
     if video is None:
         return None
     out = dc.display_path(pm.video_dir(pid, vid), fidx)
     return out if out.is_file() else None
+
+
+def _ensure_display_webp_path(pid: str, vid: str, fidx: int, video: dict) -> Path | None:
+    """
+    Return a display WebP path, lazily materializing it from mask storage.
+
+    The scrub UI renders this single composited bitmap instead of waiting for
+    per-object PNG JSON. Existing projects may have SQLite masks without a
+    populated display/ cache, so GET /display must be able to repair that cache
+    on demand.
+    """
+    video_dir = pm.video_dir(pid, vid)
+    out = dc.display_path(video_dir, fidx)
+    if out.is_file():
+        return out
+
+    masks = VideoMaskStorage(video_dir).load_masks_dense(fidx)
+    if not masks:
+        return None
+
+    colors = _object_display_colors(video.get("objects", {}))
+    w = int(video.get("width") or 1)
+    h = int(video.get("height") or 1)
+    return dc.write_display_webp(video_dir, fidx, masks, colors, w, h)
 
 
 def _get_prop_state(pid: str, vid: str) -> PropagationState:
@@ -2312,12 +2336,12 @@ def get_cache_manifest(pid: str, vid: str):
 
 @app.get("/api/projects/{pid}/videos/{vid}/display/{fidx}")
 def get_display_mask(pid: str, vid: str, fidx: int, request: Request):
-    """Serve pre-materialized display WebP for a frame (fast scrub path)."""
+    """Serve display WebP for a frame, materializing missing cache entries."""
     video = pm.get_video(pid, vid)
     if video is None:
         raise HTTPException(404, "Video not found")
 
-    path = _display_webp_path(pid, vid, fidx)
+    path = _ensure_display_webp_path(pid, vid, fidx, video)
     if path is None:
         raise HTTPException(404, "No display cache for this frame")
 

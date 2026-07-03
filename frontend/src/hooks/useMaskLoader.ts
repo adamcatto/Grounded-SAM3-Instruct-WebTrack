@@ -1,6 +1,11 @@
 import { useEffect, useRef } from 'react'
 import { useStore, currentVideo as selectCurrentVideo } from '../store/useStore'
-import { clearDisplayMissCache, loadDisplayBitmap, loadPerObjectMasks, prefetchMaskWindow } from '../utils/maskLoader'
+import {
+  loadDisplayBitmap,
+  loadPerObjectMasks,
+  prefetchDisplayWindow,
+  prefetchMaskWindow,
+} from '../utils/maskLoader'
 
 /**
  * Central mask fetch + prefetch for frame scrubbing.
@@ -19,10 +24,7 @@ export function useMaskLoader(): void {
   const pid = project?.id ?? ''
   const vid = currentVideoId ?? ''
   const lastFrameRef = useRef(currentFrame)
-
-  useEffect(() => {
-    if (pid && vid) clearDisplayMissCache(pid, vid)
-  }, [pid, vid])
+  const loadSeqRef = useRef(0)
 
   useEffect(() => {
     if (!pid || !vid) return
@@ -31,22 +33,39 @@ export function useMaskLoader(): void {
     const propagatedSet = new Set(propagated)
 
     const prev = lastFrameRef.current
+    const frameDelta = currentFrame - prev
     const direction: -1 | 0 | 1 =
-      currentFrame > prev ? 1 : currentFrame < prev ? -1 : 0
+      frameDelta > 0 ? 1 : frameDelta < 0 ? -1 : 0
+    const jumpDistance = Math.abs(frameDelta)
+    const isFarJump = jumpDistance > Math.max(10, store.frameJump * 2)
     lastFrameRef.current = currentFrame
+    const seq = ++loadSeqRef.current
+    const displayAbort = new AbortController()
 
-    // Current frame first — masks must always load even without display WebP.
-    void loadPerObjectMasks(pid, vid, currentFrame).then(masks => {
-      if (masks) setSavedMask(currentFrame, masks)
-    })
+    // Display WebP is the scrub fast path: one compact composite per frame.
+    void loadDisplayBitmap(pid, vid, currentFrame, displayAbort.signal)
 
-    // Display WebP is optional; only fetch for the visible frame.
-    void loadDisplayBitmap(pid, vid, currentFrame)
+    const detailTimer = window.setTimeout(() => {
+      void loadPerObjectMasks(pid, vid, currentFrame).then(masks => {
+        if (masks && loadSeqRef.current === seq) setSavedMask(currentFrame, masks)
+      })
+    }, isFarJump ? 500 : 180)
 
-    if (propagatedSet.size === 0) return
+    if (propagatedSet.size === 0) {
+      return () => {
+        displayAbort.abort()
+        window.clearTimeout(detailTimer)
+      }
+    }
 
-    // Defer adjacent prefetch so current-frame work is not starved.
-    const t = window.setTimeout(() => {
+    const displayTimer = window.setTimeout(() => {
+      if (!isFarJump && loadSeqRef.current === seq) {
+        prefetchDisplayWindow(pid, vid, currentFrame, direction, propagatedSet)
+      }
+    }, 32)
+
+    const objectTimer = window.setTimeout(() => {
+      if (isFarJump || loadSeqRef.current !== seq) return
       prefetchMaskWindow(
         pid,
         vid,
@@ -59,8 +78,13 @@ export function useMaskLoader(): void {
           }
         },
       )
-    }, 32)
+    }, 220)
 
-    return () => { window.clearTimeout(t) }
+    return () => {
+      displayAbort.abort()
+      window.clearTimeout(detailTimer)
+      window.clearTimeout(displayTimer)
+      window.clearTimeout(objectTimer)
+    }
   }, [pid, vid, currentFrame, video?.propagated_frames, setSavedMask])
 }

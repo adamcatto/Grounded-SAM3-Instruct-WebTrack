@@ -22,6 +22,8 @@ logger = logging.getLogger(__name__)
 MANIFEST_NAME = "cache_manifest.json"
 DISPLAY_SUBDIR = "display"
 DISPLAY_ALPHA = 0.45
+DISPLAY_MAX_DIM = 720
+DISPLAY_WEBP_QUALITY = 70
 
 
 def display_dir(video_dir: Path) -> Path:
@@ -59,6 +61,27 @@ def composite_masks_rgba(
     return rgba
 
 
+def _display_dims(frame_w: int, frame_h: int) -> tuple[int, int]:
+    if frame_w <= 0 or frame_h <= 0:
+        return 1, 1
+    long_edge = max(frame_w, frame_h)
+    if long_edge <= DISPLAY_MAX_DIM:
+        return frame_w, frame_h
+    scale = DISPLAY_MAX_DIM / float(long_edge)
+    return max(1, round(frame_w * scale)), max(1, round(frame_h * scale))
+
+
+def _resize_mask_for_display(mask: np.ndarray, width: int, height: int) -> np.ndarray:
+    arr = np.squeeze(mask).astype(np.uint8)
+    if arr.shape == (height, width):
+        return arr
+    img = Image.fromarray(arr * 255, mode="L")
+    return np.asarray(
+        img.resize((width, height), Image.Resampling.NEAREST),
+        dtype=np.uint8,
+    )
+
+
 def write_display_webp(
     video_dir: Path,
     frame_idx: int,
@@ -73,9 +96,14 @@ def write_display_webp(
         return None
     out = display_path(video_dir, frame_idx)
     try:
-        rgba = composite_masks_rgba(masks, colors, frame_h, frame_w)
+        display_w, display_h = _display_dims(frame_w, frame_h)
+        display_masks = {
+            str(obj_id): _resize_mask_for_display(mask, display_w, display_h)
+            for obj_id, mask in masks.items()
+        }
+        rgba = composite_masks_rgba(display_masks, colors, display_h, display_w)
         img = Image.fromarray(rgba, mode="RGBA")
-        img.save(str(out), format="WEBP", quality=85, method=4)
+        img.save(str(out), format="WEBP", quality=DISPLAY_WEBP_QUALITY, method=0)
         return out
     except Exception as e:
         logger.warning(f"write_display_webp frame {frame_idx}: {e}")

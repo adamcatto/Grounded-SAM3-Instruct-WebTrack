@@ -58,6 +58,10 @@ class ProjectManager:
         self._base_dir.mkdir(parents=True, exist_ok=True)
         self._locks: dict[str, threading.Lock] = {}
         self._locks_lock = threading.Lock()
+        self._config_cache_lock = threading.Lock()
+        self._config_cache: dict[str, tuple[Path, int, int, dict]] = {}
+        self._progress_cache_lock = threading.Lock()
+        self._progress_cache: dict[Path, tuple[int, int, list[int]]] = {}
 
     def projects_base_dir(self) -> Path:
         return self._base_dir
@@ -85,6 +89,10 @@ class ProjectManager:
         with self._root_lock:
             self._base_dir = resolved
             self._base_dir.mkdir(parents=True, exist_ok=True)
+        with self._config_cache_lock:
+            self._config_cache.clear()
+        with self._progress_cache_lock:
+            self._progress_cache.clear()
         return self._base_dir
 
     def _get_lock(self, pid: str) -> threading.Lock:
@@ -302,13 +310,9 @@ class ProjectManager:
         return self.get_project(pid) or merged_config
 
     def get_project(self, pid: str) -> Optional[dict]:
-        d = self._find_project_dir(pid)
-        if d is None:
+        config = self._load_config(pid)
+        if config is None:
             return None
-        cfg = d / "config.json"
-        if not cfg.exists():
-            return None
-        config = self._normalize_project_config(json.loads(cfg.read_text()))
         # Merge propagated_frames from per-video progress files
         for vid in config.get("videos", {}):
             config["videos"][vid]["propagated_frames"] = self._read_propagated_frames(pid, vid)
@@ -328,6 +332,11 @@ class ProjectManager:
         d = self._find_project_dir(pid)
         if d is not None:
             shutil.rmtree(d)
+        with self._config_cache_lock:
+            self._config_cache.pop(pid, None)
+        with self._progress_cache_lock:
+            for path in [p for p in self._progress_cache if str(p).startswith(str(d))]:
+                self._progress_cache.pop(path, None)
 
     # ─── Videos ──────────────────────────────────────────────────────────────
 
@@ -376,12 +385,13 @@ class ProjectManager:
         return video_meta
 
     def get_video(self, pid: str, vid: str) -> Optional[dict]:
-        config = self.get_project(pid)
+        config = self._load_config(pid)
         if config is None:
             return None
         vm = config["videos"].get(vid)
         if vm is None:
             return None
+        vm = dict(vm)
         # Merge propagated_frames from the per-video progress file
         vm["propagated_frames"] = self._read_propagated_frames(pid, vid)
         return vm
@@ -571,6 +581,11 @@ class ProjectManager:
             return []
         if not path.exists():
             return []
+        st = path.stat()
+        with self._progress_cache_lock:
+            cached = self._progress_cache.get(path)
+            if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+                return list(cached[2])
         frames: set[int] = set()
         for line in path.read_text().splitlines():
             line = line.strip()
@@ -579,7 +594,11 @@ class ProjectManager:
                     frames.add(int(line))
                 except ValueError:
                     pass
-        return sorted(frames)
+        out = sorted(frames)
+        st_after = path.stat()
+        with self._progress_cache_lock:
+            self._progress_cache[path] = (st_after.st_mtime_ns, st_after.st_size, out)
+        return list(out)
 
     def mark_frame_propagated(self, pid: str, vid: str, frame_idx: int):
         """Append frame index to the per-video progress file.
@@ -592,6 +611,8 @@ class ProjectManager:
         path = self._propagation_progress_path(pid, vid)
         with open(path, "a") as f:
             f.write(f"{frame_idx}\n")
+        with self._progress_cache_lock:
+            self._progress_cache.pop(path, None)
 
     def clear_propagated_frames(self, pid: str, vid: str):
         """Delete the progress file (used during video reset)."""
@@ -601,6 +622,8 @@ class ProjectManager:
             return
         if path.exists():
             path.unlink()
+        with self._progress_cache_lock:
+            self._progress_cache.pop(path, None)
 
     def trim_propagated_frames(self, pid: str, vid: str, keep_below: int) -> int:
         """Rewrite progress file keeping only frames < keep_below.
@@ -616,6 +639,8 @@ class ProjectManager:
             path.write_text("".join(f"{f}\n" for f in frames))
         elif path.exists():
             path.unlink()
+        with self._progress_cache_lock:
+            self._progress_cache.pop(path, None)
         return len(frames)
 
     def mark_propagation_complete(self, pid: str, vid: str):
@@ -703,6 +728,32 @@ class ProjectManager:
         out["videos"] = vids
         return out
 
+    def _load_config(self, pid: str) -> Optional[dict]:
+        d = self._find_project_dir(pid)
+        if d is None:
+            return None
+        cfg_path = d / "config.json"
+        if not cfg_path.exists():
+            return None
+
+        st = cfg_path.stat()
+        mtime_ns = st.st_mtime_ns
+        size = st.st_size
+        with self._config_cache_lock:
+            cached = self._config_cache.get(pid)
+            if (
+                cached is not None
+                and cached[0] == cfg_path
+                and cached[1] == mtime_ns
+                and cached[2] == size
+            ):
+                return cached[3]
+
+        config = self._normalize_project_config(json.loads(cfg_path.read_text()))
+        with self._config_cache_lock:
+            self._config_cache[pid] = (cfg_path, mtime_ns, size, config)
+        return config
+
     def _save_config(self, pid: str, config: dict, project_dir: Optional[Path] = None):
         cfg_path = (project_dir or self._project_dir(pid)) / "config.json"
         # Strip propagated_frames from config — stored in per-video progress files
@@ -721,6 +772,15 @@ class ProjectManager:
                 with os.fdopen(fd, "w") as f:
                     json.dump(config, f, indent=2)
                 os.replace(tmp_name, str(cfg_path))
+                st = cfg_path.stat()
+                normalized = self._normalize_project_config(config)
+                with self._config_cache_lock:
+                    self._config_cache[pid] = (
+                        cfg_path,
+                        st.st_mtime_ns,
+                        st.st_size,
+                        normalized,
+                    )
             except BaseException:
                 try:
                     os.unlink(tmp_name)
