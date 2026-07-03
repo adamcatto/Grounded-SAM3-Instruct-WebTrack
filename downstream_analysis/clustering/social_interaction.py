@@ -17,6 +17,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
+from ..figio import save_figure  # noqa: E402
 
 from .dataset import WindowMetadata
 from .multi_project_comparison import (
@@ -229,7 +230,6 @@ def plot_social_interaction_time(
     All saved under ``plots_dir/social_interaction/``.
     """
     out_dir = plots_dir / "social_interaction"
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     cutoffs = social_data.get("cutoffs", [])
     by_condition = social_data.get("by_condition_group", {})
@@ -309,7 +309,7 @@ def _plot_boxplot_for_cutoff(
     )
     ax.set_ylim(bottom=0)
     fig.tight_layout()
-    fig.savefig(outfile, dpi=_DPI, bbox_inches="tight")
+    save_figure(fig, outfile, dpi=_DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("Saved %s", outfile)
 
@@ -354,6 +354,6 @@ def _plot_summary_line_chart(
     ax.legend(fontsize=7)
     ax.set_ylim(bottom=0)
     fig.tight_layout()
-    fig.savefig(outfile, dpi=_DPI, bbox_inches="tight")
+    save_figure(fig, outfile, dpi=_DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("Saved %s", outfile)

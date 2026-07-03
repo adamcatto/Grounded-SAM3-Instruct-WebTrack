@@ -11,6 +11,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 
+from .figio import save_figure  # noqa: E402
+
 
 def _finite(vals: np.ndarray) -> np.ndarray:
     return vals[np.isfinite(vals)]
@@ -28,7 +30,6 @@ def plot_overlay_histogram(
     colors: Mapping[str, str] | None = None,
     log_x: bool = False,
 ) -> None:
-    outfile.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=figsize)
     for label, vals in sorted(series_by_label.items(), key=lambda x: x[0].lower()):
         v = _finite(vals)
@@ -45,7 +46,7 @@ def plot_overlay_histogram(
         ax.set_xscale("log")
     ax.legend(fontsize=8, loc="upper right")
     fig.tight_layout()
-    fig.savefig(outfile, dpi=140)
+    save_figure(fig, outfile, dpi=140)
     plt.close(fig)
 
 
@@ -60,7 +61,6 @@ def plot_overlay_cdf(
     log_x: bool = False,
 ) -> None:
     """Empirical CDF (ECDF) overlay per label — step functions after sorted samples."""
-    outfile.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=figsize)
     for label, vals in sorted(series_by_label.items(), key=lambda x: x[0].lower()):
         v = np.sort(_finite(vals))
@@ -80,7 +80,7 @@ def plot_overlay_cdf(
         ax.set_xscale("log")
     ax.legend(fontsize=8, loc="lower right")
     fig.tight_layout()
-    fig.savefig(outfile, dpi=140)
+    save_figure(fig, outfile, dpi=140)
     plt.close(fig)
 
 def plot_bimodal_moving_fraction(
@@ -89,7 +89,6 @@ def plot_bimodal_moving_fraction(
     outfile: Path,
     title: str = "Estimated fraction of high-locomotion chunks (GMM threshold)",
 ) -> None:
-    outfile.parent.mkdir(parents=True, exist_ok=True)
     xs = np.arange(len(names))
     ys: list[float] = []
     colors: list[str] = []
@@ -117,5 +116,5 @@ def plot_bimodal_moving_fraction(
         color="#777",
     )
     fig.tight_layout()
-    fig.savefig(outfile, dpi=140)
+    save_figure(fig, outfile, dpi=140)
     plt.close(fig)

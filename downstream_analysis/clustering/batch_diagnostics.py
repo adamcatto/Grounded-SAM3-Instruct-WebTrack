@@ -17,6 +17,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
+from ..figio import save_figure  # noqa: E402
 from scipy.stats import f_oneway  # noqa: E402
 
 from .dataset import WindowMetadata
@@ -275,7 +276,7 @@ def _plot_pca_before_after(
                bbox_to_anchor=(1.02, 1), loc="upper left")
     fig.suptitle("Batch Structure: PCA Before vs After Correction", fontsize=13)
     fig.tight_layout()
-    fig.savefig(outfile, dpi=_DPI, bbox_inches="tight")
+    save_figure(fig, outfile, dpi=_DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("Saved %s", outfile)
 
@@ -308,7 +309,7 @@ def _plot_batch_mean_heatmap(
     ax.set_title("Batch Centroids (z-scored feature means, before correction)")
     fig.colorbar(im, ax=ax, fraction=0.02, pad=0.02, label="z-score")
     fig.tight_layout()
-    fig.savefig(outfile, dpi=_DPI, bbox_inches="tight")
+    save_figure(fig, outfile, dpi=_DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("Saved %s", outfile)
 
@@ -336,7 +337,7 @@ def _plot_batch_effect_bars(
     ax.legend(fontsize=9)
     ax.invert_yaxis()
     fig.tight_layout()
-    fig.savefig(outfile, dpi=_DPI, bbox_inches="tight")
+    save_figure(fig, outfile, dpi=_DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("Saved %s", outfile)
 
@@ -371,7 +372,7 @@ def _plot_variance_partition(
     ax.legend()
     ax.set_ylim(0, max(max(pre_vals), max(post_vals), 0.01) * 1.25)
     fig.tight_layout()
-    fig.savefig(outfile, dpi=_DPI)
+    save_figure(fig, outfile, dpi=_DPI)
     plt.close(fig)
     logger.info("Saved %s", outfile)
 
@@ -390,7 +391,7 @@ def _plot_batch_sample_counts(
     ax.set_ylabel("Window count")
     ax.set_title("Samples per Batch")
     fig.tight_layout()
-    fig.savefig(outfile, dpi=_DPI, bbox_inches="tight")
+    save_figure(fig, outfile, dpi=_DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("Saved %s", outfile)
 

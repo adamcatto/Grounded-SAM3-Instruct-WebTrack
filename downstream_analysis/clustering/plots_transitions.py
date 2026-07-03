@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 import matplotlib.patches as mpatches  # noqa: E402
 import matplotlib.cm as cm  # noqa: E402
 import numpy as np  # noqa: E402
+from ..figio import save_figure  # noqa: E402
 
 from .clustering_pipeline import ClusteringResult
 from .plots import _cluster_cmap
@@ -195,8 +196,7 @@ def plot_transition_network(
     cbar.set_label("P(next cluster | current cluster)")
 
     fig.tight_layout()
-    outfile.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(outfile, dpi=_DPI)
+    save_figure(fig, outfile, dpi=_DPI)
     plt.close(fig)
     logger.info("Saved %s", outfile)
 
@@ -226,8 +226,7 @@ def plot_transition_heatmap(
     ax.set_title(title, fontsize=10)
     fig.colorbar(im, ax=ax, shrink=0.7, label="P(B | A)")
     fig.tight_layout()
-    outfile.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(outfile, dpi=_DPI)
+    save_figure(fig, outfile, dpi=_DPI)
     plt.close(fig)
     logger.info("Saved %s", outfile)
 
@@ -266,8 +265,7 @@ def plot_differential_transition_heatmap(
     cbar = fig.colorbar(im, ax=ax, shrink=0.7)
     cbar.set_label(f"Δ P(B|A) = {label_a} − {label_b}")
     fig.tight_layout()
-    outfile.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(outfile, dpi=_DPI)
+    save_figure(fig, outfile, dpi=_DPI)
     plt.close(fig)
     logger.info("Saved %s", outfile)
 
@@ -380,8 +378,7 @@ def plot_differential_transition_network(
     cbar.set_label(f"Δ P(B|A) = {label_a} − {label_b}")
 
     fig.tight_layout()
-    outfile.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(outfile, dpi=_DPI)
+    save_figure(fig, outfile, dpi=_DPI)
     plt.close(fig)
     logger.info("Saved %s", outfile)
 
@@ -397,7 +394,6 @@ def _generate_differential_transition_plots(
 ) -> None:
     """Plot Δ transition matrix/network for each pair of condition groups."""
     diff_dir = out_dir / "differential"
-    diff_dir.mkdir(parents=True, exist_ok=True)
 
     exclude = exclude_groups or {"unknown"}
     ordered: list[str] = list(group_order or [])
@@ -479,7 +475,6 @@ def generate_transition_plots(
         return
 
     out_dir = plots_dir / "transitions"
-    out_dir.mkdir(parents=True, exist_ok=True)
     cluster_colors = _cluster_cmap(result.n_clusters)
 
     ordered_keys = list(group_order or [])

@@ -71,7 +71,6 @@ class LocomotionAnalysisPipeline:
         per_vid_dir = out / "locomotion" / "per_video"
         agg_dir = out / "locomotion" / "aggregate"
         csv_dir = out / "locomotion" / "samples"
-        per_vid_dir.mkdir(parents=True, exist_ok=True)
         agg_dir.mkdir(parents=True, exist_ok=True)
         csv_dir.mkdir(parents=True, exist_ok=True)
         logger.info(

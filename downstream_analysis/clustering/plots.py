@@ -12,6 +12,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import matplotlib.colors as mcolors  # noqa: E402
 import numpy as np  # noqa: E402
+from ..figio import save_figure  # noqa: E402
 
 from .clustering_pipeline import ClusteringResult
 from .dataset import housing_condition
@@ -199,7 +200,7 @@ def plot_umap_by_cluster(result: ClusteringResult, outfile: Path) -> None:
     ax.set_title("Behavioral clusters")
     _add_legend_on_plot(ax, fontsize=6, markerscale=3)
     fig.tight_layout()
-    fig.savefig(outfile, dpi=_DPI, bbox_inches="tight")
+    save_figure(fig, outfile, dpi=_DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("Saved %s", outfile)
 
@@ -228,7 +229,7 @@ def plot_umap_by_housing(result: ClusteringResult, outfile: Path) -> None:
     ax.set_title("Interaction types")
     _add_legend_on_plot(ax, fontsize=7, markerscale=3)
     fig.tight_layout()
-    fig.savefig(outfile, dpi=_DPI, bbox_inches="tight")
+    save_figure(fig, outfile, dpi=_DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("Saved %s", outfile)
 
@@ -274,7 +275,7 @@ def plot_cluster_composition(
     ax.legend(fontsize=8)
     ax.set_ylim(0, 1.05)
     fig.tight_layout()
-    fig.savefig(outfile, dpi=_DPI)
+    save_figure(fig, outfile, dpi=_DPI)
     plt.close(fig)
     logger.info("Saved %s", outfile)
 
@@ -304,7 +305,7 @@ def plot_feature_heatmap(result: ClusteringResult, outfile: Path) -> None:
     ax.set_title("Mean feature values per cluster (z-scored)")
     fig.colorbar(im, ax=ax, shrink=0.6, label="z-score")
     fig.tight_layout()
-    fig.savefig(outfile, dpi=_DPI)
+    save_figure(fig, outfile, dpi=_DPI)
     plt.close(fig)
     logger.info("Saved %s", outfile)
 
@@ -341,7 +342,7 @@ def plot_ethogram(
     itype = ethogram_data.get("interaction_type", "")
     ax.set_title(f"{vname[:60]} ({itype})", fontsize=9)
     fig.tight_layout()
-    fig.savefig(outfile, dpi=_DPI)
+    save_figure(fig, outfile, dpi=_DPI)
     plt.close(fig)
 
 
@@ -389,7 +390,7 @@ def plot_feature_violins(
 
     fig.suptitle("Feature distributions by cluster", fontsize=10)
     fig.tight_layout()
-    fig.savefig(outfile, dpi=_DPI)
+    save_figure(fig, outfile, dpi=_DPI)
     plt.close(fig)
     logger.info("Saved %s", outfile)
 
@@ -427,7 +428,7 @@ def plot_enrichment_bars(
     ax.set_ylabel("Odds ratio (isolated enrichment)")
     ax.set_title("Isolation enrichment per cluster (* = p < 0.05)")
     fig.tight_layout()
-    fig.savefig(outfile, dpi=_DPI)
+    save_figure(fig, outfile, dpi=_DPI)
     plt.close(fig)
     logger.info("Saved %s", outfile)
 
@@ -483,7 +484,7 @@ def plot_feature_enrichment(
     ax.legend(handles=legend_elements, fontsize=7, loc="lower right")
 
     fig.tight_layout()
-    fig.savefig(outfile, dpi=_DPI)
+    save_figure(fig, outfile, dpi=_DPI)
     plt.close(fig)
     logger.info("Saved %s", outfile)
 
@@ -503,7 +504,6 @@ def generate_all_plots(
     # Basic UMAP plots (multi-project pipeline generates enhanced versions via
     # plots_umap.generate_all_umap_plots, but single-project still needs these)
     umap_dir = plots_dir / "umap"
-    umap_dir.mkdir(parents=True, exist_ok=True)
     plot_umap_by_cluster(result, umap_dir / "umap_by_cluster.png")
     # Skip housing UMAP in single-animal mode (housing is per-pair concept)
     is_single_animal = (
@@ -526,8 +526,6 @@ def generate_all_plots(
     # Ethograms per video
     ethograms = comparison.get("ethograms", {})
     ethogram_dir = plots_dir / "ethograms"
-    if ethograms:
-        ethogram_dir.mkdir(parents=True, exist_ok=True)
     for vid_id, ethogram_data in ethograms.items():
         plot_ethogram(
             result, ethogram_data, vid_id,

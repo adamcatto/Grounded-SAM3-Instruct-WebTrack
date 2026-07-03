@@ -17,6 +17,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import matplotlib.patches as mpatches  # noqa: E402
 import numpy as np  # noqa: E402
+from ..figio import save_figure  # noqa: E402
 
 from .clustering_pipeline import ClusteringResult
 from .multi_project_comparison import (
@@ -146,7 +147,7 @@ def plot_condition_boxplots(
     fig.suptitle("Feature Distributions by Condition Group", fontsize=13, y=1.01)
     fig.tight_layout()
     outfile = plots_dir / "condition_feature_boxplots.png"
-    fig.savefig(outfile, dpi=_DPI, bbox_inches="tight")
+    save_figure(fig, outfile, dpi=_DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("Saved %s", outfile)
 
@@ -218,7 +219,7 @@ def plot_cluster_composition(
     fig.tight_layout()
 
     outfile = plots_dir / "cluster_composition_by_condition.png"
-    fig.savefig(outfile, dpi=_DPI, bbox_inches="tight")
+    save_figure(fig, outfile, dpi=_DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("Saved %s", outfile)
 
@@ -299,7 +300,7 @@ def _plot_per_video_cluster_fractions(
     fig.suptitle("Per-Video Cluster Fraction by Condition", fontsize=12, y=1.01)
     fig.tight_layout()
     outfile = plots_dir / "cluster_fraction_boxplots_by_condition.png"
-    fig.savefig(outfile, dpi=_DPI, bbox_inches="tight")
+    save_figure(fig, outfile, dpi=_DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("Saved %s", outfile)
 
@@ -377,7 +378,7 @@ def plot_locomotion_paired(
         fig.suptitle(title, fontsize=12, y=1.01)
         fig.tight_layout()
         outfile = plots_dir / f"locomotion_{key}.png"
-        fig.savefig(outfile, dpi=_DPI, bbox_inches="tight")
+        save_figure(fig, outfile, dpi=_DPI, bbox_inches="tight")
         plt.close(fig)
         logger.info("Saved %s", outfile)
 
@@ -413,7 +414,7 @@ def _plot_locomotion_effect_bars(comp: dict[str, Any], outfile: Path) -> None:
     ax.set_xlabel("Mean difference (paired test − locomotion)")
     ax.set_title(comp.get("label_b", "Paired") + " vs " + comp.get("label_a", "Locomotion"))
     fig.tight_layout()
-    fig.savefig(outfile, dpi=_DPI)
+    save_figure(fig, outfile, dpi=_DPI)
     plt.close(fig)
     logger.info("Saved %s", outfile)
 
@@ -463,7 +464,7 @@ def _plot_locomotion_group_boxplots(
         fig.suptitle(comp_name.replace("_", " ").title(), fontsize=12)
         fig.tight_layout()
         outfile = plots_dir / f"locomotion_{comp_name}.png"
-        fig.savefig(outfile, dpi=_DPI, bbox_inches="tight")
+        save_figure(fig, outfile, dpi=_DPI, bbox_inches="tight")
         plt.close(fig)
         logger.info("Saved %s", outfile)
 
@@ -561,6 +562,6 @@ def plot_role_condition_boxplots(
     fig.suptitle("Feature Distributions by Role Condition", fontsize=13, y=1.01)
     fig.tight_layout()
     outfile = plots_dir / "role_condition_boxplots.png"
-    fig.savefig(outfile, dpi=_DPI, bbox_inches="tight")
+    save_figure(fig, outfile, dpi=_DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("Saved %s", outfile)

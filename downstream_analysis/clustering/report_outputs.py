@@ -225,7 +225,8 @@ def _embed_plot_sheets(wb, plots_dir: Path, plot_files: list[tuple[str, str]]) -
     except ImportError:
         return
     for sheet_name, filename in plot_files:
-        img_path = plots_dir / filename
+        # Figures now live under plots/png/ (SVG siblings under plots/svg/).
+        img_path = plots_dir / "png" / filename
         if not img_path.is_file():
             continue
         ws = wb.create_sheet(sheet_name[:31])  # Excel sheet name limit

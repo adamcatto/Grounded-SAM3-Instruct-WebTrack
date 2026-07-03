@@ -14,6 +14,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
+from ..figio import save_figure  # noqa: E402
 
 from .clustering_pipeline import ClusteringResult
 from .dataset import WindowMetadata
@@ -76,7 +77,7 @@ def plot_umap_by_experiment(result: ClusteringResult, outfile: Path) -> None:
     ax.set_title("UMAP by Experiment")
     _add_legend_on_plot(ax, fontsize=7, markerscale=4)
     fig.tight_layout()
-    fig.savefig(outfile, dpi=_DPI, bbox_inches="tight")
+    save_figure(fig, outfile, dpi=_DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("Saved %s", outfile)
 
@@ -113,7 +114,7 @@ def plot_umap_by_condition_group(result: ClusteringResult, outfile: Path) -> Non
     ax.set_title("UMAP by Condition Group")
     _add_legend_on_plot(ax, fontsize=7, markerscale=4)
     fig.tight_layout()
-    fig.savefig(outfile, dpi=_DPI, bbox_inches="tight")
+    save_figure(fig, outfile, dpi=_DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("Saved %s", outfile)
 
@@ -158,7 +159,7 @@ def plot_umap_by_batch(result: ClusteringResult, outfile: Path) -> None:
     _add_legend_right_of_axes(
         ax, ncol=ncol, fontsize=5, markerscale=3, n_items=n_batches,
     )
-    fig.savefig(outfile, dpi=_DPI, bbox_inches="tight")
+    save_figure(fig, outfile, dpi=_DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("Saved %s", outfile)
 
@@ -241,6 +242,6 @@ def plot_batch_correction_before_after(
 
     fig.suptitle("Batch Effect Correction (color = batch)", fontsize=13)
     fig.tight_layout(rect=[0, 0, 0.82, 0.96])
-    fig.savefig(outfile, dpi=_DPI, bbox_inches="tight")
+    save_figure(fig, outfile, dpi=_DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("Saved %s", outfile)

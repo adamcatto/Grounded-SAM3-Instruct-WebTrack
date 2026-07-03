@@ -14,6 +14,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
+from ..figio import save_figure  # noqa: E402
 
 from .clustering_pipeline import ClusteringResult
 from .plots import _add_legend_on_plot, _cluster_cmap, _DPI
@@ -97,7 +98,7 @@ def plot_umap_by_role(result: ClusteringResult, outfile: Path) -> None:
     ax.set_title("UMAP by Role")
     _add_legend_on_plot(ax, fontsize=7, markerscale=4)
     fig.tight_layout()
-    fig.savefig(outfile, dpi=_DPI, bbox_inches="tight")
+    save_figure(fig, outfile, dpi=_DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("Saved %s", outfile)
 
@@ -151,7 +152,7 @@ def plot_umap_highlight(
     ax.set_title(title or label)
     _add_legend_on_plot(ax, fontsize=8, markerscale=4)
     fig.tight_layout()
-    fig.savefig(outfile, dpi=_DPI, bbox_inches="tight")
+    save_figure(fig, outfile, dpi=_DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("Saved %s", outfile)
 
@@ -178,7 +179,6 @@ def generate_umap_highlight_plots(
         SA_ROLE_MASK_BUILDERS,
     )
 
-    umap_dir.mkdir(parents=True, exist_ok=True)
 
     # Detect single-animal mode
     is_single_animal = (
@@ -245,7 +245,6 @@ def generate_all_umap_plots(
 ) -> None:
     """Generate all UMAP plots into plots/umap/ subfolder."""
     umap_dir = plots_dir / "umap"
-    umap_dir.mkdir(parents=True, exist_ok=True)
 
     # Detect single-animal mode
     is_single_animal = (

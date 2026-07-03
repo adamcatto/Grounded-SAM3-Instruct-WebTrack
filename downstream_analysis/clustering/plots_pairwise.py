@@ -13,6 +13,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
+from ..figio import save_figure  # noqa: E402
 
 from .clustering_pipeline import ClusteringResult
 
@@ -51,7 +52,7 @@ def plot_pairwise_cluster_enrichment(
     ax.set_ylabel(f"Odds ratio ({disp_a} enrichment)")
     ax.set_title(f"Cluster enrichment: {disp_a} vs {disp_b} (* = p < 0.05)")
     fig.tight_layout()
-    fig.savefig(outfile, dpi=_DPI)
+    save_figure(fig, outfile, dpi=_DPI)
     plt.close(fig)
     logger.info("Saved %s", outfile)
 
@@ -102,7 +103,7 @@ def plot_pairwise_feature_enrichment(
     )
 
     fig.tight_layout()
-    fig.savefig(outfile, dpi=_DPI)
+    save_figure(fig, outfile, dpi=_DPI)
     plt.close(fig)
     logger.info("Saved %s", outfile)
 
@@ -187,7 +188,7 @@ def plot_pairwise_feature_boxplots(
     )
     fig.suptitle(f"Feature Distributions: {disp_a} vs {disp_b}", fontsize=11, y=1.01)
     fig.tight_layout()
-    fig.savefig(outfile, dpi=_DPI, bbox_inches="tight")
+    save_figure(fig, outfile, dpi=_DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("Saved %s", outfile)
 
@@ -240,7 +241,6 @@ def generate_pairwise_comparison_plots(
         if not pairs:
             continue
         section_dir = plots_dir / "paired_animals" / section_name
-        section_dir.mkdir(parents=True, exist_ok=True)
 
         for pair_key, pair_result in pairs.items():
             # Cluster enrichment (uses pre-computed per_cluster data)
