@@ -449,6 +449,25 @@ class ClusteringPipeline:
         )
         phase1_time = time.monotonic() - t0
         logger.info("Phase 1 done in %s: %d windows extracted.", _fmt_duration(phase1_time), len(dataset))
+
+        # Single-animal handling: warn on flag/data mismatch, then restrict the
+        # dataset to the focal animal's 12 per-object features.
+        looks_single = len(dataset) > 0 and all(
+            not m.object_b_key for m in dataset.metadata
+        )
+        if self.cfg.single_animal:
+            if not looks_single:
+                logger.warning(
+                    "--single-animal was set but some windows have a second tracked "
+                    "object; b_* / interaction features will be dropped anyway."
+                )
+            from .single_animal import restrict_to_focal_animal
+            dataset = restrict_to_focal_animal(dataset)
+        elif looks_single:
+            logger.warning(
+                "Every video has only one tracked object — consider re-running with "
+                "--single-animal for cleaner (12-feature) single-animal clustering."
+            )
         logger.info("")
 
         if len(dataset) == 0:
@@ -475,11 +494,17 @@ class ClusteringPipeline:
         logger.info("")
 
         # 3. Downstream comparison
-        logger.info("PHASE 3: Housing condition comparison")
-        logger.info("-" * 40)
         t0 = time.monotonic()
-        from .comparison import compare_housing_conditions
-        comparison = compare_housing_conditions(result)
+        if self.cfg.single_animal:
+            logger.info("PHASE 3: Cluster description (single-animal)")
+            logger.info("-" * 40)
+            from .comparison import describe_single_animal_clusters
+            comparison = describe_single_animal_clusters(result)
+        else:
+            logger.info("PHASE 3: Housing condition comparison")
+            logger.info("-" * 40)
+            from .comparison import compare_housing_conditions
+            comparison = compare_housing_conditions(result)
         phase3_time = time.monotonic() - t0
         logger.info("Phase 3 done in %s.", _fmt_duration(phase3_time))
         logger.info("")
@@ -593,32 +618,35 @@ class ClusteringPipeline:
                 writer.writerow(row)
         logger.info("  Wrote %s (%s)", csv_path.name, _fmt_size(csv_path.stat().st_size))
 
-        # Housing comparison
-        p = results_dir / "housing_comparison.json"
+        # Comparison / description JSON
+        json_name = "cluster_description.json" if self.cfg.single_animal else "housing_comparison.json"
+        p = results_dir / json_name
         p.write_text(json.dumps(comparison, indent=2, default=str))
         logger.info("  Wrote %s (%s)", p.name, _fmt_size(p.stat().st_size))
 
-        # CSV: per-cluster enrichment
-        csv_path = results_dir / "housing_enrichment_per_cluster.csv"
-        per_cluster = comparison.get("per_cluster", {})
-        with open(csv_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                "cluster", "size", "fraction",
-                "isolated_in_cluster", "group_in_cluster",
-                "isolated_outside", "group_outside",
-                "odds_ratio", "p_value",
-            ])
-            for c_str in sorted(per_cluster, key=int):
-                pc = per_cluster[c_str]
-                enr = pc["isolated_enrichment"]
+        # CSV: per-cluster enrichment (social only — single-animal per_cluster
+        # carries just size/fraction, so there is nothing to enrich)
+        if not self.cfg.single_animal:
+            csv_path = results_dir / "housing_enrichment_per_cluster.csv"
+            per_cluster = comparison.get("per_cluster", {})
+            with open(csv_path, "w", newline="") as f:
+                writer = csv.writer(f)
                 writer.writerow([
-                    c_str, pc["size"], pc["fraction"],
-                    enr["isolated_in_cluster"], enr["group_in_cluster"],
-                    enr["isolated_outside"], enr["group_outside"],
-                    enr["odds_ratio"], enr["p_value"],
+                    "cluster", "size", "fraction",
+                    "isolated_in_cluster", "group_in_cluster",
+                    "isolated_outside", "group_outside",
+                    "odds_ratio", "p_value",
                 ])
-        logger.info("  Wrote %s (%s)", csv_path.name, _fmt_size(csv_path.stat().st_size))
+                for c_str in sorted(per_cluster, key=int):
+                    pc = per_cluster[c_str]
+                    enr = pc["isolated_enrichment"]
+                    writer.writerow([
+                        c_str, pc["size"], pc["fraction"],
+                        enr["isolated_in_cluster"], enr["group_in_cluster"],
+                        enr["isolated_outside"], enr["group_outside"],
+                        enr["odds_ratio"], enr["p_value"],
+                    ])
+            logger.info("  Wrote %s (%s)", csv_path.name, _fmt_size(csv_path.stat().st_size))
 
         # CSV: per-feature Mann-Whitney U tests
         per_feat = comparison.get("per_feature_tests", {})
@@ -691,6 +719,7 @@ class ClusteringPipeline:
 
         write_single_project_excel_report(
             out_dir, result, comparison, self.cfg, self.project_dir.name,
+            single_animal=self.cfg.single_animal,
         )
 
 
@@ -717,6 +746,13 @@ def main(argv: list[str] | None = None) -> int:
         "--skip-mask-verification",
         action="store_true",
         help="Skip per-frame mask existence check (faster startup, relies on propagation_complete flag)",
+    )
+    p.add_argument(
+        "--single-animal",
+        action="store_true",
+        help="Single-animal mode: cluster on the focal animal's 12 per-object features "
+             "only and emit descriptive outputs (no social/housing comparison). "
+             "Use for projects with one tracked object per video.",
     )
     args = p.parse_args(argv)
 
@@ -780,6 +816,7 @@ def main(argv: list[str] | None = None) -> int:
         stride=args.stride,
         n_neighbors=args.n_neighbors,
         leiden_resolution=args.resolution,
+        single_animal=args.single_animal,
     )
 
     pipe = ClusteringPipeline(

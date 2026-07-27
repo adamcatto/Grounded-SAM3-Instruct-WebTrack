@@ -363,8 +363,15 @@ def write_single_project_excel_report(
     comparison: dict[str, Any],
     cfg: ClusteringConfig,
     project_name: str,
+    *,
+    single_animal: bool = False,
 ) -> None:
-    """Write ``clustering_report.xlsx`` for a single-project run (housing comparison)."""
+    """Write ``clustering_report.xlsx`` for a single-project run.
+
+    In social mode this includes housing-enrichment sheets; in single-animal
+    mode (``single_animal=True``) those are replaced by a plain cluster-sizes
+    sheet and the housing-specific plots are omitted.
+    """
     try:
         from openpyxl import Workbook
     except ImportError:
@@ -416,34 +423,50 @@ def write_single_project_excel_report(
 
     _add_cluster_sheets(wb, result, cfg, styles)
 
-    ws = wb.create_sheet("Cluster Enrichment")
     per_cluster = comparison.get("per_cluster", {})
-    enr_cols = [
-        "Cluster", "Size", "Fraction",
-        "Isolated in Cluster", "Group in Cluster",
-        "Isolated Outside", "Group Outside",
-        "Odds Ratio", "p-value", "Significant",
-    ]
-    for c_idx, col_name in enumerate(enr_cols, 1):
-        ws.cell(row=1, column=c_idx, value=col_name)
-    _style_header(ws, len(enr_cols), styles)
-    for ri, c_str in enumerate(sorted(per_cluster, key=int), 2):
-        pc = per_cluster[c_str]
-        enr = pc["isolated_enrichment"]
-        p_val = enr["p_value"]
-        ws.cell(row=ri, column=1, value=int(c_str))
-        ws.cell(row=ri, column=2, value=pc["size"])
-        ws.cell(row=ri, column=3, value=pc["fraction"])
-        ws[f"C{ri}"].number_format = pct_fmt
-        ws.cell(row=ri, column=4, value=enr["isolated_in_cluster"])
-        ws.cell(row=ri, column=5, value=enr["group_in_cluster"])
-        ws.cell(row=ri, column=6, value=enr["isolated_outside"])
-        ws.cell(row=ri, column=7, value=enr["group_outside"])
-        ws.cell(row=ri, column=8, value=enr["odds_ratio"])
-        ws.cell(row=ri, column=9, value=p_val)
-        ws[f"I{ri}"].number_format = sci_fmt
-        ws.cell(row=ri, column=10, value=_sig_marker(p_val))
-    _auto_width(ws)
+    if single_animal:
+        # No enrichment in single-animal mode — just cluster sizes.
+        ws = wb.create_sheet("Cluster Sizes")
+        size_cols = ["Cluster", "Size", "Fraction"]
+        for c_idx, col_name in enumerate(size_cols, 1):
+            ws.cell(row=1, column=c_idx, value=col_name)
+        _style_header(ws, len(size_cols), styles)
+        n_total = len(result.cluster_labels)
+        for ri, c in enumerate(range(result.n_clusters), 2):
+            size = int(np.sum(result.cluster_labels == c))
+            ws.cell(row=ri, column=1, value=c)
+            ws.cell(row=ri, column=2, value=size)
+            ws.cell(row=ri, column=3, value=(size / n_total if n_total else 0.0))
+            ws[f"C{ri}"].number_format = pct_fmt
+        _auto_width(ws)
+    else:
+        ws = wb.create_sheet("Cluster Enrichment")
+        enr_cols = [
+            "Cluster", "Size", "Fraction",
+            "Isolated in Cluster", "Group in Cluster",
+            "Isolated Outside", "Group Outside",
+            "Odds Ratio", "p-value", "Significant",
+        ]
+        for c_idx, col_name in enumerate(enr_cols, 1):
+            ws.cell(row=1, column=c_idx, value=col_name)
+        _style_header(ws, len(enr_cols), styles)
+        for ri, c_str in enumerate(sorted(per_cluster, key=int), 2):
+            pc = per_cluster[c_str]
+            enr = pc["isolated_enrichment"]
+            p_val = enr["p_value"]
+            ws.cell(row=ri, column=1, value=int(c_str))
+            ws.cell(row=ri, column=2, value=pc["size"])
+            ws.cell(row=ri, column=3, value=pc["fraction"])
+            ws[f"C{ri}"].number_format = pct_fmt
+            ws.cell(row=ri, column=4, value=enr["isolated_in_cluster"])
+            ws.cell(row=ri, column=5, value=enr["group_in_cluster"])
+            ws.cell(row=ri, column=6, value=enr["isolated_outside"])
+            ws.cell(row=ri, column=7, value=enr["group_outside"])
+            ws.cell(row=ri, column=8, value=enr["odds_ratio"])
+            ws.cell(row=ri, column=9, value=p_val)
+            ws[f"I{ri}"].number_format = sci_fmt
+            ws.cell(row=ri, column=10, value=_sig_marker(p_val))
+        _auto_width(ws)
 
     feat_enr = comparison.get("feature_enrichment", [])
     if feat_enr:
@@ -491,15 +514,23 @@ def write_single_project_excel_report(
         _auto_width(ws)
 
     plots_dir = out_dir / "plots"
-    _embed_plot_sheets(wb, plots_dir, [
-        ("UMAP Clusters", "umap_by_cluster.png"),
-        ("UMAP Housing", "umap_by_housing.png"),
-        ("Cluster Composition", "cluster_composition.png"),
-        ("Feature Heatmap", "feature_heatmap.png"),
-        ("Cluster Enrichment Plot", "enrichment_bars.png"),
-        ("Feature Enrichment Plot", "feature_enrichment.png"),
-        ("Feature Violins", "feature_violins.png"),
-    ])
+    if single_animal:
+        plot_sheets = [
+            ("UMAP Clusters", "umap_by_cluster.png"),
+            ("Feature Heatmap", "feature_heatmap.png"),
+            ("Feature Violins", "feature_violins.png"),
+        ]
+    else:
+        plot_sheets = [
+            ("UMAP Clusters", "umap_by_cluster.png"),
+            ("UMAP Housing", "umap_by_housing.png"),
+            ("Cluster Composition", "cluster_composition.png"),
+            ("Feature Heatmap", "feature_heatmap.png"),
+            ("Cluster Enrichment Plot", "enrichment_bars.png"),
+            ("Feature Enrichment Plot", "feature_enrichment.png"),
+            ("Feature Violins", "feature_violins.png"),
+        ]
+    _embed_plot_sheets(wb, plots_dir, plot_sheets)
 
     xlsx_path = out_dir / "clustering_report.xlsx"
     wb.save(str(xlsx_path))

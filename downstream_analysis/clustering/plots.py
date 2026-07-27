@@ -505,18 +505,21 @@ def generate_all_plots(
     # plots_umap.generate_all_umap_plots, but single-project still needs these)
     umap_dir = plots_dir / "umap"
     plot_umap_by_cluster(result, umap_dir / "umap_by_cluster.png")
-    # Skip housing UMAP in single-animal mode (housing is per-pair concept)
+    # In single-animal mode there is no pair, so all housing / interaction /
+    # enrichment plots are meaningless (and enrichment plots assume the
+    # "isolated_enrichment" comparison keys). Skip them.
     is_single_animal = (
         result.metadata
         and getattr(result.metadata[0], "focal_side", "") != ""
     )
     if not is_single_animal:
         plot_umap_by_housing(result, umap_dir / "umap_by_housing.png")
+        plot_cluster_composition(result, comparison, plots_dir / "cluster_composition.png")
 
-    plot_cluster_composition(result, comparison, plots_dir / "cluster_composition.png")
     plot_feature_heatmap(result, plots_dir / "feature_heatmap.png")
-    plot_enrichment_bars(result, comparison, plots_dir / "enrichment_bars.png")
-    plot_feature_enrichment(comparison, plots_dir / "feature_enrichment.png")
+    if not is_single_animal:
+        plot_enrichment_bars(result, comparison, plots_dir / "enrichment_bars.png")
+        plot_feature_enrichment(comparison, plots_dir / "feature_enrichment.png")
 
     # Violin plots for top discriminative features (first 8)
     top_features = list(range(min(8, result.features_normalized.shape[1])))

@@ -35,3 +35,8 @@ class ClusteringConfig:
 
     # Normalization
     normalize_method: str = "zscore"  # "zscore" | "robust" | "minmax"
+
+    # Single-animal mode: cluster on the focal animal's 12 per-object features
+    # only (drop b_* + interaction), and emit descriptive outputs instead of the
+    # social / housing comparison. For projects with one tracked object per video.
+    single_animal: bool = False

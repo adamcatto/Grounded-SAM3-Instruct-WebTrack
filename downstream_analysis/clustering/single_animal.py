@@ -20,6 +20,7 @@ import numpy as np
 from .dataset import BehaviorDataset, WindowMetadata
 from .sequence_features import (
     SINGLE_ANIMAL_FEATURE_NAMES,
+    SINGLE_ANIMAL_PER_OBJECT_NAMES,
     interaction_column_indices,
     per_object_column_indices,
 )
@@ -118,4 +119,62 @@ def split_to_single_animal(dataset: BehaviorDataset) -> BehaviorDataset:
         features=out_features,
         metadata=out_metadata,
         feature_names=list(SINGLE_ANIMAL_FEATURE_NAMES),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Native single-animal restriction (no pair to split)
+# ---------------------------------------------------------------------------
+
+def restrict_to_focal_animal(dataset: BehaviorDataset) -> BehaviorDataset:
+    """Restrict a pair-schema dataset to the focal animal's 12 per-object features.
+
+    Unlike :func:`split_to_single_animal` (which turns a genuine *social pair*
+    into two focal samples), this is for projects where each video tracks a
+    **single** animal from the start.  Feature extraction still emits the full
+    33-dim pair vector, but the ``b_*`` and interaction columns are all-NaN and
+    would only dilute clustering.  This drops them, keeping only the 12 ``a_*``
+    per-object features and renaming them to the generic per-object names.
+
+    Each window's metadata is preserved but tagged ``focal_side = "a"`` so the
+    downstream single-animal detection (used by the plots) fires.
+
+    Returns
+    -------
+    BehaviorDataset
+        ``(N, 12)`` dataset with ``feature_names = SINGLE_ANIMAL_PER_OBJECT_NAMES``.
+    """
+    n = len(dataset)
+    if n == 0:
+        return BehaviorDataset(
+            features=np.empty((0, len(SINGLE_ANIMAL_PER_OBJECT_NAMES)), dtype=np.float64),
+            metadata=[],
+            feature_names=list(SINGLE_ANIMAL_PER_OBJECT_NAMES),
+        )
+
+    feat_names = list(dataset.feature_names)
+    a_cols = per_object_column_indices("a", feat_names)  # 12
+
+    assert len(a_cols) == len(SINGLE_ANIMAL_PER_OBJECT_NAMES), (
+        f"Expected {len(SINGLE_ANIMAL_PER_OBJECT_NAMES)} per-object features, "
+        f"got {len(a_cols)}"
+    )
+
+    out_features = dataset.features[:, a_cols].astype(np.float64, copy=True)
+
+    out_metadata: list[WindowMetadata] = []
+    for m in dataset.metadata:
+        m_a = copy.copy(m)
+        m_a.focal_side = "a"
+        out_metadata.append(m_a)
+
+    logger.info(
+        "Restricted %d windows to single-animal focal features (%d -> %d features)",
+        n, len(feat_names), len(a_cols),
+    )
+
+    return BehaviorDataset(
+        features=out_features,
+        metadata=out_metadata,
+        feature_names=list(SINGLE_ANIMAL_PER_OBJECT_NAMES),
     )

@@ -16,6 +16,54 @@ from .dataset import housing_condition
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Shared building blocks (used by both social and single-animal comparisons)
+# ---------------------------------------------------------------------------
+
+def _build_ethograms(meta: list, labels: np.ndarray) -> dict[str, dict[str, Any]]:
+    """Per-video cluster-label timelines, keyed by video_id."""
+    ethograms: dict[str, dict[str, Any]] = {}
+    vid_groups: defaultdict[str, list[int]] = defaultdict(list)
+    for i, m in enumerate(meta):
+        vid_groups[m.video_id].append(i)
+
+    for vid_id, indices in vid_groups.items():
+        indices_sorted = sorted(indices, key=lambda i: meta[i].start_frame)
+        ethograms[vid_id] = {
+            "video_name": meta[indices_sorted[0]].video_name,
+            "n_windows": len(indices_sorted),
+            "start_frames": [meta[i].start_frame for i in indices_sorted],
+            "cluster_labels": [int(labels[i]) for i in indices_sorted],
+            "interaction_type": meta[indices_sorted[0]].interaction_type,
+        }
+    return ethograms
+
+
+def _build_transition_data(
+    ethograms: dict[str, dict[str, Any]],
+    n_clusters: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Transition matrices grouped by interaction_type + differential matrices."""
+    from .transition_analysis import (
+        compute_differential_transition_matrices,
+        compute_transition_matrices_by_group,
+    )
+
+    transition_matrices = compute_transition_matrices_by_group(
+        ethograms,
+        n_clusters,
+        group_field="interaction_type",
+        exclude_groups={"unknown", "single_animal"},
+    )
+    transition_group_order = sorted(transition_matrices.keys())
+    differential_transition_matrices = compute_differential_transition_matrices(
+        transition_matrices,
+        transition_group_order,
+        exclude_groups={"unknown", "single_animal"},
+    )
+    return transition_matrices, differential_transition_matrices
+
+
 def compare_housing_conditions(result: ClusteringResult) -> dict[str, Any]:
     """Analyze cluster composition by housing condition and interaction type.
 
@@ -205,22 +253,8 @@ def compare_housing_conditions(result: ClusteringResult) -> dict[str, Any]:
     # 4. Ethograms: per-video cluster label timelines
     # ---------------------------------------------------------------------------
 
-    ethograms: dict[str, dict[str, Any]] = {}
-    vid_groups: defaultdict[str, list[int]] = defaultdict(list)
-    for i, m in enumerate(meta):
-        vid_groups[m.video_id].append(i)
-
-    logger.info("Building ethograms for %d videos...", len(vid_groups))
-
-    for vid_id, indices in vid_groups.items():
-        indices_sorted = sorted(indices, key=lambda i: meta[i].start_frame)
-        ethograms[vid_id] = {
-            "video_name": meta[indices_sorted[0]].video_name,
-            "n_windows": len(indices_sorted),
-            "start_frames": [meta[i].start_frame for i in indices_sorted],
-            "cluster_labels": [int(labels[i]) for i in indices_sorted],
-            "interaction_type": meta[indices_sorted[0]].interaction_type,
-        }
+    logger.info("Building ethograms...")
+    ethograms = _build_ethograms(meta, labels)
 
     # ---------------------------------------------------------------------------
     # 5. Per-feature enrichment (effect size, fold change, odds-ratio-style)
@@ -337,22 +371,8 @@ def compare_housing_conditions(result: ClusteringResult) -> dict[str, Any]:
     overall_enrichment["total_windows_group_only"] = total_grp
     overall_enrichment["interaction_type_counts"] = dict(Counter(interaction_types))
 
-    from .transition_analysis import (
-        compute_differential_transition_matrices,
-        compute_transition_matrices_by_group,
-    )
-
-    transition_matrices = compute_transition_matrices_by_group(
-        ethograms,
-        n_clusters,
-        group_field="interaction_type",
-        exclude_groups={"unknown", "single_animal"},
-    )
-    transition_group_order = sorted(transition_matrices.keys())
-    differential_transition_matrices = compute_differential_transition_matrices(
-        transition_matrices,
-        transition_group_order,
-        exclude_groups={"unknown", "single_animal"},
+    transition_matrices, differential_transition_matrices = _build_transition_data(
+        ethograms, n_clusters,
     )
 
     elapsed = time.monotonic() - t0
@@ -368,6 +388,71 @@ def compare_housing_conditions(result: ClusteringResult) -> dict[str, Any]:
         "overall_enrichment": overall_enrichment,
         "per_feature_tests": per_feature_tests,
         "feature_enrichment": feature_enrichment,
+        "interaction_type_distribution": itype_dist,
+        "ethograms": ethograms,
+        "transition_matrices": transition_matrices,
+        "differential_transition_matrices": differential_transition_matrices,
+    }
+
+
+def describe_single_animal_clusters(result: ClusteringResult) -> dict[str, Any]:
+    """Descriptive cluster summary for single-animal projects (no social stats).
+
+    Produces the same dict shape as :func:`compare_housing_conditions` but only
+    the fields that are meaningful without a social pair:
+      - ``per_cluster``: size + fraction only (no ``isolated_enrichment``)
+      - ``interaction_type_distribution``: cluster composition (all "single_animal")
+      - ``ethograms``: per-video cluster label timelines
+      - ``transition_matrices`` / ``differential_transition_matrices``
+
+    The social-only keys (``per_feature_tests``, ``feature_enrichment``) are
+    omitted and ``overall_enrichment`` is left empty so downstream consumers that
+    guard on presence simply skip them.
+    """
+    if len(result.metadata) == 0:
+        return {"note": "no data"}
+
+    t0 = time.monotonic()
+
+    labels = result.cluster_labels
+    n_clusters = result.n_clusters
+    meta = result.metadata
+    n_total = len(labels)
+
+    logger.info(
+        "Describing %d clusters over %d single-animal windows (no social comparison)...",
+        n_clusters, n_total,
+    )
+
+    per_cluster: dict[str, dict[str, Any]] = {}
+    itype_dist: dict[str, dict[str, int]] = {}
+    for c in range(n_clusters):
+        mask = labels == c
+        n_in = int(np.sum(mask))
+        per_cluster[str(c)] = {
+            "size": n_in,
+            "fraction": n_in / n_total if n_total else 0.0,
+        }
+        counts: Counter[str] = Counter()
+        for i in np.where(mask)[0]:
+            counts[meta[i].interaction_type] += 1
+        itype_dist[str(c)] = dict(counts)
+        logger.info("  Cluster %d: %d windows (%.1f%%)", c, n_in, 100.0 * n_in / n_total)
+
+    ethograms = _build_ethograms(meta, labels)
+    transition_matrices, differential_transition_matrices = _build_transition_data(
+        ethograms, n_clusters,
+    )
+
+    elapsed = time.monotonic() - t0
+    logger.info(
+        "Cluster description complete in %.1fs: %d clusters, %d video ethograms.",
+        elapsed, n_clusters, len(ethograms),
+    )
+
+    return {
+        "per_cluster": per_cluster,
+        "overall_enrichment": {},
         "interaction_type_distribution": itype_dist,
         "ethograms": ethograms,
         "transition_matrices": transition_matrices,

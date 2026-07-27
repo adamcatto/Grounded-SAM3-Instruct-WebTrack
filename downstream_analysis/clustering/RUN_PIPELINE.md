@@ -56,6 +56,32 @@ This will:
 - Compare isolated vs group-housed mice
 - Generate all plots
 
+### Single-animal projects
+
+For projects where each video tracks a **single** animal (no social pair), add
+`--single-animal`:
+
+```bash
+conda run --no-capture-output -n sam3 python -m downstream_analysis.clustering \
+  --project-dir /path/to/single_animal_project \
+  --skip-mask-verification \
+  --single-animal
+```
+
+This clusters on the focal animal's 12 per-object kinematic/shape features only
+(dropping the `b_*` and interaction features, which are undefined with one
+animal) and produces **descriptive** outputs instead of the social/housing
+comparison:
+
+- `results/cluster_description.json` (in place of `housing_comparison.json`)
+- Cluster summaries, per-video ethograms, feature heatmap, feature violins,
+  and behavioral transition matrices
+- No housing/enrichment plots or sheets (`umap_by_housing`, `enrichment_bars`,
+  `feature_enrichment`, `cluster_composition` are skipped)
+
+If you omit the flag but every video has only one object, the pipeline still
+runs and logs a warning suggesting `--single-animal`.
+
 ## Step 4 (optional): Re-run with different parameters
 
 Cached frame features are reused automatically. Only clustering is re-done:
