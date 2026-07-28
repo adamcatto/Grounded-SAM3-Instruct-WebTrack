@@ -34,7 +34,6 @@ echo "PROJECT_DIR=${PROJECT_DIR}"
 echo "EXTRA_ARGS=$*"
 
 REPO_ROOT="/sc/arion/projects/KennyComputational/Behavior/Grounded-SAM3-Instruct-WebTrack"
-BACKEND_PORT=8810
 
 cd "${REPO_ROOT}"
 
@@ -45,6 +44,14 @@ export SAM3_PROJECTS_DIR="$(dirname "${PROJECT_DIR}")"
 export CUDA_VISIBLE_DEVICES=0
 # Ensure localhost/127.0.0.1 bypasses the HPC HTTP proxy (which returns 503 for local backends)
 export no_proxy="127.0.0.1,localhost,${no_proxy:-}"
+
+# ── Pick a free backend port ───────────────────────────────────────────────
+# Multiple tracking jobs can land on the SAME host (span[hosts=1] + -gpu num=1
+# does not reserve the whole node). A fixed port would collide — and the
+# fuser -k below would kill a co-located job's backend. Bind to an OS-assigned
+# free port instead so co-located jobs stay isolated.
+BACKEND_PORT="$(python -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+echo "Selected backend port ${BACKEND_PORT} on host $(hostname)"
 
 # ── Kill any stale process on the target port ──────────────────────────────
 fuser -k "${BACKEND_PORT}/tcp" >/dev/null 2>&1 || true

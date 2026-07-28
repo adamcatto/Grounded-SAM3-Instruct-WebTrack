@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Git conventions
+
+- Never add Claude as a co-author on git commits (no `Co-Authored-By: Claude ...` trailer).
+
 ## Commands
 
 **Start everything:**
