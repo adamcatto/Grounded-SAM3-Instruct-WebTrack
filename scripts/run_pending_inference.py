@@ -154,6 +154,17 @@ def _log_sse_to_terminal(ev: str, data: dict[str, Any], *, stream_active: list[b
     print(f"  [{ev}] {data}", flush=True)
 
 
+# Inactivity timeout for the propagation SSE stream. A healthy propagation emits
+# progress events far more often than this (per-batch cadence is ~1-3 min); a
+# stream silent for this long means the backend wedged mid-propagation (e.g. a
+# SAM3/CUDA stall or a dropped connection). Without a finite cap the client
+# blocks in a socket read forever — the LSF job stays RUN with flat CPU and never
+# re-claims, wasting a GPU. 20 min is a generous margin over legitimate gaps yet
+# finite, so a stall surfaces as an error the worker loop recovers from (it
+# releases the claim and moves on; the video's status becomes retryable).
+DEFAULT_SSE_INACTIVITY_TIMEOUT_S = 1200.0
+
+
 def propagation_sse(
     backend_api_base: str,
     pid: str,
@@ -166,6 +177,10 @@ def propagation_sse(
     """
     Consume GET /api/.../propagate SSE until done or error.
 
+    ``timeout_s`` is the per-read socket (inactivity) timeout: if the stream goes
+    silent for this many seconds the read is aborted and a stall error returned,
+    rather than blocking forever. ``None`` uses DEFAULT_SSE_INACTIVITY_TIMEOUT_S.
+
     Returns (ok, last_payload_dict, human_error_message).
     """
     q = urllib.parse.urlencode({"use_all_anchors": "true" if use_all_anchors else "false"})
@@ -173,7 +188,11 @@ def propagation_sse(
     api = backend_api_base.rstrip("/")
     url = f"{api}/projects/{urllib.parse.quote(pid)}/videos/{urllib.parse.quote(vid)}/propagate{tail}"
     req = urllib.request.Request(url, headers={"Accept": "text/event-stream"})
-    to = timeout_s if timeout_s is not None else None
+    # A finite per-read timeout is what prevents the infinite-hang failure mode:
+    # urlopen(timeout=to) sets the socket timeout, which applies to every read on
+    # the streamed response, so a silent stream raises socket.timeout instead of
+    # blocking the worker forever.
+    to = timeout_s if timeout_s is not None else DEFAULT_SSE_INACTIVITY_TIMEOUT_S
 
     seen_done = False
     seen_err = False
@@ -241,6 +260,16 @@ def propagation_sse(
         except Exception:
             pass
         return False, last_payload, f"HTTP {e.code}: {body or e.reason}"
+    except (TimeoutError, socket.timeout) as e:
+        # Inactivity timeout: the stream went silent (backend wedged mid-
+        # propagation). Surface as a recoverable error so the worker releases the
+        # claim and moves on; the video stays retryable via video_eligibility.
+        return (
+            False,
+            last_payload,
+            f"SSE stream stalled: no data for {to:.0f}s (inactivity timeout; "
+            f"backend likely wedged mid-propagation) [{e!r}]",
+        )
     except Exception as e:
         return False, last_payload, str(e)
 
