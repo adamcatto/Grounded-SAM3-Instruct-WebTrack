@@ -2422,8 +2422,9 @@ class AddPoseEntityRequest(BaseModel):
 
 
 class PoseAnnotationRequest(BaseModel):
-    x: float
-    y: float
+    x: Optional[float] = None
+    y: Optional[float] = None
+    visible: bool = True
 
 
 class PosePredictionRequest(BaseModel):
@@ -2467,12 +2468,54 @@ def set_pose_annotation(pid: str, vid: str, oid: str, part_id: str, frame_idx: i
         raise HTTPException(404, "Video not found")
     if frame_idx < 0 or frame_idx >= int(video.get("num_frames") or 1):
         raise HTTPException(422, "Frame is outside the video")
-    if not (0.0 <= req.x <= 1.0 and 0.0 <= req.y <= 1.0):
-        raise HTTPException(422, "Pose coordinates must be normalized from 0 to 1")
+    if req.visible and (
+        req.x is None or req.y is None
+        or not (0.0 <= req.x <= 1.0 and 0.0 <= req.y <= 1.0)
+    ):
+        raise HTTPException(422, "Visible pose coordinates must be normalized from 0 to 1")
     try:
-        return pm.set_pose_annotation(pid, vid, oid, part_id, frame_idx, req.x, req.y)
+        return pm.set_pose_annotation(pid, vid, oid, part_id, frame_idx, req.x, req.y, req.visible)
     except ValueError as e:
         raise HTTPException(404, str(e))
+
+
+@app.delete("/api/projects/{pid}/videos/{vid}/pose/objects/{oid}/parts/{part_id}/frames/{frame_idx}")
+def delete_pose_annotation(pid: str, vid: str, oid: str, part_id: str, frame_idx: int):
+    try:
+        removed = pm.delete_pose_annotation(pid, vid, oid, part_id, frame_idx)
+        return {"removed": removed}
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.delete("/api/projects/{pid}/videos/{vid}/pose/frames/{frame_idx}/annotations")
+def clear_pose_annotations_for_frame(pid: str, vid: str, frame_idx: int):
+    video = pm.get_video(pid, vid)
+    if video is None:
+        raise HTTPException(404, "Video not found")
+    if frame_idx < 0 or frame_idx >= int(video.get("num_frames") or 1):
+        raise HTTPException(422, "Frame is outside the video")
+    return {"removed": pm.clear_pose_annotations_for_frame(pid, vid, frame_idx)}
+
+
+@app.post("/api/projects/{pid}/videos/{vid}/pose/anchors/{frame_idx}/skip")
+def skip_pose_anchor(pid: str, vid: str, frame_idx: int):
+    video = pm.get_video(pid, vid)
+    if video is None:
+        raise HTTPException(404, "Video not found")
+    if frame_idx < 0 or frame_idx >= int(video.get("num_frames") or 1):
+        raise HTTPException(422, "Frame is outside the video")
+    skipped = sorted({int(frame) for frame in video.get("pose_skipped_anchor_frames") or []} | {frame_idx})
+    return pm.update_video(pid, vid, {"pose_skipped_anchor_frames": skipped})
+
+
+@app.delete("/api/projects/{pid}/videos/{vid}/pose/anchors/{frame_idx}/skip")
+def unskip_pose_anchor(pid: str, vid: str, frame_idx: int):
+    video = pm.get_video(pid, vid)
+    if video is None:
+        raise HTTPException(404, "Video not found")
+    skipped = [int(frame) for frame in video.get("pose_skipped_anchor_frames") or [] if int(frame) != frame_idx]
+    return pm.update_video(pid, vid, {"pose_skipped_anchor_frames": skipped})
 
 
 def _pose_tracks_path(pid: str, vid: str) -> Path:
@@ -2518,7 +2561,11 @@ def cache_pose_memory(pid: str, vid: str, frame_idx: int):
     path = _pose_feature_path(pid, vid, frame_idx)
     _cached_pose_features(pid, vid, str(video.get("source_path") or ""), frame_idx)
     memory_frames = sorted({int(frame) for frame in video.get("pose_memory_frames") or []} | {frame_idx})
-    pm.update_video(pid, vid, {"pose_memory_frames": memory_frames})
+    skipped = [int(frame) for frame in video.get("pose_skipped_anchor_frames") or [] if int(frame) != frame_idx]
+    pm.update_video(pid, vid, {
+        "pose_memory_frames": memory_frames,
+        "pose_skipped_anchor_frames": skipped,
+    })
     return {"frame_idx": frame_idx, "cached": True, "feature_file": path.name}
 
 
@@ -2553,18 +2600,26 @@ def predict_pose(pid: str, vid: str, req: PosePredictionRequest, background_task
     annotations = video.get("pose_annotations") or {}
     point_keys: list[tuple[str, str]] = []
     normalized: list[list[float]] = []
+    query_visibility: list[bool] = []
     missing: list[str] = []
     for oid, obj in pose_objects.items():
         for part_id, part in (obj.get("parts") or {}).items():
             annotation = annotations.get(oid, {}).get(part_id, {}).get(str(start))
-            if annotation is None:
+            annotation_visible = bool(annotation and annotation.get("visible", True))
+            if not annotation_visible:
                 part_memories = annotations.get(oid, {}).get(part_id, {})
-                if not part_memories:
+                if not any(
+                    memory.get("visible", True)
+                    and memory.get("x") is not None
+                    and memory.get("y") is not None
+                    for memory in part_memories.values()
+                ):
                     missing.append(f"{obj.get('name', oid)} / {part.get('name', part_id)}")
                     continue
                 normalized.append([float("nan"), float("nan")])
             else:
                 normalized.append([float(annotation["x"]), float(annotation["y"])])
+            query_visibility.append(annotation is None or annotation_visible)
             point_keys.append((oid, part_id))
     if missing:
         raise HTTPException(409, f"Label at least one anchor for every pose part: {', '.join(missing)}")
@@ -2577,16 +2632,18 @@ def predict_pose(pid: str, vid: str, req: PosePredictionRequest, background_task
     capture.release()
     normalized_xy = np.asarray(normalized, dtype=np.float32)
     unresolved = np.isnan(normalized_xy).any(axis=1)
+    skipped_memory_frames = {int(frame) for frame in video.get("pose_skipped_anchor_frames") or []}
     memory_frames = sorted({
         int(frame_key)
         for oid, part_id in point_keys
         for frame_key in annotations.get(oid, {}).get(part_id, {})
+        if int(frame_key) not in skipped_memory_frames
         if all(
             str(frame_key) in annotations.get(other_oid, {}).get(other_part_id, {})
             for other_oid, other_part_id in point_keys
         )
     })
-    memory_weights: list[tuple[np.ndarray, np.ndarray, float]] = []
+    memory_weights: list[tuple[np.ndarray, np.ndarray, float | np.ndarray]] = []
     previous_used = False
     if unresolved.any() and start > 0:
         tracks_path = _pose_tracks_path(pid, vid)
@@ -2603,17 +2660,29 @@ def predict_pose(pid: str, vid: str, req: PosePredictionRequest, background_task
     if unresolved.any():
         if not memory_frames:
             raise HTTPException(409, "No fully labeled pose anchor frame is available")
-        anchor_weight = (0.4 if previous_used else 1.0) / len(memory_frames)
+        visible_counts = np.zeros(len(point_keys), dtype=np.float32)
+        memory_points_by_frame: dict[int, np.ndarray] = {}
         for memory_frame in memory_frames:
             memory_points = np.asarray([
                 [
-                    annotations[oid][part_id][str(memory_frame)]["x"],
-                    annotations[oid][part_id][str(memory_frame)]["y"],
+                    annotations[oid][part_id][str(memory_frame)].get("x", float("nan"))
+                    if annotations[oid][part_id][str(memory_frame)].get("visible", True) else float("nan"),
+                    annotations[oid][part_id][str(memory_frame)].get("y", float("nan"))
+                    if annotations[oid][part_id][str(memory_frame)].get("visible", True) else float("nan"),
                 ]
                 for oid, part_id in point_keys
             ], dtype=np.float32)
+            memory_points_by_frame[memory_frame] = memory_points
+            visible_counts += (~np.isnan(memory_points).any(axis=1)).astype(np.float32)
+        if np.any(unresolved & (visible_counts == 0)) and not previous_used:
+            raise HTTPException(409, "No visible pose anchor is available for one or more occluded parts")
+        anchor_total = 0.4 if previous_used else 1.0
+        for memory_frame, memory_points in memory_points_by_frame.items():
+            valid = ~np.isnan(memory_points).any(axis=1)
+            weights = np.zeros(len(point_keys), dtype=np.float32)
+            weights[valid] = anchor_total / np.maximum(visible_counts[valid], 1)
             memory_features = _cached_pose_features(pid, vid, source_path, memory_frame)
-            memory_weights.append((memory_features, memory_points, anchor_weight))
+            memory_weights.append((memory_features, memory_points, weights))
         target_features = _cached_pose_features(pid, vid, source_path, start)
         resolved = cotracker3.correlate_memories(target_features, memory_weights)
         normalized_xy[unresolved] = resolved[unresolved]
@@ -2644,6 +2713,9 @@ def predict_pose(pid: str, vid: str, req: PosePredictionRequest, background_task
         tmp.replace(path)
 
     def encode_progress(tracks: np.ndarray, visibility: np.ndarray) -> None:
+        visibility = np.asarray(visibility, dtype=bool).copy()
+        if len(visibility):
+            visibility[0] = np.asarray(query_visibility, dtype=bool)
         frames: dict[str, dict] = {}
         for local_idx in range(len(tracks)):
             frame_objects: dict[str, dict] = {}

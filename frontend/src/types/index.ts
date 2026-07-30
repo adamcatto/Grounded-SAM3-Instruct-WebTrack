@@ -66,8 +66,9 @@ export interface VideoMeta {
     host?: string | null
   }
   pose_objects?: Record<string, PoseObject>
-  pose_annotations?: Record<string, Record<string, Record<string, PosePoint>>>
+  pose_annotations?: Record<string, Record<string, Record<string, PoseAnnotation>>>
   pose_memory_frames?: number[]
+  pose_skipped_anchor_frames?: number[]
   pose_tracking?: {
     status?: 'none' | 'running' | 'complete' | 'failed'
     start_frame?: number | null
@@ -152,6 +153,12 @@ export interface PointAnnotation {
   x: number  // normalized 0-1
   y: number  // normalized 0-1
   label: 1 | 0  // 1=positive, 0=negative
+}
+
+export interface PoseAnnotation {
+  x?: number
+  y?: number
+  visible: boolean
 }
 
 export interface MaskData {

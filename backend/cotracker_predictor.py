@@ -100,7 +100,7 @@ class CoTracker3Predictor:
     @staticmethod
     def correlate_memories(
         target_features: np.ndarray,
-        memories: list[tuple[np.ndarray, np.ndarray, float]],
+        memories: list[tuple[np.ndarray, np.ndarray, float | np.ndarray]],
     ) -> np.ndarray:
         """Locate points in a target feature map using weighted memory descriptors.
 
@@ -110,17 +110,24 @@ class CoTracker3Predictor:
         _, height, width = target.shape
         count = len(memories[0][1])
         scores = np.zeros((count, height, width), dtype=np.float32)
-        weight_sum = 0.0
+        weight_sum = np.zeros(count, dtype=np.float32)
         for feature_map, points, weight in memories:
             fmap = np.asarray(feature_map, dtype=np.float32)
-            xs = np.clip(np.rint(points[:, 0] * (fmap.shape[2] - 1)), 0, fmap.shape[2] - 1).astype(int)
-            ys = np.clip(np.rint(points[:, 1] * (fmap.shape[1] - 1)), 0, fmap.shape[1] - 1).astype(int)
+            points = np.asarray(points, dtype=np.float32)
+            valid = ~np.isnan(points).any(axis=1)
+            weights = np.broadcast_to(np.asarray(weight, dtype=np.float32), (count,))
+            active = valid & (weights > 0)
+            if not active.any():
+                continue
+            indices = np.flatnonzero(active)
+            xs = np.clip(np.rint(points[indices, 0] * (fmap.shape[2] - 1)), 0, fmap.shape[2] - 1).astype(int)
+            ys = np.clip(np.rint(points[indices, 1] * (fmap.shape[1] - 1)), 0, fmap.shape[1] - 1).astype(int)
             descriptors = fmap[:, ys, xs].T
             descriptors /= np.maximum(np.linalg.norm(descriptors, axis=1, keepdims=True), 1e-8)
-            scores += float(weight) * np.einsum("nc,chw->nhw", descriptors, target)
-            weight_sum += float(weight)
-        if weight_sum <= 0:
-            raise ValueError("At least one positive memory weight is required")
+            scores[indices] += weights[indices, None, None] * np.einsum("nc,chw->nhw", descriptors, target)
+            weight_sum[indices] += weights[indices]
+        if np.any(weight_sum <= 0):
+            raise ValueError("Every pose point requires at least one visible, positive-weight memory")
         flat = scores.reshape(count, -1).argmax(axis=1)
         y, x = np.divmod(flat, width)
         return np.column_stack([

@@ -72,8 +72,30 @@ export const setPoseAnnotation = (
   pid: string, vid: string, oid: string, partId: string, frameIdx: number, x: number, y: number,
 ) => api.put(
   `/projects/${pid}/videos/${vid}/pose/objects/${oid}/parts/${partId}/frames/${frameIdx}`,
-  { x, y },
+  { x, y, visible: true },
 ).then(r => r.data)
+
+export const setPoseOccluded = (
+  pid: string, vid: string, oid: string, partId: string, frameIdx: number,
+) => api.put(
+  `/projects/${pid}/videos/${vid}/pose/objects/${oid}/parts/${partId}/frames/${frameIdx}`,
+  { visible: false },
+).then(r => r.data)
+
+export const deletePoseAnnotation = (
+  pid: string, vid: string, oid: string, partId: string, frameIdx: number,
+) => api.delete(
+  `/projects/${pid}/videos/${vid}/pose/objects/${oid}/parts/${partId}/frames/${frameIdx}`,
+).then(r => r.data)
+
+export const clearPoseAnnotationsForFrame = (pid: string, vid: string, frameIdx: number) =>
+  api.delete(`/projects/${pid}/videos/${vid}/pose/frames/${frameIdx}/annotations`).then(r => r.data)
+
+export const skipPoseAnchor = (pid: string, vid: string, frameIdx: number) =>
+  api.post(`/projects/${pid}/videos/${vid}/pose/anchors/${frameIdx}/skip`).then(r => r.data)
+
+export const unskipPoseAnchor = (pid: string, vid: string, frameIdx: number) =>
+  api.delete(`/projects/${pid}/videos/${vid}/pose/anchors/${frameIdx}/skip`).then(r => r.data)
 
 export const predictPose = (pid: string, vid: string, startFrame: number, numFrames: number) =>
   api.post(`/projects/${pid}/videos/${vid}/pose/predict`, {

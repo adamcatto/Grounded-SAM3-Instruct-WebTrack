@@ -451,6 +451,7 @@ class ProjectManager:
             "pose_objects": {},
             "pose_annotations": {},
             "pose_memory_frames": [],
+            "pose_skipped_anchor_frames": [],
             "pose_tracking": {
                 "status": "none",
                 "start_frame": None,
@@ -518,8 +519,9 @@ class ProjectManager:
         object_id: str,
         part_id: str,
         frame_idx: int,
-        x: float,
-        y: float,
+        x: Optional[float],
+        y: Optional[float],
+        visible: bool = True,
     ) -> dict:
         config = self.get_project(pid)
         if config is None or vid not in config.get("videos", {}):
@@ -527,12 +529,51 @@ class ProjectManager:
         obj = config["videos"][vid].setdefault("pose_objects", {}).get(object_id)
         if obj is None or part_id not in obj.get("parts", {}):
             raise ValueError("Pose part not found")
-        annotation = {"x": float(x), "y": float(y)}
+        annotation = {"visible": bool(visible)}
+        if visible:
+            if x is None or y is None:
+                raise ValueError("Visible pose annotations require coordinates")
+            annotation.update({"x": float(x), "y": float(y)})
         config["videos"][vid].setdefault("pose_annotations", {}).setdefault(
             object_id, {},
         ).setdefault(part_id, {})[str(frame_idx)] = annotation
         self._save_config(pid, config)
         return annotation
+
+    def delete_pose_annotation(
+        self,
+        pid: str,
+        vid: str,
+        object_id: str,
+        part_id: str,
+        frame_idx: int,
+    ) -> bool:
+        config = self.get_project(pid)
+        if config is None or vid not in config.get("videos", {}):
+            raise ValueError("Video not found")
+        obj = config["videos"][vid].setdefault("pose_objects", {}).get(object_id)
+        if obj is None or part_id not in obj.get("parts", {}):
+            raise ValueError("Pose part not found")
+        frames = config["videos"][vid].setdefault("pose_annotations", {}).setdefault(
+            object_id, {},
+        ).setdefault(part_id, {})
+        removed = frames.pop(str(frame_idx), None) is not None
+        if removed:
+            self._save_config(pid, config)
+        return removed
+
+    def clear_pose_annotations_for_frame(self, pid: str, vid: str, frame_idx: int) -> int:
+        config = self.get_project(pid)
+        if config is None or vid not in config.get("videos", {}):
+            raise ValueError("Video not found")
+        removed = 0
+        for parts in config["videos"][vid].setdefault("pose_annotations", {}).values():
+            for frames in parts.values():
+                if frames.pop(str(frame_idx), None) is not None:
+                    removed += 1
+        if removed:
+            self._save_config(pid, config)
+        return removed
 
     def get_video(self, pid: str, vid: str) -> Optional[dict]:
         config = self._load_config(pid)
