@@ -2431,6 +2431,10 @@ class PosePredictionRequest(BaseModel):
     num_frames: int = 30
 
 
+_pose_prediction_jobs: set[tuple[str, str]] = set()
+_pose_prediction_jobs_lock = threading.Lock()
+
+
 @app.get("/api/pose/model")
 def pose_model_status():
     return cotracker3.status()
@@ -2486,11 +2490,14 @@ def get_pose_tracks(pid: str, vid: str, frame_idx: int):
         "objects": (payload.get("frames") or {}).get(str(frame_idx), {}),
         "start_frame": payload.get("start_frame"),
         "end_frame": payload.get("end_frame"),
+        "requested_end_frame": payload.get("requested_end_frame"),
+        "status": payload.get("status", "complete"),
+        "error": payload.get("error"),
     }
 
 
 @app.post("/api/projects/{pid}/videos/{vid}/pose/predict")
-def predict_pose(pid: str, vid: str, req: PosePredictionRequest):
+def predict_pose(pid: str, vid: str, req: PosePredictionRequest, background_tasks: BackgroundTasks):
     video = pm.get_video(pid, vid)
     if video is None:
         raise HTTPException(404, "Video not found")
@@ -2524,41 +2531,113 @@ def predict_pose(pid: str, vid: str, req: PosePredictionRequest):
     points_xy = np.asarray(normalized, dtype=np.float32)
     points_xy[:, 0] *= max(1, native_width - 1)
     points_xy[:, 1] *= max(1, native_height - 1)
-    try:
-        tracks, visibility = cotracker3.track(source_path, start, count, points_xy)
-    except Exception as e:
-        logger.exception("CoTracker3 pose prediction failed")
-        raise HTTPException(500, f"CoTracker3 prediction failed: {e}")
-    frames: dict[str, dict] = {}
-    for local_idx in range(len(tracks)):
-        frame_objects: dict[str, dict] = {}
-        for point_idx, (oid, part_id) in enumerate(point_keys):
-            frame_objects.setdefault(oid, {})[part_id] = {
-                "x": float(np.clip(tracks[local_idx, point_idx, 0] / max(1, native_width - 1), 0, 1)),
-                "y": float(np.clip(tracks[local_idx, point_idx, 1] / max(1, native_height - 1), 0, 1)),
-                "visible": bool(visibility[local_idx, point_idx]),
-            }
-        frames[str(start + local_idx)] = frame_objects
-    payload = {
-        "model": "facebook/cotracker3:scaled_offline.pth",
-        "start_frame": start,
-        "end_frame": start + count,
-        "frames": frames,
-    }
+    job_key = (pid, vid)
+    with _pose_prediction_jobs_lock:
+        if job_key in _pose_prediction_jobs:
+            raise HTTPException(409, "Pose prediction is already running for this video")
+        _pose_prediction_jobs.add(job_key)
+
     path = _pose_tracks_path(pid, vid)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(payload, indent=2))
-    tmp.replace(path)
+    requested_end = start + count
+    payload: dict = {
+        "model": "facebook/cotracker3:scaled_offline.pth",
+        "status": "running",
+        "start_frame": start,
+        "end_frame": start,
+        "requested_end_frame": requested_end,
+        "frames": {},
+    }
+
+    def persist(current_payload: dict) -> None:
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(current_payload, indent=2))
+        tmp.replace(path)
+
+    def encode_progress(tracks: np.ndarray, visibility: np.ndarray) -> None:
+        frames: dict[str, dict] = {}
+        for local_idx in range(len(tracks)):
+            frame_objects: dict[str, dict] = {}
+            for point_idx, (oid, part_id) in enumerate(point_keys):
+                frame_objects.setdefault(oid, {})[part_id] = {
+                    "x": float(np.clip(tracks[local_idx, point_idx, 0] / max(1, native_width - 1), 0, 1)),
+                    "y": float(np.clip(tracks[local_idx, point_idx, 1] / max(1, native_height - 1), 0, 1)),
+                    "visible": bool(visibility[local_idx, point_idx]),
+                }
+            frames[str(start + local_idx)] = frame_objects
+        payload["frames"] = frames
+        payload["end_frame"] = start + len(tracks) - 1
+        persist(payload)
+        pm.update_video(pid, vid, {
+            "pose_tracking": {
+                "status": "running",
+                "start_frame": start,
+                "end_frame": payload["end_frame"],
+                "requested_end_frame": requested_end,
+                "tracks_file": str(path.relative_to(pm._project_dir(pid))),
+                "model": payload["model"],
+            },
+        })
+
+    # Publish the labeled query frame before GPU inference begins.
+    encode_progress(points_xy[None, ...], np.ones((1, len(points_xy)), dtype=bool))
     pm.update_video(pid, vid, {
         "pose_tracking": {
-            "status": "complete",
+            "status": "running",
             "start_frame": start,
-            "end_frame": start + count,
+            "end_frame": start,
+            "requested_end_frame": requested_end,
             "tracks_file": str(path.relative_to(pm._project_dir(pid))),
             "model": payload["model"],
         },
     })
-    return {"status": "complete", "start_frame": start, "end_frame": start + count, "points": len(point_keys)}
+
+    def run_prediction() -> None:
+        try:
+            tracks, visibility = cotracker3.track(
+                source_path, start, count, points_xy, on_progress=encode_progress,
+            )
+            # Also persist here in case a predictor implementation does not invoke the callback.
+            encode_progress(tracks, visibility)
+            payload["status"] = "complete"
+            persist(payload)
+            pm.update_video(pid, vid, {
+                "pose_tracking": {
+                    "status": "complete",
+                    "start_frame": start,
+                    "end_frame": requested_end,
+                    "requested_end_frame": requested_end,
+                    "tracks_file": str(path.relative_to(pm._project_dir(pid))),
+                    "model": payload["model"],
+                },
+            })
+        except Exception as e:
+            logger.exception("CoTracker3 pose prediction failed")
+            payload["status"] = "failed"
+            payload["error"] = str(e)
+            persist(payload)
+            pm.update_video(pid, vid, {
+                "pose_tracking": {
+                    "status": "failed",
+                    "start_frame": start,
+                    "end_frame": payload["end_frame"],
+                    "requested_end_frame": requested_end,
+                    "tracks_file": str(path.relative_to(pm._project_dir(pid))),
+                    "model": payload["model"],
+                    "error": str(e),
+                },
+            })
+        finally:
+            with _pose_prediction_jobs_lock:
+                _pose_prediction_jobs.discard(job_key)
+
+    background_tasks.add_task(run_prediction)
+    return {
+        "status": "running",
+        "start_frame": start,
+        "end_frame": start,
+        "requested_end_frame": requested_end,
+        "points": len(point_keys),
+    }
 
 
 # ─── Objects ──────────────────────────────────────────────────────────────────

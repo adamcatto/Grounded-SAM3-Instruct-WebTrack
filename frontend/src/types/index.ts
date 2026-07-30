@@ -71,8 +71,10 @@ export interface VideoMeta {
     status?: 'none' | 'running' | 'complete' | 'failed'
     start_frame?: number | null
     end_frame?: number | null
+    requested_end_frame?: number | null
     tracks_file?: string | null
     model?: string
+    error?: string
   }
 }
 

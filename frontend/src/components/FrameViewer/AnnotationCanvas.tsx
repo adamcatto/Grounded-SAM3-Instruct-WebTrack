@@ -46,6 +46,7 @@ export default function AnnotationCanvas({ width, height, scrubbing = false }: P
   const pid = project?.id ?? ''
   const vid = currentVideoId ?? ''
   const poseMode = project?.tracking_mode === 'pose_tracking'
+  const poseTrackingStatus = video?.pose_tracking?.status
 
   useEffect(() => {
     if (!poseMode || !pid || !vid) {
@@ -53,13 +54,23 @@ export default function AnnotationCanvas({ width, height, scrubbing = false }: P
       return
     }
     let cancelled = false
-    void getPoseTracks(pid, vid, currentFrame).then(result => {
-      if (!cancelled) setPoseTracks(result.objects ?? {})
-    }).catch(() => {
-      if (!cancelled) setPoseTracks({})
-    })
-    return () => { cancelled = true }
-  }, [poseMode, pid, vid, currentFrame])
+    let timer: number | undefined
+    const load = async () => {
+      try {
+        const result = await getPoseTracks(pid, vid, currentFrame)
+        if (cancelled) return
+        setPoseTracks(result.objects ?? {})
+        if (result.status === 'running') timer = window.setTimeout(load, 500)
+      } catch {
+        if (!cancelled) setPoseTracks({})
+      }
+    }
+    void load()
+    return () => {
+      cancelled = true
+      if (timer !== undefined) window.clearTimeout(timer)
+    }
+  }, [poseMode, poseTrackingStatus, pid, vid, currentFrame])
 
   const masksToShow = useMemo(() => {
     if (currentFrameMasksFrame === currentFrame && Object.keys(currentFrameMasks).length > 0) {

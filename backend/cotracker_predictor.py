@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import threading
 from pathlib import Path
+from typing import Callable
 
 import cv2
 import numpy as np
@@ -100,8 +101,9 @@ class CoTracker3Predictor:
         start_frame: int,
         num_next_frames: int,
         points_xy: np.ndarray,
+        on_progress: Callable[[np.ndarray, np.ndarray], None] | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Track N points from start through the next requested frames, chunking at 60."""
+        """Track N points, publishing cumulative results after every inferred chunk."""
         if num_next_frames < 1:
             raise ValueError("num_next_frames must be at least 1")
         points = np.asarray(points_xy, dtype=np.float32).reshape(-1, 2)
@@ -125,6 +127,8 @@ class CoTracker3Predictor:
                 chunk_visibility = visibility[0].detach().cpu().numpy().astype(bool)
                 all_tracks.extend(chunk_tracks[1:])
                 all_visibility.extend(chunk_visibility[1:])
+                if on_progress is not None:
+                    on_progress(np.asarray(all_tracks), np.asarray(all_visibility))
                 query_points = chunk_tracks[-1]
                 cursor += steps
                 remaining -= steps

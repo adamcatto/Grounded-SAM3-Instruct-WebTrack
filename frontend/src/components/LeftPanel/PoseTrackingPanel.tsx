@@ -60,11 +60,21 @@ export default function PoseTrackingPanel() {
     setPredicting(true)
     try {
       const result = await predictPose(project!.id, currentVideoId!, startFrame, nextFrames)
-      await refresh()
-      addToast(`Tracked ${result.points} pose parts through frame ${result.end_frame}`, 'success')
+      let status = result.status
+      let latest = await getProject(project!.id)
+      setProject(latest)
+      while (status === 'running') {
+        await new Promise(resolve => window.setTimeout(resolve, 750))
+        latest = await getProject(project!.id)
+        setProject(latest)
+        status = latest.videos[currentVideoId!]?.pose_tracking?.status ?? 'failed'
+      }
+      const tracking = latest.videos[currentVideoId!]?.pose_tracking
+      if (status === 'failed') throw new Error(tracking?.error ?? 'CoTracker3 pose prediction failed')
+      addToast(`Tracked ${result.points} pose parts through frame ${tracking?.end_frame}`, 'success')
     } catch (error: unknown) {
       const detail = (error as { response?: { data?: { detail?: string } } })?.response?.data?.detail
-      addToast(detail ?? 'CoTracker3 pose prediction failed', 'error')
+      addToast(detail ?? (error as Error)?.message ?? 'CoTracker3 pose prediction failed', 'error')
     } finally {
       setPredicting(false)
     }
