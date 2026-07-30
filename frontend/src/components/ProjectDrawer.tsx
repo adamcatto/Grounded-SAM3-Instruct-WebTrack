@@ -172,7 +172,12 @@ export default function ProjectDrawer() {
     if (!project) return
     setRegistrationBusy(true)
     try {
-      await computeRegistration(project.id)
+      await computeRegistration(
+        project.id,
+        project.registration?.warp_mode === 'affine_full_frame'
+          ? 'affine_full_frame'
+          : 'bounded_full_frame_mesh',
+      )
       const fresh = await getProject(project.id)
       setProject(fresh)
       addToast('Registration homographies generated', 'success')

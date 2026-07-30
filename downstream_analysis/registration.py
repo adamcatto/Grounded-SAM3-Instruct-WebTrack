@@ -168,7 +168,21 @@ def transform_xy(
 
 
 def _canvas_homography(registration: dict[str, Any]) -> np.ndarray:
-    matrix = np.asarray(registration["homography"], dtype=np.float64).reshape(3, 3)
+    if registration.get("warp_mode") == "affine_full_frame":
+        corners = np.asarray(registration["source_corners"], dtype=np.float64).reshape(4, 2)
+        size = max(2, int(registration["target_size"]))
+        target = np.asarray(
+            [[0, 0], [size - 1, 0], [size - 1, size - 1], [0, size - 1]],
+            dtype=np.float64,
+        )
+        coefficients = np.linalg.lstsq(
+            np.column_stack([corners, np.ones(4)]),
+            target,
+            rcond=None,
+        )[0]
+        matrix = np.vstack([coefficients.T, [0.0, 0.0, 1.0]])
+    else:
+        matrix = np.asarray(registration["homography"], dtype=np.float64).reshape(3, 3)
     dx, dy = (registration.get("canvas_offset") or [0.0, 0.0])[:2]
     translation = np.asarray(
         [[1.0, 0.0, float(dx)], [0.0, 1.0, float(dy)], [0.0, 0.0, 1.0]],

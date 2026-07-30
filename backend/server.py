@@ -39,8 +39,11 @@ from sam_predictor import SAMPredictor, _get_predictor
 from mask_store import VideoMaskStorage
 from registration_geometry import (
     EDGE_NAMES,
+    WARP_MODES,
+    affine_floor_homography,
     bounded_mesh_remap,
     canvas_homography,
+    expanded_affine_canvas,
     expanded_registration_canvas,
     fit_edge_registration,
 )
@@ -861,6 +864,10 @@ class RegistrationEdgesRequest(BaseModel):
     edges: dict[str, list[list[float]]]
 
 
+class RegistrationComputeRequest(BaseModel):
+    warp_mode: str = "bounded_full_frame_mesh"
+
+
 def _registration_dir(pid: str) -> Path:
     out = pm._project_dir(pid) / "registration"
     out.mkdir(parents=True, exist_ok=True)
@@ -1105,10 +1112,9 @@ def fit_registration_edges(pid: str, vid: str, req: RegistrationEdgesRequest):
     refreshed_registration = refreshed.get("registration") or {}
     refreshed_entries = refreshed_registration.get("videos") or {}
     if refreshed_entries and all(item.get("registered") for item in refreshed_entries.values()):
-        canvas = expanded_registration_canvas(
-            refreshed.get("videos") or {},
-            refreshed_entries,
-            target_size,
+        mode = refreshed_registration.get("warp_mode") or "bounded_full_frame_mesh"
+        canvas = _registration_canvas(
+            refreshed.get("videos") or {}, refreshed_entries, target_size, mode,
         )
         pm.update_project(pid, {"registration": {**refreshed_registration, **canvas}})
     return {"registration": entry, **fitted}
@@ -1292,8 +1298,21 @@ def redo_registration_morphology(pid: str, vid: str):
     return _registration_history_step(pid, vid, "redo")
 
 
+def _registration_canvas(
+    videos: dict[str, dict],
+    entries: dict[str, dict],
+    target_size: int,
+    warp_mode: str,
+) -> dict:
+    if warp_mode not in WARP_MODES:
+        raise HTTPException(422, f"warp_mode must be one of: {', '.join(WARP_MODES)}")
+    if warp_mode == "affine_full_frame":
+        return expanded_affine_canvas(videos, entries, target_size)
+    return expanded_registration_canvas(videos, entries, target_size)
+
+
 @app.post("/api/projects/{pid}/registration/compute")
-def compute_registration(pid: str):
+def compute_registration(pid: str, req: RegistrationComputeRequest = RegistrationComputeRequest()):
     project = pm.get_project(pid)
     if project is None:
         raise HTTPException(404, "Project not found")
@@ -1340,10 +1359,11 @@ def compute_registration(pid: str):
         )
     refreshed = pm.get_project(pid) or {}
     refreshed_registration = refreshed.get("registration") or {}
-    canvas = expanded_registration_canvas(
+    canvas = _registration_canvas(
         refreshed.get("videos") or {},
         refreshed_registration.get("videos") or {},
         size,
+        req.warp_mode,
     )
     pm.update_project(pid, {"registration": {**refreshed_registration, **canvas}})
     return {
@@ -1414,7 +1434,12 @@ def _render_registration_preview(pid: str, vid: str, frame_idx: int, view: str) 
                 borderValue=(0, 0, 0),
             )
         else:
-            matrix = canvas_homography(entry["homography"], registration.get("canvas_offset"))
+            homography = (
+                affine_floor_homography(entry["source_corners"], target_size)
+                if registration.get("warp_mode") == "affine_full_frame"
+                else np.asarray(entry["homography"], dtype=np.float64).reshape(3, 3)
+            )
+            matrix = canvas_homography(homography.tolist(), registration.get("canvas_offset"))
             output = cv2.warpPerspective(
                 output,
                 matrix,

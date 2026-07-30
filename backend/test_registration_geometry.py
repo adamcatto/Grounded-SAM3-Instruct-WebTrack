@@ -4,9 +4,11 @@ import cv2
 import numpy as np
 
 from registration_geometry import (
-    camera_matrix_for_size,
+    affine_floor_homography,
     bounded_mesh_points,
     bounded_mesh_remap,
+    camera_matrix_for_size,
+    expanded_affine_canvas,
     expanded_registration_canvas,
     fit_edge_registration,
 )
@@ -98,3 +100,21 @@ def test_bounded_mesh_supports_only_two_visible_inferred_corners() -> None:
     assert map_x.shape == (canvas["canvas_height"], canvas["canvas_width"])
     assert map_y.shape == map_x.shape
     assert int(np.count_nonzero(map_x >= 0)) > 9000
+
+
+def test_affine_canvas_contains_every_transformed_frame_corner() -> None:
+    videos = {"camera": {"width": 120, "height": 80}}
+    corners = np.asarray([[20, 10], [100, 20], [90, 70], [15, 60]], dtype=np.float64)
+    entries = {"camera": {"registered": True, "source_corners": corners.tolist()}}
+
+    canvas = expanded_affine_canvas(videos, entries, target_size=100)
+    matrix = affine_floor_homography(corners.tolist(), 100)
+    frame_corners = np.asarray([[0, 0], [119, 0], [119, 79], [0, 79]], dtype=np.float64)
+    transformed = cv2.perspectiveTransform(
+        frame_corners.reshape(-1, 1, 2), matrix,
+    ).reshape(-1, 2) + np.asarray(canvas["canvas_offset"])
+
+    assert canvas["warp_mode"] == "affine_full_frame"
+    assert float(transformed.min()) >= 0.0
+    assert float(transformed[:, 0].max()) <= canvas["canvas_width"] - 1
+    assert float(transformed[:, 1].max()) <= canvas["canvas_height"] - 1

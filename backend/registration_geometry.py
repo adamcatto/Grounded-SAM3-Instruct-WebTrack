@@ -8,6 +8,62 @@ from scipy.optimize import least_squares
 from scipy.spatial import Delaunay
 
 EDGE_NAMES = ("top", "right", "bottom", "left")
+WARP_MODES = ("bounded_full_frame_mesh", "affine_full_frame")
+
+
+def affine_floor_homography(source_corners: list[list[float]], target_size: int) -> np.ndarray:
+    """Least-squares affine map from the inferred floor quad toward a square."""
+    corners = np.asarray(source_corners, dtype=np.float64).reshape(4, 2)
+    size = max(2, int(target_size))
+    target = np.asarray(
+        [[0, 0], [size - 1, 0], [size - 1, size - 1], [0, size - 1]],
+        dtype=np.float64,
+    )
+    coefficients = np.linalg.lstsq(
+        np.column_stack([corners, np.ones(4)]),
+        target,
+        rcond=None,
+    )[0]
+    return np.vstack([coefficients.T, [0.0, 0.0, 1.0]])
+
+
+def expanded_affine_canvas(
+    videos: dict[str, dict],
+    entries: dict[str, dict],
+    target_size: int,
+    boundary_samples: int = 65,
+) -> dict:
+    """Return shared bounds for finite, whole-frame affine registration."""
+    transformed_boundaries: list[np.ndarray] = []
+    samples = max(2, int(boundary_samples))
+    for vid, video in videos.items():
+        entry = entries.get(vid) or {}
+        if not entry.get("registered") or not entry.get("source_corners"):
+            continue
+        width = max(2, int(video.get("width") or 1))
+        height = max(2, int(video.get("height") or 1))
+        x = np.linspace(0.0, width - 1.0, samples)
+        y = np.linspace(0.0, height - 1.0, samples)
+        boundary = np.concatenate(
+            [
+                np.column_stack([x, np.zeros_like(x)]),
+                np.column_stack([np.full_like(y, width - 1.0), y]),
+                np.column_stack([x[::-1], np.full_like(x, height - 1.0)]),
+                np.column_stack([np.zeros_like(y), y[::-1]]),
+            ],
+        )
+        # cv2.undistort returns onto the original rectangular pixel grid, so
+        # these are also the bounds of the lens-corrected image passed to warp.
+        matrix = affine_floor_homography(entry["source_corners"], target_size)
+        transformed_boundaries.append(
+            cv2.perspectiveTransform(boundary.reshape(-1, 1, 2), matrix).reshape(-1, 2)
+        )
+    return _canvas_from_points(
+        transformed_boundaries,
+        target_size,
+        "affine_full_frame",
+        "affine_full_frame_floor_least_squares",
+    )
 
 
 def bounded_mesh_points(
@@ -103,17 +159,30 @@ def expanded_registration_canvas(
         _validated_mesh_triangles(source, destination, vid)
         transformed_boundaries.append(destination)
 
+    return _canvas_from_points(
+        transformed_boundaries,
+        target_size,
+        "bounded_full_frame_mesh",
+        "bounded_full_frame_mesh_with_floor_homography",
+    )
+
+
+def _canvas_from_points(
+    transformed_boundaries: list[np.ndarray],
+    target_size: int,
+    warp_mode: str,
+    method: str,
+) -> dict:
     if not transformed_boundaries:
         size = max(2, int(target_size))
         return {
             "version": 2,
-            "method": "bounded_full_frame_mesh_with_floor_homography",
+            "method": method,
             "canvas_width": size,
             "canvas_height": size,
             "canvas_offset": [0.0, 0.0],
-            "warp_mode": "bounded_full_frame_mesh",
+            "warp_mode": warp_mode,
         }
-
     all_points = np.concatenate(transformed_boundaries)
     floor_max = float(max(2, int(target_size)) - 1)
     minimum = np.minimum(np.floor(all_points.min(axis=0)), [0.0, 0.0])
@@ -127,11 +196,11 @@ def expanded_registration_canvas(
         )
     return {
         "version": 2,
-        "method": "bounded_full_frame_mesh_with_floor_homography",
+        "method": method,
         "canvas_width": int(width),
         "canvas_height": int(height),
         "canvas_offset": [float(-minimum[0]), float(-minimum[1])],
-        "warp_mode": "bounded_full_frame_mesh",
+        "warp_mode": warp_mode,
     }
 
 

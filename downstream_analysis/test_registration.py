@@ -74,6 +74,29 @@ def test_bounded_full_frame_mesh_keeps_source_boundary_and_floor_coordinates() -
     np.testing.assert_allclose(floor, target + [4, 4], atol=1e-4)
 
 
+def test_affine_full_frame_mask_and_points_share_the_same_transform() -> None:
+    corners = np.asarray([[2, 2], [17, 2], [17, 17], [2, 17]], dtype=np.float32)
+    registration = {
+        "homography": np.eye(3).tolist(),
+        "source_corners": corners.tolist(),
+        "source_width": 20,
+        "source_height": 20,
+        "target_size": 16,
+        "canvas_width": 24,
+        "canvas_height": 24,
+        "canvas_offset": [4, 4],
+        "warp_mode": "affine_full_frame",
+    }
+    mask = np.zeros((20, 20), dtype=np.uint8)
+    mask[2, 2] = 1
+
+    warped = warp_mask(mask, registration)
+    point = transform_xy(np.asarray([[2.0, 2.0]]), registration)
+
+    np.testing.assert_allclose(point, [[4.0, 4.0]], atol=1e-4)
+    assert warped[4, 4]
+
+
 def test_unregistered_mask_is_unchanged() -> None:
     mask = np.asarray([[0, 1], [1, 0]], dtype=np.uint8)
     np.testing.assert_array_equal(warp_mask(mask, None), mask)

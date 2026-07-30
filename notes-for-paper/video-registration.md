@@ -91,17 +91,22 @@ every displayed recording. This view makes residual scale, orientation,
 cropping, and lens-correction differences apparent without altering project
 data.
 
-Registered previews and downstream masks use a bounded full-frame mesh rather
-than applying the planar homography infinitely beyond the floor. The warp is
-exactly projective within the inferred floor quadrilateral, then transitions
-smoothly toward a finite affine mapping near the outer image boundary. This
-preserves the entire camera frame—even when a projective horizon crosses the
-image—while retaining the shared square floor coordinate system. A single
-project-level canvas bound and offset are computed across every camera, so all
-registered outputs have identical dimensions and floor origin. The four floor
-corners may be extrapolated from sampled edge lines; therefore the method does
-not require every corner to be directly visible, although accuracy depends on
-having enough visible edge structure to estimate those lines.
+At parameter generation time, the user chooses one of two full-frame
+registration transforms. **Nonlinear · exact square floor** uses a bounded
+full-frame mesh: the warp is exactly projective within the inferred floor
+quadrilateral, then transitions smoothly toward a finite affine mapping near
+the outer image boundary. **Affine · entire frame, approximate floor** applies
+one least-squares rotation/shear/scale transform to the complete frame; it
+cannot remove all perspective, so the floor may remain slightly trapezoidal,
+but it introduces no nonlinear bending. Both choices preserve the complete
+camera image and compute a single project-level canvas bound and offset across
+every camera, giving all registered outputs identical dimensions and floor
+origin. The selected mode is persisted and is used consistently for previews,
+downstream masks, and transformed coordinates.
+
+The four floor corners may be extrapolated from sampled edge lines; therefore
+neither mode requires every corner to be directly visible, although accuracy
+depends on having enough visible edge structure to estimate those lines.
 
 ## Mathematical transform
 

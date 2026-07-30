@@ -44,6 +44,11 @@ export default function RegistrationPanel() {
   const [morphologyOperation, setMorphologyOperation] = useState<'opening' | 'closing'>('opening')
   const [kernelSize, setKernelSize] = useState(5)
   const [previewOpen, setPreviewOpen] = useState(false)
+  const [warpMode, setWarpMode] = useState<'bounded_full_frame_mesh' | 'affine_full_frame'>(
+    project?.registration?.warp_mode === 'affine_full_frame'
+      ? 'affine_full_frame'
+      : 'bounded_full_frame_mesh',
+  )
 
   const videos = useMemo(
     () => project ? Object.values(project.videos) : [],
@@ -98,15 +103,28 @@ export default function RegistrationPanel() {
     return () => { cancelled = true }
   }, [project?.id, currentVideoId, entry?.labeled, setCurrentFrameMasks, setSavedMask])
 
+  useEffect(() => {
+    setWarpMode(
+      project?.registration?.warp_mode === 'affine_full_frame'
+        ? 'affine_full_frame'
+        : 'bounded_full_frame_mesh',
+    )
+  }, [project?.id])
+
   if (!project || !video || !registration) return null
 
   async function generate() {
     setComputing(true)
     try {
-      await computeRegistration(project!.id)
+      await computeRegistration(project!.id, warpMode)
       const fresh = await getProject(project!.id)
       setProject(fresh)
-      addToast('Registration homographies generated', 'success')
+      addToast(
+        warpMode === 'affine_full_frame'
+          ? 'Whole-frame affine registration generated'
+          : 'Nonlinear exact-floor registration generated',
+        'success',
+      )
     } catch (e: unknown) {
       const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
       addToast(detail || 'Could not generate registration parameters', 'error')
@@ -486,6 +504,23 @@ export default function RegistrationPanel() {
             View all cameras
           </button>
         </div>
+
+        <label className="block text-xs text-[#aaa]">
+          Registration transform
+          <select
+            value={warpMode}
+            onChange={event => setWarpMode(event.target.value as typeof warpMode)}
+            className="mt-1 w-full rounded-md border border-[#444] bg-[#e5e7eb] px-2 py-2 text-xs text-[#111827]"
+          >
+            <option value="bounded_full_frame_mesh">Nonlinear · exact square floor</option>
+            <option value="affine_full_frame">Affine · entire frame, approximate floor</option>
+          </select>
+          <span className="mt-1 block text-[10px] leading-4 text-[#777]">
+            {warpMode === 'affine_full_frame'
+              ? 'Preserves every pixel with rotation/shear; perspective may leave the floor trapezoidal.'
+              : 'Makes the floor exactly square and smoothly bends the surrounding frame.'}
+          </span>
+        </label>
 
         <button
           type="button"

@@ -138,8 +138,11 @@ export const addRegistrationPoints = (
     }
   }>(`/projects/${pid}/registration/videos/${vid}/points`, { points, labels }).then(r => r.data)
 
-export const computeRegistration = (pid: string) =>
-  api.post(`/projects/${pid}/registration/compute`).then(r => r.data)
+export const computeRegistration = (
+  pid: string,
+  warpMode: 'bounded_full_frame_mesh' | 'affine_full_frame',
+) =>
+  api.post(`/projects/${pid}/registration/compute`, { warp_mode: warpMode }).then(r => r.data)
 
 export const getRegistrationMask = (pid: string, vid: string) =>
   api.get<{ mask: string | null; registration: import('../types').VideoRegistration }>(

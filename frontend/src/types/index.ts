@@ -111,7 +111,7 @@ export interface ProjectRegistration {
   canvas_width?: number | null
   canvas_height?: number | null
   canvas_offset?: [number, number] | null
-  warp_mode?: 'bounded_full_frame_mesh' | null
+  warp_mode?: 'bounded_full_frame_mesh' | 'affine_full_frame' | null
   status: 'labeling' | 'complete'
   videos: Record<string, VideoRegistration>
 }
