@@ -91,6 +91,18 @@ every displayed recording. This view makes residual scale, orientation,
 cropping, and lens-correction differences apparent without altering project
 data.
 
+Registered previews and downstream masks use a bounded full-frame mesh rather
+than applying the planar homography infinitely beyond the floor. The warp is
+exactly projective within the inferred floor quadrilateral, then transitions
+smoothly toward a finite affine mapping near the outer image boundary. This
+preserves the entire camera frame—even when a projective horizon crosses the
+image—while retaining the shared square floor coordinate system. A single
+project-level canvas bound and offset are computed across every camera, so all
+registered outputs have identical dimensions and floor origin. The four floor
+corners may be extrapolated from sampled edge lines; therefore the method does
+not require every corner to be directly visible, although accuracy depends on
+having enough visible edge structure to estimate those lines.
+
 ## Mathematical transform
 
 Although the visual distortion can look like shear, an oblique camera view of a

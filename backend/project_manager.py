@@ -358,10 +358,14 @@ class ProjectManager:
                 "straightness_rms_pixels": old.get("straightness_rms_pixels"),
             }
         registration = {
-            "version": 1,
+            "version": 2,
             "method": "floor_mask_quadrilateral_to_square_homography",
             "orientation_policy": "unspecified_dihedral_rotation_reflection_invariant_analysis",
             "target_size": max(2, int(target_size)),
+            "canvas_width": previous.get("canvas_width"),
+            "canvas_height": previous.get("canvas_height"),
+            "canvas_offset": previous.get("canvas_offset"),
+            "warp_mode": previous.get("warp_mode"),
             "status": "complete" if videos and all(v["registered"] for v in videos.values()) else "labeling",
             "videos": videos,
         }

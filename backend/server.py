@@ -37,7 +37,13 @@ from anchor_helpers import (
 from project_manager import ProjectManager
 from sam_predictor import SAMPredictor, _get_predictor
 from mask_store import VideoMaskStorage
-from registration_geometry import EDGE_NAMES, fit_edge_registration
+from registration_geometry import (
+    EDGE_NAMES,
+    bounded_mesh_remap,
+    canvas_homography,
+    expanded_registration_canvas,
+    fit_edge_registration,
+)
 import display_cache as dc
 from video_processor import (
     compute_ds_dims,
@@ -1095,6 +1101,16 @@ def fit_registration_edges(pid: str, vid: str, req: RegistrationEdgesRequest):
             "registered": True,
         },
     )
+    refreshed = pm.get_project(pid) or {}
+    refreshed_registration = refreshed.get("registration") or {}
+    refreshed_entries = refreshed_registration.get("videos") or {}
+    if refreshed_entries and all(item.get("registered") for item in refreshed_entries.values()):
+        canvas = expanded_registration_canvas(
+            refreshed.get("videos") or {},
+            refreshed_entries,
+            target_size,
+        )
+        pm.update_project(pid, {"registration": {**refreshed_registration, **canvas}})
     return {"registration": entry, **fitted}
 
 
@@ -1322,9 +1338,18 @@ def compute_registration(pid: str):
                 "registered": True,
             },
         )
+    refreshed = pm.get_project(pid) or {}
+    refreshed_registration = refreshed.get("registration") or {}
+    canvas = expanded_registration_canvas(
+        refreshed.get("videos") or {},
+        refreshed_registration.get("videos") or {},
+        size,
+    )
+    pm.update_project(pid, {"registration": {**refreshed_registration, **canvas}})
     return {
         "status": "complete",
         "target_size": size,
+        **canvas,
         "videos": results,
     }
 
@@ -1366,16 +1391,38 @@ def _render_registration_preview(pid: str, vid: str, frame_idx: int, view: str) 
             camera = np.asarray(entry["camera_matrix"], dtype=np.float64).reshape(3, 3)
             distortion = np.asarray(entry["distortion_coefficients"], dtype=np.float64)
             output = cv2.undistort(output, camera, distortion, None, camera)
-        matrix = np.asarray(entry["homography"], dtype=np.float64).reshape(3, 3)
-        target_size = max(2, int((project.get("registration") or {}).get("target_size") or 1000))
-        output = cv2.warpPerspective(
-            output,
-            matrix,
-            (target_size, target_size),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=(0, 0, 0),
-        )
+        registration = project.get("registration") or {}
+        target_size = max(2, int(registration.get("target_size") or 1000))
+        canvas_width = max(2, int(registration.get("canvas_width") or target_size))
+        canvas_height = max(2, int(registration.get("canvas_height") or target_size))
+        if registration.get("warp_mode") == "bounded_full_frame_mesh":
+            map_x, map_y = _cached_registration_mesh_maps(
+                width,
+                height,
+                json.dumps(entry, sort_keys=True, separators=(",", ":")),
+                target_size,
+                canvas_width,
+                canvas_height,
+                json.dumps(registration.get("canvas_offset") or [0.0, 0.0]),
+            )
+            output = cv2.remap(
+                output,
+                map_x,
+                map_y,
+                interpolation=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=(0, 0, 0),
+            )
+        else:
+            matrix = canvas_homography(entry["homography"], registration.get("canvas_offset"))
+            output = cv2.warpPerspective(
+                output,
+                matrix,
+                (canvas_width, canvas_height),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=(0, 0, 0),
+            )
     ok, encoded = cv2.imencode(".jpg", output, [cv2.IMWRITE_JPEG_QUALITY, 92])
     if not ok:
         raise HTTPException(500, "Could not encode preview")
@@ -1387,6 +1434,27 @@ def _render_registration_preview(pid: str, vid: str, frame_idx: int, view: str) 
             "X-Frame-Index": str(frame_idx),
             "X-Registration-View": view,
         },
+    )
+
+
+@functools.lru_cache(maxsize=8)
+def _cached_registration_mesh_maps(
+    width: int,
+    height: int,
+    entry_json: str,
+    target_size: int,
+    canvas_width: int,
+    canvas_height: int,
+    offset_json: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    return bounded_mesh_remap(
+        width,
+        height,
+        json.loads(entry_json),
+        target_size,
+        canvas_width,
+        canvas_height,
+        json.loads(offset_json),
     )
 
 
