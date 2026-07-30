@@ -1,6 +1,6 @@
-import React, { useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useState } from 'react'
 import { ChevronDown, ChevronRight, Loader, Plus, Sparkles } from 'lucide-react'
-import { addPoseObject, addPosePart, getProject, predictPose } from '../../api/client'
+import { addPoseObject, addPosePart, getProject, predictPose, updateVideoMeta } from '../../api/client'
 import { useStore, currentVideo as selectCurrentVideo } from '../../store/useStore'
 import { OBJECT_COLORS } from '../../utils/colors'
 
@@ -9,15 +9,31 @@ export default function PoseTrackingPanel() {
   const video = selectCurrentVideo(store)
   const {
     project, currentVideoId, currentFrame, currentPoseObjectId, currentPosePartId,
-    setCurrentPosePart, setProject, addToast,
+    setCurrentPosePart, setProject, addToast, setCurrentFrame,
+    setPropagationStartFrame, updateVideo,
   } = store
   const [newObject, setNewObject] = useState('')
   const [partDrafts, setPartDrafts] = useState<Record<string, string>>({})
   const [expanded, setExpanded] = useState<Record<string, boolean>>({})
   const [nextFrames, setNextFrames] = useState(30)
+  const [startFrame, setStartFrame] = useState(video?.start_frame ?? 0)
   const [predicting, setPredicting] = useState(false)
   const objects = useMemo(() => Object.values(video?.pose_objects ?? {}), [video?.pose_objects])
+
+  useEffect(() => {
+    setStartFrame(video?.start_frame ?? 0)
+  }, [video?.id, video?.start_frame])
+
   if (!project || !video || !currentVideoId) return null
+
+  async function commitStartFrame() {
+    const frame = Math.max(0, Math.min(video!.num_frames - 2, Math.round(startFrame)))
+    setStartFrame(frame)
+    await updateVideoMeta(project!.id, currentVideoId!, { start_frame: frame })
+    updateVideo({ start_frame: frame })
+    setPropagationStartFrame(frame)
+    setCurrentFrame(frame)
+  }
 
   async function refresh() {
     setProject(await getProject(project!.id))
@@ -43,7 +59,7 @@ export default function PoseTrackingPanel() {
   async function runPrediction() {
     setPredicting(true)
     try {
-      const result = await predictPose(project!.id, currentVideoId!, currentFrame, nextFrames)
+      const result = await predictPose(project!.id, currentVideoId!, startFrame, nextFrames)
       await refresh()
       addToast(`Tracked ${result.points} pose parts through frame ${result.end_frame}`, 'success')
     } catch (error: unknown) {
@@ -59,9 +75,34 @@ export default function PoseTrackingPanel() {
       <div className="mb-3">
         <h2 className="font-semibold text-white">Pose tracking</h2>
         <p className="mt-1 text-xs text-[#777]">
-          Frame {currentFrame} is the query frame. Select a part, then click its location once.
+          Frame {startFrame} is the query frame. Select a part, then click its location once.
         </p>
       </div>
+
+      <label className="mb-3 block text-xs text-[#aaa]">
+        Start frame
+        <div className="mt-1 flex gap-2">
+          <input
+            type="number"
+            min={0}
+            max={Math.max(0, video.num_frames - 2)}
+            value={startFrame}
+            onChange={event => setStartFrame(Math.max(0, Number(event.target.value)))}
+            onKeyDown={event => { if (event.key === 'Enter') void commitStartFrame() }}
+            onBlur={() => void commitStartFrame()}
+            disabled={predicting}
+            className="min-w-0 flex-1 rounded border border-[#333] bg-[#1a1a1a] px-2 py-1.5 text-xs text-[#ddd]"
+          />
+          <button
+            type="button"
+            onClick={() => void commitStartFrame()}
+            disabled={predicting}
+            className="btn btn-secondary px-3 text-xs"
+          >
+            Go
+          </button>
+        </div>
+      </label>
 
       <div className="mb-3 flex gap-2">
         <input
@@ -95,7 +136,7 @@ export default function PoseTrackingPanel() {
               {isOpen && (
                 <div className="space-y-1 border-t border-[#292929] p-2">
                   {parts.map(part => {
-                    const annotation = video.pose_annotations?.[object.id]?.[part.id]?.[String(currentFrame)]
+                    const annotation = video.pose_annotations?.[object.id]?.[part.id]?.[String(startFrame)]
                     const selected = currentPoseObjectId === object.id && currentPosePartId === part.id
                     return (
                       <button
@@ -139,7 +180,7 @@ export default function PoseTrackingPanel() {
           <input
             type="number"
             min={1}
-            max={Math.max(1, video.num_frames - currentFrame - 1)}
+            max={Math.max(1, video.num_frames - startFrame - 1)}
             value={nextFrames}
             onChange={event => setNextFrames(Math.max(1, Number(event.target.value)))}
             className="mt-1 w-full rounded border border-[#444] bg-[#e5e7eb] px-2 py-1.5 text-[#111827]"
@@ -152,7 +193,7 @@ export default function PoseTrackingPanel() {
           className="flex w-full items-center justify-center gap-2 rounded bg-violet-600 py-2 font-medium text-white hover:bg-violet-500 disabled:bg-[#333] disabled:text-[#666]"
         >
           {predicting ? <Loader size={14} className="animate-spin" /> : <Sparkles size={14} />}
-          {predicting ? 'Running CoTracker3…' : `Predict from frame ${currentFrame}`}
+          {predicting ? 'Running CoTracker3…' : `Predict from frame ${startFrame}`}
         </button>
       </div>
     </div>

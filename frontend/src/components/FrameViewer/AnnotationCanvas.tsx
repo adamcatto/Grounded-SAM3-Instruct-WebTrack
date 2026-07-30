@@ -271,6 +271,11 @@ export default function AnnotationCanvas({ width, height, scrubbing = false }: P
     const ny = Math.max(0, Math.min(1, py / height))
     if (poseMode) {
       if (!currentPoseObjectId || !currentPosePartId) return
+      const queryFrame = video.start_frame ?? 0
+      if (frameToUse !== queryFrame) {
+        addToast(`Pose labels must be placed on start frame ${queryFrame}`, 'info')
+        return
+      }
       try {
         await setPoseAnnotation(
           pid, vid, currentPoseObjectId, currentPosePartId, frameToUse, nx, ny,
