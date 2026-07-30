@@ -25,6 +25,7 @@ def test_pose_hierarchy_and_query_annotation_persist(tmp_path: Path) -> None:
     assert project["tracking_mode"] == "pose_tracking"
     assert saved["pose_objects"][obj["id"]]["parts"][part["id"]]["name"] == "snout"
     assert saved["pose_annotations"][obj["id"]][part["id"]]["17"] == {
+        "visible": True,
         "x": 0.25,
         "y": 0.75,
     }
