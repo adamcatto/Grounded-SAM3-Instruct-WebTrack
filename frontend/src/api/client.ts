@@ -86,6 +86,9 @@ export const getPoseTracks = (pid: string, vid: string, frameIdx: number) =>
 
 export const getPoseModelStatus = () => api.get('/pose/model').then(r => r.data)
 
+export const cachePoseMemory = (pid: string, vid: string, frameIdx: number) =>
+  api.post(`/projects/${pid}/videos/${vid}/pose/memory/${frameIdx}`).then(r => r.data)
+
 export const mergeProjects = (
   name: string,
   leftProjectId: string,

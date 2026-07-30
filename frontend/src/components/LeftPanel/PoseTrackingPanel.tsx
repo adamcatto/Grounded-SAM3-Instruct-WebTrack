@@ -1,8 +1,9 @@
 import React, { useEffect, useMemo, useState } from 'react'
-import { ChevronDown, ChevronRight, Loader, Plus, Sparkles } from 'lucide-react'
-import { addPoseObject, addPosePart, getProject, predictPose, updateVideoMeta } from '../../api/client'
+import { ChevronDown, ChevronLeft, ChevronRight, Loader, Plus, Sparkles } from 'lucide-react'
+import { addPoseObject, addPosePart, cachePoseMemory, getProject, predictPose, updateVideoMeta } from '../../api/client'
 import { useStore, currentVideo as selectCurrentVideo } from '../../store/useStore'
 import { OBJECT_COLORS } from '../../utils/colors'
+import { computeAnchorFrames, normalizeAnchorBatchSize } from '../../utils/anchorFrames'
 
 export default function PoseTrackingPanel() {
   const store = useStore()
@@ -18,10 +19,26 @@ export default function PoseTrackingPanel() {
   const [nextFrames, setNextFrames] = useState(30)
   const [startFrame, setStartFrame] = useState(video?.start_frame ?? 0)
   const [predicting, setPredicting] = useState(false)
+  const [anchorLabeling, setAnchorLabeling] = useState(false)
+  const [anchorSpacing, setAnchorSpacing] = useState(video?.anchor_batch_size ?? 1000)
   const objects = useMemo(() => Object.values(video?.pose_objects ?? {}), [video?.pose_objects])
+  const anchorFrames = useMemo(
+    () => computeAnchorFrames(video?.start_frame ?? 0, video?.num_frames ?? 1, normalizeAnchorBatchSize(anchorSpacing)),
+    [video?.start_frame, video?.num_frames, anchorSpacing],
+  )
+  const currentAnchorIndex = anchorFrames.indexOf(currentFrame)
+  const poseParts = useMemo(
+    () => objects.flatMap(object => Object.values(object.parts ?? {}).map(part => [object.id, part.id] as const)),
+    [objects],
+  )
+  const anchorComplete = (frame: number) => poseParts.length > 0 && poseParts.every(
+    ([oid, partId]) => Boolean(video?.pose_annotations?.[oid]?.[partId]?.[String(frame)]),
+  )
+  const anchorCached = (frame: number) => (video?.pose_memory_frames ?? []).includes(frame)
 
   useEffect(() => {
     setStartFrame(video?.start_frame ?? 0)
+    setAnchorSpacing(video?.anchor_batch_size ?? 1000)
   }, [video?.id, video?.start_frame])
 
   if (!project || !video || !currentVideoId) return null
@@ -80,13 +97,100 @@ export default function PoseTrackingPanel() {
     }
   }
 
+  async function beginAnchorLabeling() {
+    const spacing = normalizeAnchorBatchSize(anchorSpacing)
+    setAnchorSpacing(spacing)
+    await updateVideoMeta(project!.id, currentVideoId!, { anchor_batch_size: spacing })
+    updateVideo({ anchor_batch_size: spacing })
+    setAnchorLabeling(true)
+    setCurrentFrame(anchorFrames.find(frame => !anchorCached(frame)) ?? anchorFrames[0])
+  }
+
+  async function commitAnchorAndAdvance() {
+    if (currentAnchorIndex < 0 || !anchorComplete(currentFrame)) {
+      addToast('Label every pose part on this anchor frame first', 'info')
+      return
+    }
+    try {
+      await cachePoseMemory(project!.id, currentVideoId!, currentFrame)
+      updateVideo({ pose_memory_frames: [...new Set([...(video!.pose_memory_frames ?? []), currentFrame])].sort((a, b) => a - b) })
+      const next = anchorFrames.slice(currentAnchorIndex + 1).find(frame => !anchorCached(frame))
+      if (next === undefined) {
+        setAnchorLabeling(false)
+        addToast('All pose anchor features are cached', 'success')
+      } else {
+        setCurrentFrame(next)
+      }
+    } catch (error: unknown) {
+      const detail = (error as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+      addToast(detail ?? 'Could not cache this pose anchor', 'error')
+    }
+  }
+
   return (
     <div className="flex h-full flex-col overflow-y-auto p-3 text-sm">
       <div className="mb-3">
         <h2 className="font-semibold text-white">Pose tracking</h2>
         <p className="mt-1 text-xs text-[#777]">
-          Frame {startFrame} is the query frame. Select a part, then click its location once.
+          Label pose anchors, then choose any query frame and predict forward.
         </p>
+      </div>
+
+      <div className="mb-3 rounded-lg border border-[#303030] bg-[#181818] p-2.5">
+        <div className="mb-2 text-xs font-medium text-white">Pose anchor frames</div>
+        <label className="block text-[11px] text-[#aaa]">
+          Anchor spacing
+          <input
+            type="number"
+            min={10}
+            max={10000}
+            value={anchorSpacing}
+            disabled={anchorLabeling || predicting}
+            onChange={event => setAnchorSpacing(Math.max(10, Number(event.target.value)))}
+            className="mt-1 w-full rounded border border-[#444] bg-[#e5e7eb] px-2 py-1.5 text-[#111827]"
+          />
+        </label>
+        {!anchorLabeling ? (
+          <button
+            type="button"
+            disabled={predicting || poseParts.length === 0}
+            onClick={() => void beginAnchorLabeling()}
+            className="btn btn-secondary mt-2 w-full text-xs"
+          >
+            Label pose anchors ({anchorFrames.filter(anchorCached).length}/{anchorFrames.length} cached)
+          </button>
+        ) : (
+          <div className="mt-2 space-y-2">
+            <div className="text-[11px] text-sky-200">
+              Anchor {Math.max(1, currentAnchorIndex + 1)}/{anchorFrames.length} · frame {currentFrame}
+            </div>
+            <div className="flex gap-1">
+              <button
+                type="button"
+                disabled={currentAnchorIndex <= 0}
+                onClick={() => setCurrentFrame(anchorFrames[currentAnchorIndex - 1])}
+                className="btn btn-ghost px-2"
+              >
+                <ChevronLeft size={14} />
+              </button>
+              <button
+                type="button"
+                onClick={() => void commitAnchorAndAdvance()}
+                className="btn btn-secondary min-w-0 flex-1 text-xs"
+              >
+                Cache features & next
+              </button>
+              <button
+                type="button"
+                disabled={currentAnchorIndex < 0 || currentAnchorIndex >= anchorFrames.length - 1}
+                onClick={() => setCurrentFrame(anchorFrames[currentAnchorIndex + 1])}
+                className="btn btn-ghost px-2"
+              >
+                <ChevronRight size={14} />
+              </button>
+            </div>
+          </div>
+        )}
       </div>
 
       <label className="mb-3 block text-xs text-[#aaa]">
@@ -146,7 +250,7 @@ export default function PoseTrackingPanel() {
               {isOpen && (
                 <div className="space-y-1 border-t border-[#292929] p-2">
                   {parts.map(part => {
-                    const annotation = video.pose_annotations?.[object.id]?.[part.id]?.[String(startFrame)]
+                    const annotation = video.pose_annotations?.[object.id]?.[part.id]?.[String(currentFrame)]
                     const selected = currentPoseObjectId === object.id && currentPosePartId === part.id
                     return (
                       <button

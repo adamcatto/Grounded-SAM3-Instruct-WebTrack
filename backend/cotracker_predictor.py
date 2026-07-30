@@ -10,6 +10,7 @@ from typing import Callable
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 MODEL_REPO = "facebook/cotracker3"
 MODEL_FILE = "scaled_offline.pth"
@@ -75,6 +76,57 @@ class CoTracker3Predictor:
             "loaded": self.loaded,
             "device": self.device,
         }
+
+    def extract_feature_map(self, source_path: str, frame_idx: int) -> np.ndarray:
+        """Extract the normalized CoTracker convolutional map for one video frame."""
+        model = self.ensure_loaded()
+        capture = cv2.VideoCapture(source_path)
+        capture.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
+        ok, frame = capture.read()
+        capture.release()
+        if not ok:
+            raise RuntimeError(f"Could not decode frame {frame_idx}")
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        tensor = torch.from_numpy(rgb).permute(2, 0, 1)[None].float().to(self._device)
+        tensor = F.interpolate(
+            tensor, tuple(model.interp_shape), mode="bilinear", align_corners=True,
+        )
+        tensor = 2 * (tensor / 255.0) - 1.0
+        with self._lock, torch.inference_mode():
+            features = model.model.fnet(tensor)
+            features = F.normalize(features.float(), dim=1)
+        return features[0].detach().cpu().numpy().astype(np.float16)
+
+    @staticmethod
+    def correlate_memories(
+        target_features: np.ndarray,
+        memories: list[tuple[np.ndarray, np.ndarray, float]],
+    ) -> np.ndarray:
+        """Locate points in a target feature map using weighted memory descriptors.
+
+        Each memory tuple contains (feature_map[C,H,W], normalized_xy[N,2], weight).
+        """
+        target = np.asarray(target_features, dtype=np.float32)
+        _, height, width = target.shape
+        count = len(memories[0][1])
+        scores = np.zeros((count, height, width), dtype=np.float32)
+        weight_sum = 0.0
+        for feature_map, points, weight in memories:
+            fmap = np.asarray(feature_map, dtype=np.float32)
+            xs = np.clip(np.rint(points[:, 0] * (fmap.shape[2] - 1)), 0, fmap.shape[2] - 1).astype(int)
+            ys = np.clip(np.rint(points[:, 1] * (fmap.shape[1] - 1)), 0, fmap.shape[1] - 1).astype(int)
+            descriptors = fmap[:, ys, xs].T
+            descriptors /= np.maximum(np.linalg.norm(descriptors, axis=1, keepdims=True), 1e-8)
+            scores += float(weight) * np.einsum("nc,chw->nhw", descriptors, target)
+            weight_sum += float(weight)
+        if weight_sum <= 0:
+            raise ValueError("At least one positive memory weight is required")
+        flat = scores.reshape(count, -1).argmax(axis=1)
+        y, x = np.divmod(flat, width)
+        return np.column_stack([
+            x.astype(np.float32) / max(1, width - 1),
+            y.astype(np.float32) / max(1, height - 1),
+        ])
 
     @staticmethod
     def _read_clip(source_path: str, start_frame: int, end_frame: int) -> np.ndarray:

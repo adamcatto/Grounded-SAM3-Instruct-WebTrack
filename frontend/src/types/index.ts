@@ -67,6 +67,7 @@ export interface VideoMeta {
   }
   pose_objects?: Record<string, PoseObject>
   pose_annotations?: Record<string, Record<string, Record<string, PosePoint>>>
+  pose_memory_frames?: number[]
   pose_tracking?: {
     status?: 'none' | 'running' | 'complete' | 'failed'
     start_frame?: number | null

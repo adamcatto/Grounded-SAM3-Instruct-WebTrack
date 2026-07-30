@@ -2479,6 +2479,49 @@ def _pose_tracks_path(pid: str, vid: str) -> Path:
     return pm.video_dir(pid, vid) / "pose_tracks.json"
 
 
+def _pose_feature_path(pid: str, vid: str, frame_idx: int) -> Path:
+    directory = pm.video_dir(pid, vid) / "pose_feature_cache"
+    directory.mkdir(exist_ok=True)
+    return directory / f"{frame_idx:08d}.npy"
+
+
+def _cached_pose_features(pid: str, vid: str, source_path: str, frame_idx: int) -> np.ndarray:
+    path = _pose_feature_path(pid, vid, frame_idx)
+    if not path.is_file():
+        features = cotracker3.extract_feature_map(source_path, frame_idx)
+        fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.tmp.")
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                np.save(handle, features, allow_pickle=False)
+            os.replace(tmp_name, path)
+        finally:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+    return np.load(path, allow_pickle=False)
+
+
+@app.post("/api/projects/{pid}/videos/{vid}/pose/memory/{frame_idx}")
+def cache_pose_memory(pid: str, vid: str, frame_idx: int):
+    video = pm.get_video(pid, vid)
+    if video is None:
+        raise HTTPException(404, "Video not found")
+    total = int(video.get("num_frames") or 1)
+    if frame_idx < 0 or frame_idx >= total:
+        raise HTTPException(422, "Frame is outside the video")
+    missing = []
+    for oid, obj in (video.get("pose_objects") or {}).items():
+        for part_id, part in (obj.get("parts") or {}).items():
+            if not (video.get("pose_annotations") or {}).get(oid, {}).get(part_id, {}).get(str(frame_idx)):
+                missing.append(f"{obj.get('name', oid)} / {part.get('name', part_id)}")
+    if missing:
+        raise HTTPException(409, f"Label every pose part on frame {frame_idx}: {', '.join(missing)}")
+    path = _pose_feature_path(pid, vid, frame_idx)
+    _cached_pose_features(pid, vid, str(video.get("source_path") or ""), frame_idx)
+    memory_frames = sorted({int(frame) for frame in video.get("pose_memory_frames") or []} | {frame_idx})
+    pm.update_video(pid, vid, {"pose_memory_frames": memory_frames})
+    return {"frame_idx": frame_idx, "cached": True, "feature_file": path.name}
+
+
 @app.get("/api/projects/{pid}/videos/{vid}/pose/tracks/{frame_idx}")
 def get_pose_tracks(pid: str, vid: str, frame_idx: int):
     path = _pose_tracks_path(pid, vid)
@@ -2515,12 +2558,16 @@ def predict_pose(pid: str, vid: str, req: PosePredictionRequest, background_task
         for part_id, part in (obj.get("parts") or {}).items():
             annotation = annotations.get(oid, {}).get(part_id, {}).get(str(start))
             if annotation is None:
-                missing.append(f"{obj.get('name', oid)} / {part.get('name', part_id)}")
-                continue
+                part_memories = annotations.get(oid, {}).get(part_id, {})
+                if not part_memories:
+                    missing.append(f"{obj.get('name', oid)} / {part.get('name', part_id)}")
+                    continue
+                normalized.append([float("nan"), float("nan")])
+            else:
+                normalized.append([float(annotation["x"]), float(annotation["y"])])
             point_keys.append((oid, part_id))
-            normalized.append([float(annotation["x"]), float(annotation["y"])])
     if missing:
-        raise HTTPException(409, f"Label every pose part on frame {start}: {', '.join(missing)}")
+        raise HTTPException(409, f"Label at least one anchor for every pose part: {', '.join(missing)}")
     if not point_keys:
         raise HTTPException(409, "Create and label at least one pose part")
     source_path = str(video.get("source_path") or "")
@@ -2528,7 +2575,50 @@ def predict_pose(pid: str, vid: str, req: PosePredictionRequest, background_task
     native_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     native_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
     capture.release()
-    points_xy = np.asarray(normalized, dtype=np.float32)
+    normalized_xy = np.asarray(normalized, dtype=np.float32)
+    unresolved = np.isnan(normalized_xy).any(axis=1)
+    memory_frames = sorted({
+        int(frame_key)
+        for oid, part_id in point_keys
+        for frame_key in annotations.get(oid, {}).get(part_id, {})
+        if all(
+            str(frame_key) in annotations.get(other_oid, {}).get(other_part_id, {})
+            for other_oid, other_part_id in point_keys
+        )
+    })
+    memory_weights: list[tuple[np.ndarray, np.ndarray, float]] = []
+    previous_used = False
+    if unresolved.any() and start > 0:
+        tracks_path = _pose_tracks_path(pid, vid)
+        if tracks_path.is_file():
+            previous_objects = (json.loads(tracks_path.read_text()).get("frames") or {}).get(str(start - 1), {})
+            if all(previous_objects.get(oid, {}).get(part_id) for oid, part_id in point_keys):
+                previous_points = np.asarray([
+                    [previous_objects[oid][part_id]["x"], previous_objects[oid][part_id]["y"]]
+                    for oid, part_id in point_keys
+                ], dtype=np.float32)
+                previous_features = _cached_pose_features(pid, vid, source_path, start - 1)
+                memory_weights.append((previous_features, previous_points, 0.6))
+                previous_used = True
+    if unresolved.any():
+        if not memory_frames:
+            raise HTTPException(409, "No fully labeled pose anchor frame is available")
+        anchor_weight = (0.4 if previous_used else 1.0) / len(memory_frames)
+        for memory_frame in memory_frames:
+            memory_points = np.asarray([
+                [
+                    annotations[oid][part_id][str(memory_frame)]["x"],
+                    annotations[oid][part_id][str(memory_frame)]["y"],
+                ]
+                for oid, part_id in point_keys
+            ], dtype=np.float32)
+            memory_features = _cached_pose_features(pid, vid, source_path, memory_frame)
+            memory_weights.append((memory_features, memory_points, anchor_weight))
+        target_features = _cached_pose_features(pid, vid, source_path, start)
+        resolved = cotracker3.correlate_memories(target_features, memory_weights)
+        normalized_xy[unresolved] = resolved[unresolved]
+
+    points_xy = normalized_xy.copy()
     points_xy[:, 0] *= max(1, native_width - 1)
     points_xy[:, 1] *= max(1, native_height - 1)
     job_key = (pid, vid)

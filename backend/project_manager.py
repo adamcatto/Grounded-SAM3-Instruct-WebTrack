@@ -450,6 +450,7 @@ class ProjectManager:
             },
             "pose_objects": {},
             "pose_annotations": {},
+            "pose_memory_frames": [],
             "pose_tracking": {
                 "status": "none",
                 "start_frame": None,
