@@ -118,6 +118,95 @@ export const downsampleVideo = (pid: string, vid: string, ds: DownsampleOptions)
     { timeout: 1800_000 },
   ).then(r => r.data)
 
+export const initializeRegistration = (pid: string, targetSize = 1000) =>
+  api.post(`/projects/${pid}/registration`, { target_size: targetSize }).then(r => r.data)
+
+export const addRegistrationPoints = (
+  pid: string,
+  vid: string,
+  points: [number, number][],
+  labels: number[],
+) =>
+  api.post<{
+    frame_idx: number
+    mask: string
+    registration: {
+      points: [number, number][]
+      labels: number[]
+      labeled: boolean
+      registered: boolean
+    }
+  }>(`/projects/${pid}/registration/videos/${vid}/points`, { points, labels }).then(r => r.data)
+
+export const computeRegistration = (pid: string) =>
+  api.post(`/projects/${pid}/registration/compute`).then(r => r.data)
+
+export const getRegistrationMask = (pid: string, vid: string) =>
+  api.get<{ mask: string | null; registration: import('../types').VideoRegistration }>(
+    `/projects/${pid}/registration/videos/${vid}/mask`,
+  ).then(r => r.data)
+
+export const clearRegistrationVideo = (pid: string, vid: string) =>
+  api.delete<{ mask: null; registration: import('../types').VideoRegistration }>(
+    `/projects/${pid}/registration/videos/${vid}`,
+  ).then(r => r.data)
+
+export const setRegistrationPolygon = (
+  pid: string,
+  vid: string,
+  vertices: [number, number][],
+) =>
+  api.post<{ mask: string; registration: import('../types').VideoRegistration }>(
+    `/projects/${pid}/registration/videos/${vid}/polygon`,
+    { vertices },
+  ).then(r => r.data)
+
+export const fitRegistrationEdges = (
+  pid: string,
+  vid: string,
+  edges: Record<'top' | 'right' | 'bottom' | 'left', [number, number][]>,
+) =>
+  api.post<{ registration: import('../types').VideoRegistration; straightness_rms_pixels: number }>(
+    `/projects/${pid}/registration/videos/${vid}/edges`,
+    { edges },
+  ).then(r => r.data)
+
+export const registrationPreviewUrl = (pid: string, vid: string) =>
+  `/api/projects/${pid}/registration/videos/${vid}/preview`
+
+export const registrationFramePreviewUrl = (
+  pid: string,
+  vid: string,
+  frameIdx: number,
+  view: 'original' | 'registered',
+  revision = '',
+) => {
+  const params = new URLSearchParams({ view })
+  if (revision) params.set('rev', revision)
+  return `/api/projects/${pid}/registration/videos/${vid}/preview/${frameIdx}?${params}`
+}
+
+export const applyRegistrationMorphology = (
+  pid: string,
+  vid: string,
+  operation: 'opening' | 'closing',
+  kernelSize: number,
+) =>
+  api.post<{ mask: string; registration: import('../types').VideoRegistration }>(
+    `/projects/${pid}/registration/videos/${vid}/morphology`,
+    { operation, kernel_size: kernelSize },
+  ).then(r => r.data)
+
+export const undoRegistrationMorphology = (pid: string, vid: string) =>
+  api.post<{ mask: string; registration: import('../types').VideoRegistration }>(
+    `/projects/${pid}/registration/videos/${vid}/morphology/undo`,
+  ).then(r => r.data)
+
+export const redoRegistrationMorphology = (pid: string, vid: string) =>
+  api.post<{ mask: string; registration: import('../types').VideoRegistration }>(
+    `/projects/${pid}/registration/videos/${vid}/morphology/redo`,
+  ).then(r => r.data)
+
 export interface BrowseEntry {
   name: string
   path: string

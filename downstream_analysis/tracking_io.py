@@ -19,6 +19,7 @@ if str(_BACKEND) not in sys.path:
 from mask_store import VideoMaskStorage
 
 from .tqdm_optional import try_tqdm
+from .registration import registration_for_video, warp_masks
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,7 @@ class VideoTrackContext:
     video_name: str
     config: dict[str, Any]
     video_dir: Path
+    registration: dict[str, Any] | None = None
 
 
 def load_project_config(project_dir: Path) -> dict[str, Any]:
@@ -97,12 +99,14 @@ def _try_make_complete_context(
     )
     if not ok:
         return None, "missing saved masks for some frames"
+    project_config = load_project_config(project_dir)
     return (
         VideoTrackContext(
             video_id=str(vid),
             video_name=str(v.get("name") or vid),
             config=dict(v),
             video_dir=vdir,
+            registration=registration_for_video(project_config, str(vid)),
         ),
         None,
     )
@@ -211,6 +215,8 @@ def build_centroid_timelines(
     n = int(ctx.config["num_frames"])
     w = int(ctx.config.get("width") or 1)
     h = int(ctx.config.get("height") or 1)
+    if ctx.registration:
+        w = h = int(ctx.registration["target_size"])
     total_fr = max(0, n - start)
 
     logger.info(
@@ -237,7 +243,7 @@ def build_centroid_timelines(
     ms = VideoMaskStorage(ctx.video_dir)
 
     for fi in frame_iter:
-        masks = ms.load_masks_dense(fi)
+        masks = warp_masks(ms.load_masks_dense(fi), ctx.registration)
         row = fi - start
         for k, m in masks.items():
             if k not in all_series:

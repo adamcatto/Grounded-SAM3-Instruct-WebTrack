@@ -50,6 +50,7 @@ export default function App() {
   const video = selectCurrentVideo(store)
   const {
     project, currentVideoId, viewerTab,
+    registrationMode,
     setProject, setCurrentVideo, setUploadModalOpen, setDrawerOpen, setViewerTab,
     configDirty, revertConfig,
   } = store
@@ -135,18 +136,18 @@ export default function App() {
                   label="Annotate"
                   onClick={() => handleSetViewerTab('annotate')}
                 />
-                <TabButton
+                {!registrationMode && <TabButton
                   active={viewerTab === 'player'}
                   icon={<PlayCircle size={14} />}
                   label="Player"
                   onClick={() => handleSetViewerTab('player')}
-                />
-                <TabButton
+                />}
+                {!registrationMode && <TabButton
                   active={viewerTab === 'inference'}
                   icon={<BrainCircuit size={14} />}
                   label="Inference State"
                   onClick={() => handleSetViewerTab('inference')}
-                />
+                />}
               </>
             )}
             <div className="flex-1" />
@@ -165,12 +166,12 @@ export default function App() {
           {viewerTab === 'config' && <ConfigPanel />}
 
           {/* Horizontal resize handle between viewer and timeline */}
-          {video && viewerTab === 'annotate' && (
+          {video && viewerTab === 'annotate' && !registrationMode && (
             <ResizeHandle direction="vertical" onMouseDown={timelineHandleMouseDown} />
           )}
 
           {/* Timeline (resizable height) */}
-          {video && viewerTab === 'annotate' && (
+          {video && viewerTab === 'annotate' && !registrationMode && (
             <div className="flex-shrink-0 overflow-hidden" style={{ height: timelineHeight }}>
               <Timeline />
             </div>

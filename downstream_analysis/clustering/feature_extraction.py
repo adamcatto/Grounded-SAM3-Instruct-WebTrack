@@ -29,6 +29,7 @@ from ..tracking_io import (
     video_storage_dir,
 )
 from ..tqdm_optional import try_tqdm
+from ..registration import registration_for_video, registration_signature, warp_masks
 
 try:
     from tqdm import tqdm as _tqdm
@@ -97,7 +98,7 @@ def _discover_object_keys(
     seen_keys = set()
     # Sample a few frames first. If we find a frame with >= 2 keys, we can instantly return them.
     for fi in range(start, min(start + 50, n)):
-        masks = ms.load_masks_dense(fi)
+        masks = warp_masks(ms.load_masks_dense(fi), ctx.registration)
         keys = sorted(masks.keys())
         if len(keys) >= 2:
             return keys[0], keys[1]
@@ -142,6 +143,8 @@ def _extract_video_frame_features(
     n = int(ctx.config["num_frames"])
     w = int(ctx.config.get("width") or 1)
     h = int(ctx.config.get("height") or 1)
+    if ctx.registration:
+        w = h = int(ctx.registration["target_size"])
     total_fr = max(0, n - start)
     fps = float(ctx.config.get("fps") or 30)
     duration_str = _fmt_duration(total_fr / fps) if fps > 0 else "?"
@@ -154,21 +157,29 @@ def _extract_video_frame_features(
         if cache_path.is_file():
             sqlite_path = ctx.video_dir / "masks.sqlite"
             if sqlite_path.is_file() and cache_path.stat().st_mtime > sqlite_path.stat().st_mtime:
-                cache_size = _fmt_size(cache_path.stat().st_size)
-                logger.info(
-                    '%s Loaded cached frame features for "%s" (%s, %s)',
-                    tag, ctx.video_name, cache_size, _fmt_duration(0),
-                )
                 data = np.load(cache_path, allow_pickle=True)
-                return (
-                    data["frame_features"],
-                    str(data["obj_a_key"]),
-                    str(data["obj_b_key"]),
-                    int(data["start_frame"]),
-                    int(data["num_frames"]),
-                    int(data["width"]),
-                    int(data["height"]),
-                )
+                cached_sig = str(data["registration_signature"]) if "registration_signature" in data else ""
+                if cached_sig != registration_signature(ctx.registration):
+                    logger.info('%s Registration changed; rebuilding cache for "%s"', tag, ctx.video_name)
+                    data.close()
+                    data = None
+                if data is None:
+                    pass
+                else:
+                    cache_size = _fmt_size(cache_path.stat().st_size)
+                    logger.info(
+                        '%s Loaded cached frame features for "%s" (%s, %s)',
+                        tag, ctx.video_name, cache_size, _fmt_duration(0),
+                    )
+                    return (
+                        data["frame_features"],
+                        str(data["obj_a_key"]),
+                        str(data["obj_b_key"]),
+                        int(data["start_frame"]),
+                        int(data["num_frames"]),
+                        int(data["width"]),
+                        int(data["height"]),
+                    )
 
     # Discover object keys
     keys = _discover_object_keys(ms, ctx)
@@ -203,7 +214,7 @@ def _extract_video_frame_features(
         )
 
     for fi in frame_iter:
-        masks = ms.load_masks_dense(fi)
+        masks = warp_masks(ms.load_masks_dense(fi), ctx.registration)
         row = fi - start
         fv = extract_frame_features(
             masks, obj_a_key, obj_b_key,
@@ -247,6 +258,7 @@ def _extract_video_frame_features(
             width=w,
             height=h,
             video_diagonal=float(np.hypot(w, h)),
+            registration_signature=registration_signature(ctx.registration),
         )
         cache_size = _fmt_size(cache_path.stat().st_size)
         logger.info('%s Cached frame features to %s (%s)', tag, cache_path.name, cache_size)
@@ -304,6 +316,7 @@ def _fast_discover_videos(
             video_name=vname,
             config=dict(v),
             video_dir=vdir,
+            registration=registration_for_video(config, str(vid)),
         ))
 
     logger.info(

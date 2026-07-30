@@ -1,9 +1,9 @@
 import React, { useEffect, useMemo, useState } from 'react'
-import { X, Plus, Film, FolderOpen, Trash2 } from 'lucide-react'
+import { X, Plus, Film, FolderOpen, Trash2, ScanLine, CheckCircle2 } from 'lucide-react'
 import { useStore } from '../store/useStore'
 import { useResizable } from '../hooks/useResizable'
 import ProjectsFolderBrowserModal from './ProjectsFolderBrowserModal'
-import { listProjects, createProject, mergeProjects, deleteProject, getProject, getProjectsRoot, removeVideo } from '../api/client'
+import { listProjects, createProject, mergeProjects, deleteProject, getProject, getProjectsRoot, removeVideo, initializeRegistration, computeRegistration } from '../api/client'
 import type { ProjectsRootInfo } from '../api/client'
 import type { Project } from '../types'
 import VideoProgressRings from './VideoProgressRings'
@@ -16,6 +16,8 @@ export default function ProjectDrawer() {
     setUploadModalOpen,
     addToast,
     clearHistory,
+    registrationMode,
+    enterRegistrationVideo,
   } = useStore()
 
   const [projects, setProjects] = useState<Project[]>([])
@@ -32,6 +34,7 @@ export default function ProjectDrawer() {
     max: 560,
     direction: 'horizontal',
   })
+  const [registrationBusy, setRegistrationBusy] = useState(false)
 
   useEffect(() => {
     if (!drawerOpen) return
@@ -143,6 +146,42 @@ export default function ProjectDrawer() {
   function handleSelectVideo(vid: string) {
     setCurrentVideo(vid)
     setDrawerOpen(false)
+  }
+
+  async function handleStartRegistration() {
+    if (!project || Object.keys(project.videos).length === 0) return
+    setRegistrationBusy(true)
+    try {
+      await initializeRegistration(project.id)
+      const fresh = await getProject(project.id)
+      setProject(fresh)
+      const firstUnlabeled = Object.keys(fresh.videos).find(
+        vid => !fresh.registration?.videos?.[vid]?.labeled,
+      ) ?? Object.keys(fresh.videos)[0]
+      enterRegistrationVideo(firstUnlabeled)
+      addToast('Registration created. Segment the visible floor in each first frame.', 'success')
+      setDrawerOpen(false)
+    } catch {
+      addToast('Failed to initialize video registration', 'error')
+    } finally {
+      setRegistrationBusy(false)
+    }
+  }
+
+  async function handleComputeRegistration() {
+    if (!project) return
+    setRegistrationBusy(true)
+    try {
+      await computeRegistration(project.id)
+      const fresh = await getProject(project.id)
+      setProject(fresh)
+      addToast('Registration homographies generated', 'success')
+    } catch (e: unknown) {
+      const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+      addToast(detail || 'Failed to generate registration', 'error')
+    } finally {
+      setRegistrationBusy(false)
+    }
   }
 
   async function handleDeleteVideo(vid: string, e: React.MouseEvent) {
@@ -377,6 +416,74 @@ export default function ProjectDrawer() {
                     />
                     <span>Green — whole-video frames tracked</span>
                   </span>
+                </div>
+              )}
+              {currentVideos.length > 0 && !project.registration && (
+                <button
+                  type="button"
+                  disabled={registrationBusy}
+                  onClick={() => void handleStartRegistration()}
+                  className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-sm text-sky-300 bg-sky-500/10 hover:bg-sky-500/20 border border-sky-500/30 disabled:opacity-50"
+                >
+                  <ScanLine size={14} />
+                  <span>Register videos</span>
+                </button>
+              )}
+              {project.registration && (
+                <div className={`rounded-lg border ${
+                  registrationMode ? 'border-sky-500/50 bg-sky-500/10' : 'border-[#333] bg-[#171717]'
+                }`}>
+                  <div className="flex items-center gap-2 px-3 py-2 text-sm text-sky-200">
+                    <ScanLine size={14} />
+                    <span className="font-medium flex-1">Registration</span>
+                    <span className="text-[10px] text-[#888]">
+                      {Object.values(project.registration.videos).filter(v => v.labeled || v.registered).length}/
+                      {currentVideos.length} labeled
+                    </span>
+                  </div>
+                  <div className="border-t border-[#2a2a2a] px-1 py-1 space-y-0.5">
+                    {currentVideos.map(v => {
+                      const reg = project.registration!.videos[v.id]
+                      return (
+                        <button
+                          key={`registration-${v.id}`}
+                          type="button"
+                          onClick={() => {
+                            enterRegistrationVideo(v.id)
+                            setDrawerOpen(false)
+                          }}
+                          className={`w-full flex items-center gap-2 px-2 py-1.5 rounded text-left text-xs ${
+                            registrationMode && currentVideoId === v.id
+                              ? 'bg-sky-500/20 text-sky-100'
+                              : 'text-[#aaa] hover:bg-white/5'
+                          }`}
+                        >
+                          {reg?.labeled || reg?.registered
+                            ? <CheckCircle2 size={12} className="text-emerald-400 shrink-0" />
+                            : <span className="w-3 h-3 rounded-full border border-[#555] shrink-0" />}
+                          <span className="truncate flex-1">{v.name} · frame 0</span>
+                        </button>
+                      )
+                    })}
+                  </div>
+                  <div className="border-t border-[#2a2a2a] p-2">
+                    <button
+                      type="button"
+                      disabled={
+                        registrationBusy ||
+                        !currentVideos.every(v => {
+                          const entry = project.registration?.videos[v.id]
+                          return entry?.labeled || entry?.registered
+                        })
+                      }
+                      onClick={() => void handleComputeRegistration()}
+                      className="w-full px-2 py-1.5 rounded text-xs font-medium bg-emerald-600/80 hover:bg-emerald-600 text-white disabled:bg-[#292929] disabled:text-[#666]"
+                    >
+                      {project.registration.status === 'complete'
+                        ? 'Recompute registration parameters'
+                        : 'Generate registration parameters'}
+                    </button>
+                  </div>
                 </div>
               )}
               {currentVideos.map(v => (

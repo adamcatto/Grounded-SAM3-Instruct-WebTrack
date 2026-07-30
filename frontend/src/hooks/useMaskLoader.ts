@@ -18,6 +18,7 @@ export function useMaskLoader(): void {
     project,
     currentVideoId,
     currentFrame,
+    registrationMode,
     setSavedMask,
   } = store
 
@@ -27,7 +28,7 @@ export function useMaskLoader(): void {
   const loadSeqRef = useRef(0)
 
   useEffect(() => {
-    if (!pid || !vid) return
+    if (!pid || !vid || registrationMode) return
 
     const propagated = video?.propagated_frames ?? []
     const propagatedSet = new Set(propagated)
@@ -86,5 +87,5 @@ export function useMaskLoader(): void {
       window.clearTimeout(displayTimer)
       window.clearTimeout(objectTimer)
     }
-  }, [pid, vid, currentFrame, video?.propagated_frames, setSavedMask])
+  }, [pid, vid, currentFrame, video?.propagated_frames, registrationMode, setSavedMask])
 }

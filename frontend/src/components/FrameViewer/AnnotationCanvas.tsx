@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useStore, currentVideo as selectCurrentVideo } from '../../store/useStore'
-import { extractFrame, addPoints, rebuildFromConfig, replaceFramePromptsData, removeObject } from '../../api/client'
+import { extractFrame, addPoints, addRegistrationPoints, rebuildFromConfig, replaceFramePromptsData, removeObject } from '../../api/client'
 import { drawCompositeMask, drawMasks, drawPoints, loadMaskBitmap } from '../../utils/maskUtils'
 import { getCompositeBitmap } from '../../utils/compositeMaskCache'
 import { loadDisplayBitmap } from '../../utils/maskLoader'
@@ -26,6 +26,13 @@ export default function AnnotationCanvas({ width, height, scrubbing = false }: P
     savedMaskCache, setSavedMask,
     config,
     anchorPhase,
+    registrationMode,
+    registrationTool,
+    registrationPolygonPoints,
+    addRegistrationPolygonPoint,
+    registrationActiveEdge,
+    registrationEdgePoints,
+    addRegistrationEdgePoint,
     addToast,
   } = store
 
@@ -46,7 +53,7 @@ export default function AnnotationCanvas({ width, height, scrubbing = false }: P
 
   // Load pre-materialized display WebP when available (optional fast path).
   useEffect(() => {
-    if (!config.showMasks || !pid || !vid) return
+    if (!config.showMasks || !pid || !vid || registrationMode) return
     if (getCompositeBitmap(pid, vid, currentFrame)) {
       setDisplayReady(t => t + 1)
       return
@@ -56,7 +63,7 @@ export default function AnnotationCanvas({ width, height, scrubbing = false }: P
       if (!cancelled) setDisplayReady(t => t + 1)
     })
     return () => { cancelled = true }
-  }, [currentFrame, pid, vid, config.showMasks])
+  }, [currentFrame, pid, vid, config.showMasks, registrationMode])
 
   // Per-object alpha maps for hover hit-testing (disabled while scrubbing).
   useEffect(() => {
@@ -83,8 +90,9 @@ export default function AnnotationCanvas({ width, height, scrubbing = false }: P
         names[objId] = obj.name || objId
       }
     }
+    if (registrationMode) names.__registration_floor__ = 'Common floor'
     return names
-  }, [video?.objects])
+  }, [video?.objects, registrationMode])
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -110,9 +118,54 @@ export default function AnnotationCanvas({ width, height, scrubbing = false }: P
         }
       }
       drawPoints(ctx, allPoints, width, height, config.pointSize)
+      if (registrationMode && registrationPolygonPoints.length > 0) {
+        ctx.save()
+        ctx.strokeStyle = '#facc15'
+        ctx.fillStyle = '#facc15'
+        ctx.lineWidth = Math.max(2, Math.min(width, height) / 300)
+        ctx.beginPath()
+        registrationPolygonPoints.forEach(([x, y], i) => {
+          const px = x * width
+          const py = y * height
+          if (i === 0) ctx.moveTo(px, py)
+          else ctx.lineTo(px, py)
+        })
+        if (registrationPolygonPoints.length >= 3) ctx.closePath()
+        ctx.stroke()
+        for (const [x, y] of registrationPolygonPoints) {
+          ctx.beginPath()
+          ctx.arc(x * width, y * height, Math.max(3, ctx.lineWidth * 1.5), 0, Math.PI * 2)
+          ctx.fill()
+        }
+        ctx.restore()
+      }
+      if (registrationMode && registrationTool === 'edges') {
+        const colors = { top: '#facc15', right: '#22d3ee', bottom: '#f472b6', left: '#a3e635' }
+        for (const edge of ['top', 'right', 'bottom', 'left'] as const) {
+          const points = registrationEdgePoints[edge]
+          if (points.length === 0) continue
+          ctx.save()
+          ctx.strokeStyle = colors[edge]
+          ctx.fillStyle = colors[edge]
+          ctx.globalAlpha = edge === registrationActiveEdge ? 1 : 0.65
+          ctx.lineWidth = Math.max(2, Math.min(width, height) / 350)
+          ctx.beginPath()
+          points.forEach(([x, y], i) => {
+            if (i === 0) ctx.moveTo(x * width, y * height)
+            else ctx.lineTo(x * width, y * height)
+          })
+          ctx.stroke()
+          for (const [x, y] of points) {
+            ctx.beginPath()
+            ctx.arc(x * width, y * height, Math.max(3, ctx.lineWidth * 1.5), 0, Math.PI * 2)
+            ctx.fill()
+          }
+          ctx.restore()
+        }
+      }
     }
 
-    const displayBitmap = config.showMasks && pid && vid
+    const displayBitmap = config.showMasks && !registrationMode && pid && vid
       ? getCompositeBitmap(pid, vid, currentFrame)
       : undefined
 
@@ -129,7 +182,8 @@ export default function AnnotationCanvas({ width, height, scrubbing = false }: P
   }, [
     width, height, masksToShow, localAnnotations, currentFrame,
     config.showMasks, config.maskOpacity, config.pointSize, objectNames,
-    scrubbing, pid, vid, displayReady,
+    scrubbing, pid, vid, displayReady, registrationMode, registrationTool,
+    registrationPolygonPoints, registrationActiveEdge, registrationEdgePoints,
   ])
 
   const handleMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -170,8 +224,18 @@ export default function AnnotationCanvas({ width, height, scrubbing = false }: P
     const scaleY = height / rect.height
     const px = (e.clientX - rect.left) * scaleX
     const py = (e.clientY - rect.top) * scaleY
-    const nx = px / width
-    const ny = py / height
+    // Browser layout/subpixel rounding can put border clicks a fraction outside
+    // the image. Clamp normalized coordinates so edges are exactly 0 or 1.
+    const nx = Math.max(0, Math.min(1, px / width))
+    const ny = Math.max(0, Math.min(1, py / height))
+    if (registrationMode && registrationTool === 'polygon') {
+      addRegistrationPolygonPoint(nx, ny)
+      return
+    }
+    if (registrationMode && registrationTool === 'edges') {
+      addRegistrationEdgePoint(registrationActiveEdge, nx, ny)
+      return
+    }
     const label: 0 | 1 = pointMode === 'add' ? 1 : 0
 
     const oid = currentObjectId
@@ -190,6 +254,35 @@ export default function AnnotationCanvas({ width, height, scrubbing = false }: P
 
     try {
       await extractFrame(pid, vid, frameToUse)
+
+      if (registrationMode) {
+        const result = await addRegistrationPoints(pid, vid, allPoints, allLabels)
+        if (result.mask) {
+          const masks = { __registration_floor__: result.mask }
+          setCurrentFrameMasks(masks, 0)
+          setSavedMask(0, masks)
+        }
+        const state = useStore.getState()
+        const currentProject = state.project
+        if (currentProject?.registration) {
+          state.setProject({
+            ...currentProject,
+            registration: {
+              ...currentProject.registration,
+              status: 'labeling',
+              videos: {
+                ...currentProject.registration.videos,
+                [vid]: {
+                  ...currentProject.registration.videos[vid],
+                  ...result.registration,
+                  frame_idx: 0,
+                },
+              },
+            },
+          })
+        }
+        return
+      }
 
       const result = await addPoints(pid, vid, oid, frameToUse, allPoints, allLabels, anchorPhase)
       const addedObjects = result.new_objects ?? []
@@ -290,7 +383,7 @@ export default function AnnotationCanvas({ width, height, scrubbing = false }: P
         (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
       addToast(detail ?? 'Failed to add point', 'error')
     }
-  }, [pointMode, currentObjectId, video, currentFrame, width, height, pid, vid, addLocalPoint, setCurrentFrameMasks, setSavedMask, anchorPhase, addToast])
+  }, [pointMode, currentObjectId, video, currentFrame, width, height, pid, vid, addLocalPoint, setCurrentFrameMasks, setSavedMask, anchorPhase, registrationMode, registrationTool, addRegistrationPolygonPoint, registrationActiveEdge, addRegistrationEdgePoint, addToast])
 
   const cursor = pointMode ? 'crosshair' : 'default'
 

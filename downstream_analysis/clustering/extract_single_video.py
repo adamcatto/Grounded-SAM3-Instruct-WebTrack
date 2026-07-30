@@ -67,6 +67,7 @@ def main(argv: list[str] | None = None) -> int:
     from downstream_analysis.tracking_io import load_project_config, video_storage_dir, VideoTrackContext
     from downstream_analysis.clustering.config import ClusteringConfig
     from downstream_analysis.clustering.feature_extraction import _extract_video_frame_features
+    from downstream_analysis.registration import registration_for_video
 
     config = load_project_config(project_dir)
     videos = config.get("videos", {})
@@ -90,6 +91,7 @@ def main(argv: list[str] | None = None) -> int:
         video_name=vname,
         config=dict(v),
         video_dir=vdir,
+        registration=registration_for_video(config, vid),
     )
 
     cfg = ClusteringConfig()

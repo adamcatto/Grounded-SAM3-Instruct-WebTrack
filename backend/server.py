@@ -37,6 +37,7 @@ from anchor_helpers import (
 from project_manager import ProjectManager
 from sam_predictor import SAMPredictor, _get_predictor
 from mask_store import VideoMaskStorage
+from registration_geometry import EDGE_NAMES, fit_edge_registration
 import display_cache as dc
 from video_processor import (
     compute_ds_dims,
@@ -830,6 +831,579 @@ class UpdateProjectRequest(BaseModel):
 def update_project(pid: str, req: UpdateProjectRequest):
     updates = {k: v for k, v in req.model_dump().items() if v is not None}
     return pm.update_project(pid, updates)
+
+
+class RegistrationInitRequest(BaseModel):
+    target_size: int = 1000
+
+
+class RegistrationPointsRequest(BaseModel):
+    points: list[list[float]]
+    labels: list[int]
+
+
+class RegistrationMorphologyRequest(BaseModel):
+    operation: str
+    kernel_size: int = 5
+
+
+class RegistrationPolygonRequest(BaseModel):
+    vertices: list[list[float]]
+
+
+class RegistrationEdgesRequest(BaseModel):
+    edges: dict[str, list[list[float]]]
+
+
+def _registration_dir(pid: str) -> Path:
+    out = pm._project_dir(pid) / "registration"
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def _registration_history_dir(pid: str, vid: str) -> Path:
+    out = _registration_dir(pid) / "history" / vid
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def _clear_registration_history_files(pid: str, vid: str) -> None:
+    shutil.rmtree(_registration_dir(pid) / "history" / vid, ignore_errors=True)
+
+
+def _registration_mask_response(pid: str, vid: str, entry: dict) -> dict:
+    mask_b64 = None
+    if entry.get("mask_file"):
+        mask = cv2.imread(
+            str(pm._project_dir(pid) / str(entry["mask_file"])),
+            cv2.IMREAD_GRAYSCALE,
+        )
+        if mask is not None:
+            mask_b64 = encode_mask_as_png(mask > 0, "#38bdf8")
+    return {"mask": mask_b64, "registration": entry}
+
+
+def _ordered_quad(points: np.ndarray) -> np.ndarray:
+    """Return convex quadrilateral vertices ordered TL, TR, BR, BL."""
+    pts = np.asarray(points, dtype=np.float32).reshape(4, 2)
+    s = pts.sum(axis=1)
+    d = np.diff(pts, axis=1).reshape(-1)
+    ordered = np.empty((4, 2), dtype=np.float32)
+    ordered[0] = pts[np.argmin(s)]
+    ordered[2] = pts[np.argmax(s)]
+    ordered[1] = pts[np.argmin(d)]
+    ordered[3] = pts[np.argmax(d)]
+    if len({tuple(x) for x in ordered.tolist()}) != 4:
+        center = pts.mean(axis=0)
+        angles = np.arctan2(pts[:, 1] - center[1], pts[:, 0] - center[0])
+        cyc = pts[np.argsort(angles)]
+        start = int(np.argmin(cyc.sum(axis=1)))
+        ordered = np.roll(cyc, -start, axis=0)
+    return ordered
+
+
+def _floor_quad_from_mask(mask: np.ndarray) -> np.ndarray:
+    binary = (np.squeeze(mask) > 0).astype(np.uint8)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        raise ValueError("The floor segmentation mask is empty")
+    contour = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(contour) < 100:
+        raise ValueError("The floor segmentation is too small to register")
+    hull = cv2.convexHull(contour)
+    perimeter = cv2.arcLength(hull, True)
+    quad = None
+    for epsilon_fraction in np.linspace(0.005, 0.12, 80):
+        candidate = cv2.approxPolyDP(hull, float(epsilon_fraction) * perimeter, True)
+        if len(candidate) == 4:
+            quad = candidate.reshape(4, 2)
+            break
+    if quad is None:
+        # Extreme convex-hull points retain perspective better than a rotated rectangle.
+        hp = hull.reshape(-1, 2)
+        quad = np.stack([
+            hp[np.argmin(hp.sum(axis=1))],
+            hp[np.argmax(hp[:, 0] - hp[:, 1])],
+            hp[np.argmax(hp.sum(axis=1))],
+            hp[np.argmax(hp[:, 1] - hp[:, 0])],
+        ])
+    return _ordered_quad(quad)
+
+
+@app.post("/api/projects/{pid}/registration")
+def initialize_registration(pid: str, req: RegistrationInitRequest):
+    try:
+        return pm.initialize_registration(pid, req.target_size)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.post("/api/projects/{pid}/registration/videos/{vid}/points")
+def add_registration_points(pid: str, vid: str, req: RegistrationPointsRequest):
+    """Segment the visible floor on the real first frame without altering tracking masks/prompts."""
+    video = pm.get_video(pid, vid)
+    if video is None:
+        raise HTTPException(404, "Video not found")
+    if len(req.points) != len(req.labels) or not req.points:
+        raise HTTPException(400, "points and labels must be non-empty and have equal length")
+    frame_idx = 0
+    ann_frame = pm.annotated_frames_dir(pid, vid) / "000000.jpg"
+    if not ann_frame.is_file():
+        raise HTTPException(400, "First frame has not been extracted yet")
+
+    tmp_ann = tempfile.mkdtemp(prefix="sam3wt_registration_")
+    try:
+        shutil.copy2(ann_frame, Path(tmp_ann) / ann_frame.name)
+        sam.init_session(pid, vid, tmp_ann)
+        outputs = sam.add_points(
+            pid,
+            vid,
+            frame_idx=frame_idx,
+            obj_id=999999,
+            points=req.points,
+            labels=req.labels,
+            text=None,
+        )
+    except Exception as e:
+        logger.exception("Registration floor segmentation failed")
+        raise HTTPException(500, f"SAM registration inference error: {e}")
+    finally:
+        shutil.rmtree(tmp_ann, ignore_errors=True)
+
+    frame_outputs = outputs.get(frame_idx, outputs.get(str(frame_idx), {}))
+    mask_b64, raw_masks = _encode_masks_from_sam_frame_output(
+        frame_outputs,
+        {"999999": {"color": "#38bdf8"}},
+    )
+    mask = raw_masks.get("999999")
+    if mask is None:
+        raise HTTPException(500, "SAM returned no floor mask")
+    mask_path = _registration_dir(pid) / f"{vid}_floor.png"
+    cv2.imwrite(str(mask_path), (np.squeeze(mask) > 0).astype(np.uint8) * 255)
+    _clear_registration_history_files(pid, vid)
+    entry = pm.update_registration_video(
+        pid,
+        vid,
+        {
+            "frame_idx": 0,
+            "points": req.points,
+            "labels": req.labels,
+            "mask_file": str(mask_path.relative_to(pm._project_dir(pid))),
+            "labeled": True,
+            "registered": False,
+            "source_corners": None,
+            "homography": None,
+            "mask_source": "point_prompts",
+            "polygon_vertices": [],
+            "calibration_source": "floor_mask",
+            "camera_matrix": None,
+            "distortion_coefficients": None,
+            "edge_points": {},
+            "morphology_history": [],
+            "morphology_cursor": 0,
+        },
+    )
+    return {"frame_idx": 0, "mask": mask_b64.get("999999"), "registration": entry}
+
+
+@app.post("/api/projects/{pid}/registration/videos/{vid}/polygon")
+def set_registration_polygon(pid: str, vid: str, req: RegistrationPolygonRequest):
+    """Fill the convex hull of normalized polygon vertices as the floor mask."""
+    video = pm.get_video(pid, vid)
+    if video is None:
+        raise HTTPException(404, "Video not found")
+    if len(req.vertices) < 3:
+        raise HTTPException(400, "At least three polygon vertices are required")
+    vertices = np.asarray(req.vertices, dtype=np.float64)
+    if vertices.ndim != 2 or vertices.shape[1] != 2 or not np.all(np.isfinite(vertices)):
+        raise HTTPException(400, "vertices must be finite [x, y] pairs")
+    # Be tolerant of canvas/subpixel rounding at image borders. The frontend
+    # also clamps, but clipping here keeps imported/older clients safe.
+    vertices = np.clip(vertices, 0.0, 1.0)
+    width = max(1, int(video.get("width") or 1))
+    height = max(1, int(video.get("height") or 1))
+    pixels = np.column_stack(
+        [vertices[:, 0] * (width - 1), vertices[:, 1] * (height - 1)]
+    ).round().astype(np.int32)
+    hull = cv2.convexHull(pixels.reshape(-1, 1, 2))
+    if len(hull) < 3 or cv2.contourArea(hull) < 1:
+        raise HTTPException(400, "Polygon vertices do not form a usable area")
+    mask = np.zeros((height, width), dtype=np.uint8)
+    cv2.fillConvexPoly(mask, hull.reshape(-1, 2), 255)
+    mask_path = _registration_dir(pid) / f"{vid}_floor.png"
+    cv2.imwrite(str(mask_path), mask)
+    _clear_registration_history_files(pid, vid)
+    entry = pm.update_registration_video(
+        pid,
+        vid,
+        {
+            "points": [],
+            "labels": [],
+            "polygon_vertices": vertices.astype(float).tolist(),
+            "mask_source": "convex_hull_polygon",
+            "calibration_source": "floor_mask",
+            "camera_matrix": None,
+            "distortion_coefficients": None,
+            "edge_points": {},
+            "mask_file": str(mask_path.relative_to(pm._project_dir(pid))),
+            "labeled": True,
+            "registered": False,
+            "source_corners": None,
+            "homography": None,
+            "morphology_history": [],
+            "morphology_cursor": 0,
+        },
+    )
+    return _registration_mask_response(pid, vid, entry)
+
+
+@app.post("/api/projects/{pid}/registration/videos/{vid}/edges")
+def fit_registration_edges(pid: str, vid: str, req: RegistrationEdgesRequest):
+    """Fit lens distortion and square homography from four sampled floor edges."""
+    video = pm.get_video(pid, vid)
+    project = pm.get_project(pid)
+    if video is None or project is None:
+        raise HTTPException(404, "Video not found")
+    unknown = sorted(set(req.edges) - set(EDGE_NAMES))
+    if unknown:
+        raise HTTPException(400, f"Unknown edge names: {', '.join(unknown)}")
+    target_size = int((project.get("registration") or {}).get("target_size") or 1000)
+    try:
+        fitted = fit_edge_registration(
+            req.edges,
+            int(video.get("width") or 1),
+            int(video.get("height") or 1),
+            target_size,
+        )
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    normalized_edges = {
+        name: np.clip(np.asarray(req.edges.get(name) or [], dtype=float), 0.0, 1.0).tolist()
+        for name in EDGE_NAMES
+    }
+    entry = pm.update_registration_video(
+        pid,
+        vid,
+        {
+            "edge_points": normalized_edges,
+            "calibration_source": "partial_edges_radial_distortion",
+            "camera_matrix": fitted["camera_matrix"],
+            "distortion_coefficients": fitted["distortion_coefficients"],
+            "source_corners": fitted["undistorted_corners"],
+            "homography": fitted["homography"],
+            "straightness_rms_pixels": fitted["straightness_rms_pixels"],
+            "registered": True,
+        },
+    )
+    return {"registration": entry, **fitted}
+
+
+@app.get("/api/projects/{pid}/registration/videos/{vid}/mask")
+def get_registration_mask(pid: str, vid: str):
+    project = pm.get_project(pid)
+    entry = ((project or {}).get("registration") or {}).get("videos", {}).get(vid)
+    if not entry:
+        raise HTTPException(404, "Registration video not found")
+    return _registration_mask_response(pid, vid, entry)
+
+
+@app.delete("/api/projects/{pid}/registration/videos/{vid}")
+def clear_registration_video(pid: str, vid: str):
+    project = pm.get_project(pid)
+    entry = ((project or {}).get("registration") or {}).get("videos", {}).get(vid)
+    if entry is None:
+        raise HTTPException(404, "Registration video not found")
+    mask_file = entry.get("mask_file")
+    if mask_file:
+        (pm._project_dir(pid) / str(mask_file)).unlink(missing_ok=True)
+    _clear_registration_history_files(pid, vid)
+    entry = pm.update_registration_video(
+        pid,
+        vid,
+        {
+            "points": [],
+            "labels": [],
+            "polygon_vertices": [],
+            "mask_source": None,
+            "calibration_source": None,
+            "camera_matrix": None,
+            "distortion_coefficients": None,
+            "edge_points": {},
+            "straightness_rms_pixels": None,
+            "mask_file": None,
+            "labeled": False,
+            "registered": False,
+            "source_corners": None,
+            "homography": None,
+            "morphology_history": [],
+            "morphology_cursor": 0,
+        },
+    )
+    return {"status": "cleared", "mask": None, "registration": entry}
+
+
+@app.post("/api/projects/{pid}/registration/videos/{vid}/morphology")
+def apply_registration_morphology(pid: str, vid: str, req: RegistrationMorphologyRequest):
+    operation = req.operation.strip().lower()
+    if operation not in {"opening", "closing"}:
+        raise HTTPException(400, "operation must be 'opening' or 'closing'")
+    video = pm.get_video(pid, vid)
+    if video is None:
+        raise HTTPException(404, "Video not found")
+    max_kernel_size = max(
+        1,
+        min(int(video.get("width") or 1), int(video.get("height") or 1)),
+    )
+    kernel_size = int(req.kernel_size)
+    if kernel_size < 1 or kernel_size > max_kernel_size:
+        raise HTTPException(
+            400,
+            f"kernel_size must be an integer from 1 to {max_kernel_size} "
+            "(the smaller video dimension)",
+        )
+
+    project = pm.get_project(pid)
+    entry = ((project or {}).get("registration") or {}).get("videos", {}).get(vid)
+    if not entry or not entry.get("mask_file"):
+        raise HTTPException(409, "Segment the floor before applying morphology")
+    mask_path = pm._project_dir(pid) / str(entry["mask_file"])
+    before_raw = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+    if before_raw is None:
+        raise HTTPException(409, "Registration mask is unreadable")
+    before = before_raw > 0
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    op = cv2.MORPH_OPEN if operation == "opening" else cv2.MORPH_CLOSE
+    after = cv2.morphologyEx(before.astype(np.uint8), op, kernel) > 0
+    added = np.flatnonzero(after & ~before).astype(np.int64)
+    removed = np.flatnonzero(before & ~after).astype(np.int64)
+
+    history = list(entry.get("morphology_history") or [])
+    cursor = max(0, min(int(entry.get("morphology_cursor") or 0), len(history)))
+    # A new edit after undo starts a new branch; discard redo deltas.
+    for stale in history[cursor:]:
+        stale_file = stale.get("delta_file")
+        if stale_file:
+            (pm._project_dir(pid) / str(stale_file)).unlink(missing_ok=True)
+    history = history[:cursor]
+    edit_id = f"{len(history):03d}_{int(__import__('time').time_ns())}"
+    delta_path = _registration_history_dir(pid, vid) / f"{edit_id}.npz"
+    np.savez_compressed(delta_path, added=added, removed=removed, shape=np.asarray(after.shape))
+    history.append(
+        {
+            "id": edit_id,
+            "operation": operation,
+            "kernel_size": kernel_size,
+            "pixels_added": int(added.size),
+            "pixels_removed": int(removed.size),
+            "delta_file": str(delta_path.relative_to(pm._project_dir(pid))),
+        }
+    )
+    if len(history) > 50:
+        for old in history[:-50]:
+            (pm._project_dir(pid) / str(old["delta_file"])).unlink(missing_ok=True)
+        history = history[-50:]
+    cursor = len(history)
+    cv2.imwrite(str(mask_path), after.astype(np.uint8) * 255)
+    entry = pm.update_registration_video(
+        pid,
+        vid,
+        {
+            "morphology_history": history,
+            "morphology_cursor": cursor,
+            "registered": False,
+            "source_corners": None,
+            "homography": None,
+        },
+    )
+    return _registration_mask_response(pid, vid, entry)
+
+
+def _registration_history_step(pid: str, vid: str, direction: str) -> dict:
+    project = pm.get_project(pid)
+    entry = ((project or {}).get("registration") or {}).get("videos", {}).get(vid)
+    if not entry or not entry.get("mask_file"):
+        raise HTTPException(409, "No registration mask")
+    history = list(entry.get("morphology_history") or [])
+    cursor = max(0, min(int(entry.get("morphology_cursor") or 0), len(history)))
+    if direction == "undo":
+        if cursor == 0:
+            raise HTTPException(409, "Nothing to undo")
+        edit = history[cursor - 1]
+        next_cursor = cursor - 1
+    else:
+        if cursor >= len(history):
+            raise HTTPException(409, "Nothing to redo")
+        edit = history[cursor]
+        next_cursor = cursor + 1
+    delta_path = pm._project_dir(pid) / str(edit["delta_file"])
+    if not delta_path.is_file():
+        raise HTTPException(409, "Morphology history delta is missing")
+    with np.load(delta_path) as delta:
+        added = np.asarray(delta["added"], dtype=np.int64)
+        removed = np.asarray(delta["removed"], dtype=np.int64)
+    mask_path = pm._project_dir(pid) / str(entry["mask_file"])
+    raw = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+    if raw is None:
+        raise HTTPException(409, "Registration mask is unreadable")
+    flat = (raw > 0).reshape(-1)
+    if direction == "undo":
+        flat[added] = False
+        flat[removed] = True
+    else:
+        flat[removed] = False
+        flat[added] = True
+    cv2.imwrite(str(mask_path), flat.reshape(raw.shape).astype(np.uint8) * 255)
+    entry = pm.update_registration_video(
+        pid,
+        vid,
+        {
+            "morphology_cursor": next_cursor,
+            "registered": False,
+            "source_corners": None,
+            "homography": None,
+        },
+    )
+    return _registration_mask_response(pid, vid, entry)
+
+
+@app.post("/api/projects/{pid}/registration/videos/{vid}/morphology/undo")
+def undo_registration_morphology(pid: str, vid: str):
+    return _registration_history_step(pid, vid, "undo")
+
+
+@app.post("/api/projects/{pid}/registration/videos/{vid}/morphology/redo")
+def redo_registration_morphology(pid: str, vid: str):
+    return _registration_history_step(pid, vid, "redo")
+
+
+@app.post("/api/projects/{pid}/registration/compute")
+def compute_registration(pid: str):
+    project = pm.get_project(pid)
+    if project is None:
+        raise HTTPException(404, "Project not found")
+    registration = project.get("registration")
+    if not registration:
+        raise HTTPException(409, "Registration has not been initialized")
+    entries = registration.get("videos") or {}
+    missing = [
+        vid for vid in project.get("videos", {})
+        if not (entries.get(vid) or {}).get("labeled")
+        and not (entries.get(vid) or {}).get("registered")
+    ]
+    if missing:
+        raise HTTPException(409, f"Floor masks are missing for {len(missing)} video(s): {', '.join(missing)}")
+
+    size = max(2, int(registration.get("target_size") or 1000))
+    target = np.asarray(
+        [[0, 0], [size - 1, 0], [size - 1, size - 1], [0, size - 1]],
+        dtype=np.float32,
+    )
+    results: dict[str, dict] = {}
+    for vid in project.get("videos", {}):
+        entry = entries[vid]
+        if entry.get("registered") and entry.get("calibration_source") == "partial_edges_radial_distortion":
+            results[vid] = entry
+            continue
+        mask_path = pm._project_dir(pid) / str(entry["mask_file"])
+        mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            raise HTTPException(409, f"Registration mask is unreadable for video {vid}")
+        try:
+            corners = _floor_quad_from_mask(mask)
+        except ValueError as e:
+            raise HTTPException(422, f"Video {vid}: {e}")
+        matrix = cv2.getPerspectiveTransform(corners.astype(np.float32), target)
+        results[vid] = pm.update_registration_video(
+            pid,
+            vid,
+            {
+                "source_corners": corners.astype(float).tolist(),
+                "homography": matrix.astype(float).tolist(),
+                "registered": True,
+            },
+        )
+    return {
+        "status": "complete",
+        "target_size": size,
+        "videos": results,
+    }
+
+
+def _render_registration_preview(pid: str, vid: str, frame_idx: int, view: str) -> Response:
+    """Decode one arbitrary frame and return its original or registered view."""
+    project = pm.get_project(pid)
+    video = pm.get_video(pid, vid)
+    entry = ((project or {}).get("registration") or {}).get("videos", {}).get(vid)
+    if video is None or entry is None:
+        raise HTTPException(404, "Registration video not found")
+    if not entry.get("registered") or not entry.get("homography"):
+        raise HTTPException(409, "Generate registration parameters for this video first")
+    num_frames = max(1, int(video.get("num_frames") or 1))
+    if frame_idx < 0 or frame_idx >= num_frames:
+        raise HTTPException(400, f"frame_idx must be from 0 to {num_frames - 1}")
+    view = view.strip().lower()
+    if view not in {"original", "registered"}:
+        raise HTTPException(400, "view must be 'original' or 'registered'")
+    source_path = Path(str(video.get("source_path") or ""))
+    if not source_path.is_file():
+        raise HTTPException(404, "Video source file not found")
+    capture = cv2.VideoCapture(str(source_path))
+    try:
+        if frame_idx:
+            capture.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ok, frame = capture.read()
+    finally:
+        capture.release()
+    if not ok or frame is None:
+        raise HTTPException(500, "Could not decode video frame 0")
+    width = max(1, int(video.get("width") or frame.shape[1]))
+    height = max(1, int(video.get("height") or frame.shape[0]))
+    if frame.shape[1] != width or frame.shape[0] != height:
+        frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+    output = frame
+    if view == "registered":
+        if entry.get("camera_matrix") and entry.get("distortion_coefficients"):
+            camera = np.asarray(entry["camera_matrix"], dtype=np.float64).reshape(3, 3)
+            distortion = np.asarray(entry["distortion_coefficients"], dtype=np.float64)
+            output = cv2.undistort(output, camera, distortion, None, camera)
+        matrix = np.asarray(entry["homography"], dtype=np.float64).reshape(3, 3)
+        target_size = max(2, int((project.get("registration") or {}).get("target_size") or 1000))
+        output = cv2.warpPerspective(
+            output,
+            matrix,
+            (target_size, target_size),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0),
+        )
+    ok, encoded = cv2.imencode(".jpg", output, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    if not ok:
+        raise HTTPException(500, "Could not encode preview")
+    return Response(
+        content=encoded.tobytes(),
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "private, max-age=300",
+            "X-Frame-Index": str(frame_idx),
+            "X-Registration-View": view,
+        },
+    )
+
+
+@app.get("/api/projects/{pid}/registration/videos/{vid}/preview")
+def preview_registered_first_frame(pid: str, vid: str):
+    """Backward-compatible registered preview of physical frame 0."""
+    return _render_registration_preview(pid, vid, 0, "registered")
+
+
+@app.get("/api/projects/{pid}/registration/videos/{vid}/preview/{frame_idx}")
+def preview_registration_frame(
+    pid: str,
+    vid: str,
+    frame_idx: int,
+    view: str = Query("registered"),
+):
+    return _render_registration_preview(pid, vid, frame_idx, view)
 
 
 @app.delete("/api/projects/{pid}", status_code=204)

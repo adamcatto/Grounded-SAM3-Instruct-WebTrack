@@ -71,6 +71,12 @@ interface AppState {
   // Project / video state
   project: Project | null
   currentVideoId: string | null
+  /** First-frame floor calibration workflow; tracking annotations remain isolated. */
+  registrationMode: boolean
+  registrationTool: 'points' | 'polygon' | 'edges'
+  registrationPolygonPoints: [number, number][]
+  registrationActiveEdge: 'top' | 'right' | 'bottom' | 'left'
+  registrationEdgePoints: Record<'top' | 'right' | 'bottom' | 'left', [number, number][]>
 
   // Annotation state
   currentFrame: number
@@ -126,6 +132,13 @@ interface AppState {
   // Actions
   setProject: (p: Project | null) => void
   setCurrentVideo: (vid: string | null) => void
+  enterRegistrationVideo: (vid: string) => void
+  setRegistrationTool: (tool: 'points' | 'polygon' | 'edges') => void
+  addRegistrationPolygonPoint: (x: number, y: number) => void
+  clearRegistrationPolygonPoints: () => void
+  setRegistrationActiveEdge: (edge: 'top' | 'right' | 'bottom' | 'left') => void
+  addRegistrationEdgePoint: (edge: 'top' | 'right' | 'bottom' | 'left', x: number, y: number) => void
+  clearRegistrationEdgePoints: (edge?: 'top' | 'right' | 'bottom' | 'left') => void
   setCurrentFrame: (f: number) => void
   setCurrentObject: (oid: string | null) => void
   setPointMode: (m: PointMode) => void
@@ -174,6 +187,11 @@ const _initialConfig = loadConfig()
 export const useStore = create<AppState>((set, get) => ({
   project: null,
   currentVideoId: null,
+  registrationMode: false,
+  registrationTool: 'points',
+  registrationPolygonPoints: [],
+  registrationActiveEdge: 'top',
+  registrationEdgePoints: { top: [], right: [], bottom: [], left: [] },
   currentFrame: 0,
   currentObjectId: null,
   pointMode: null,
@@ -269,8 +287,10 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   setCurrentVideo: vid => {
+    const wasRegistration = get().registrationMode
+    set({ registrationMode: false })
     const prev = get().currentVideoId
-    if (prev !== vid) {
+    if (prev !== vid || wasRegistration) {
       const vidData = vid ? get().project?.videos[vid] : undefined
       const alreadyPropagated = vidData?.propagation_complete ?? false
 
@@ -316,9 +336,75 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
+  enterRegistrationVideo: vid => {
+    const entry = get().project?.registration?.videos?.[vid]
+    const points = entry?.points ?? []
+    const labels = entry?.labels ?? []
+    _savedMaskCacheOrder = []
+    set({
+      registrationMode: true,
+      registrationTool: entry?.calibration_source === 'partial_edges_radial_distortion'
+        ? 'edges'
+        : entry?.mask_source === 'convex_hull_polygon' ? 'polygon' : 'points',
+      registrationPolygonPoints: [...(entry?.polygon_vertices ?? [])],
+      registrationActiveEdge: 'top',
+      registrationEdgePoints: {
+        top: [...(entry?.edge_points?.top ?? [])],
+        right: [...(entry?.edge_points?.right ?? [])],
+        bottom: [...(entry?.edge_points?.bottom ?? [])],
+        left: [...(entry?.edge_points?.left ?? [])],
+      },
+      currentVideoId: vid,
+      currentFrame: 0,
+      propagationStartFrame: 0,
+      currentObjectId: '__registration_floor__',
+      pointMode: 'add',
+      localAnnotations: {
+        __registration_floor__: {
+          '0': {
+            points: points.map(([x, y], i) => ({
+              x,
+              y,
+              label: (labels[i] ?? 1) as 0 | 1,
+            })),
+          },
+        },
+      },
+      currentFrameMasks: {},
+      currentFrameMasksFrame: null,
+      savedMaskCache: {},
+      isPlaying: false,
+      viewerTab: 'annotate',
+      anchorPhase: false,
+      undoStack: [],
+      redoStack: [],
+    })
+  },
+  setRegistrationTool: tool => set({ registrationTool: tool }),
+  addRegistrationPolygonPoint: (x, y) => set(s => ({
+    registrationPolygonPoints: [...s.registrationPolygonPoints, [x, y]],
+  })),
+  clearRegistrationPolygonPoints: () => set({ registrationPolygonPoints: [] }),
+  setRegistrationActiveEdge: edge => set({ registrationActiveEdge: edge }),
+  addRegistrationEdgePoint: (edge, x, y) => set(s => ({
+    registrationEdgePoints: {
+      ...s.registrationEdgePoints,
+      [edge]: [...s.registrationEdgePoints[edge], [x, y]],
+    },
+  })),
+  clearRegistrationEdgePoints: edge => set(s => ({
+    registrationEdgePoints: edge
+      ? { ...s.registrationEdgePoints, [edge]: [] }
+      : { top: [], right: [], bottom: [], left: [] },
+  })),
+
   // Never allow currentFrame to go below propagationStartFrame
   setCurrentFrame: f => {
-    const { propagationStartFrame } = get()
+    const { propagationStartFrame, registrationMode } = get()
+    if (registrationMode) {
+      set({ currentFrame: 0 })
+      return
+    }
     const clamped = Math.max(f, propagationStartFrame)
     set({ currentFrame: clamped })
   },

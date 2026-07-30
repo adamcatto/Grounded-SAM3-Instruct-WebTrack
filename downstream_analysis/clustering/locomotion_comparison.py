@@ -26,6 +26,7 @@ if str(_BACKEND) not in sys.path:
     sys.path.insert(0, str(_BACKEND))
 
 from mask_store import VideoMaskStorage
+from ..registration import registration_for_video, registration_signature, warp_masks
 
 from ..tracking_io import (
     VideoTrackContext,
@@ -90,6 +91,9 @@ def _load_single_mouse_frame_features_from_cache(
         return None
 
     data = np.load(cache_path, allow_pickle=True)
+    cached_sig = str(data["registration_signature"]) if "registration_signature" in data else ""
+    if cached_sig != registration_signature(ctx.registration):
+        return None
     ff21 = np.asarray(data["frame_features"], dtype=np.float64)
     obj_a_key = str(data["obj_a_key"])
     obj_b_key = str(data["obj_b_key"])
@@ -141,7 +145,7 @@ def _extract_single_mouse_frame_features(
     frame_features = np.full((total_fr, N_SINGLE_FEATURES), np.nan, dtype=np.float64)
 
     for fi in range(start, n):
-        masks = ms.load_masks_dense(fi)
+        masks = warp_masks(ms.load_masks_dense(fi), ctx.registration)
         row = fi - start
         mask = masks.get(obj_key)
         if mask is not None:
@@ -253,14 +257,17 @@ def extract_locomotion_features(
         if identity is None:
             continue
 
-        w = int(v.get("width") or 1)
-        h = int(v.get("height") or 1)
+        reg = registration_for_video(config, str(vid))
+        w = h = int(reg["target_size"]) if reg else int(v.get("width") or 1)
+        if not reg:
+            h = int(v.get("height") or 1)
         diag = float(np.hypot(w, h))
         area = float(w * h)
 
         ctx = VideoTrackContext(
             video_id=str(vid), video_name=vname,
             config=dict(v), video_dir=vdir,
+            registration=reg,
         )
 
         ff, from_cache = _extract_single_mouse_frame_features(
@@ -359,14 +366,17 @@ def extract_resident_features(
         else:
             continue  # no resident (e.g. both littermates)
 
-        w = int(v.get("width") or 1)
-        h = int(v.get("height") or 1)
+        reg = registration_for_video(config, str(vid))
+        w = h = int(reg["target_size"]) if reg else int(v.get("width") or 1)
+        if not reg:
+            h = int(v.get("height") or 1)
         diag = float(np.hypot(w, h))
         area = float(w * h)
 
         ctx = VideoTrackContext(
             video_id=str(vid), video_name=vname,
             config=dict(v), video_dir=vdir,
+            registration=reg,
         )
 
         ff, from_cache = _extract_single_mouse_frame_features(

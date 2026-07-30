@@ -328,6 +328,65 @@ class ProjectManager:
         self._save_config(pid, config)
         return config
 
+    def initialize_registration(self, pid: str, target_size: int = 1000) -> dict:
+        """Create/refresh the project-level first-frame floor registration manifest."""
+        config = self.get_project(pid)
+        if config is None:
+            raise ValueError(f"Project {pid} not found")
+        previous = config.get("registration") or {}
+        previous_videos = previous.get("videos") or {}
+        videos: dict[str, dict] = {}
+        for vid in config.get("videos", {}):
+            old = previous_videos.get(vid) or {}
+            videos[vid] = {
+                "frame_idx": 0,
+                "points": list(old.get("points") or []),
+                "labels": list(old.get("labels") or []),
+                "polygon_vertices": list(old.get("polygon_vertices") or []),
+                "mask_source": old.get("mask_source"),
+                "mask_file": old.get("mask_file"),
+                "source_corners": old.get("source_corners"),
+                "homography": old.get("homography"),
+                "labeled": bool(old.get("labeled")),
+                "registered": bool(old.get("registered")),
+                "morphology_history": list(old.get("morphology_history") or []),
+                "morphology_cursor": int(old.get("morphology_cursor") or 0),
+                "edge_points": dict(old.get("edge_points") or {}),
+                "calibration_source": old.get("calibration_source"),
+                "camera_matrix": old.get("camera_matrix"),
+                "distortion_coefficients": old.get("distortion_coefficients"),
+                "straightness_rms_pixels": old.get("straightness_rms_pixels"),
+            }
+        registration = {
+            "version": 1,
+            "method": "floor_mask_quadrilateral_to_square_homography",
+            "orientation_policy": "unspecified_dihedral_rotation_reflection_invariant_analysis",
+            "target_size": max(2, int(target_size)),
+            "status": "complete" if videos and all(v["registered"] for v in videos.values()) else "labeling",
+            "videos": videos,
+        }
+        config["registration"] = registration
+        self._save_config(pid, config)
+        return registration
+
+    def update_registration_video(self, pid: str, vid: str, updates: dict) -> dict:
+        config = self.get_project(pid)
+        if config is None or vid not in config.get("videos", {}):
+            raise ValueError(f"Video {vid} not found in project {pid}")
+        registration = config.get("registration")
+        if not registration:
+            registration = self.initialize_registration(pid)
+            config = self.get_project(pid)
+        entry = registration.setdefault("videos", {}).setdefault(vid, {"frame_idx": 0})
+        entry.update(updates)
+        entries = list(registration.get("videos", {}).values())
+        registration["status"] = (
+            "complete" if entries and all(bool(v.get("registered")) for v in entries) else "labeling"
+        )
+        config["registration"] = registration
+        self._save_config(pid, config)
+        return entry
+
     def delete_project(self, pid: str):
         d = self._find_project_dir(pid)
         if d is not None:
@@ -381,6 +440,27 @@ class ProjectManager:
             },
         }
         config["videos"][vid] = video_meta
+        if config.get("registration"):
+            config["registration"].setdefault("videos", {})[vid] = {
+                "frame_idx": 0,
+                "points": [],
+                "labels": [],
+                "polygon_vertices": [],
+                "mask_source": None,
+                "mask_file": None,
+                "source_corners": None,
+                "homography": None,
+                "labeled": False,
+                "registered": False,
+                "morphology_history": [],
+                "morphology_cursor": 0,
+                "edge_points": {},
+                "calibration_source": None,
+                "camera_matrix": None,
+                "distortion_coefficients": None,
+                "straightness_rms_pixels": None,
+            }
+            config["registration"]["status"] = "labeling"
         self._save_config(pid, config)
         return video_meta
 
@@ -409,6 +489,14 @@ class ProjectManager:
         if config is None:
             raise ValueError(f"Project {pid} not found")
         config["videos"].pop(vid, None)
+        if config.get("registration"):
+            config["registration"].get("videos", {}).pop(vid, None)
+            remaining = list(config["registration"].get("videos", {}).values())
+            config["registration"]["status"] = (
+                "complete"
+                if remaining and all(bool(v.get("registered")) for v in remaining)
+                else "labeling"
+            )
         self._save_config(pid, config)
         video_dir = self._find_video_dir(pid, vid)
         if video_dir is not None and video_dir.exists():

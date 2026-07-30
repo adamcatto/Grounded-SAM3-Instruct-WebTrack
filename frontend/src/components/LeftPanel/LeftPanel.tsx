@@ -27,6 +27,7 @@ import {
 import NumericDraftInput from '../NumericDraftInput'
 import ObjectCard from './ObjectCard'
 import StepIndicator from './StepIndicator'
+import RegistrationPanel from './RegistrationPanel'
 import type { PropagationEvent } from '../../types'
 
 function targetIsTypingContext(target: EventTarget | null): boolean {
@@ -68,6 +69,7 @@ export default function LeftPanel() {
     invalidateSavedMaskFrame,
     undoStack, redoStack, historyBusy, undoLast, redoLast,
     viewerTab,
+    registrationMode,
   } = store
 
   const handleCommitAnchorRef = useRef<() => Promise<void>>(async () => {})
@@ -1282,6 +1284,7 @@ export default function LeftPanel() {
   }
 
   if (!video) return null
+  if (registrationMode) return <RegistrationPanel />
 
   const manualNAnchors = manualAnchorPrefixRef.current
   const showInferRemainderButton =

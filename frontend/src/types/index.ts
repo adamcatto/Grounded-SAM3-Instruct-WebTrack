@@ -72,6 +72,44 @@ export interface Project {
   name: string
   created_at: string
   videos: Record<string, VideoMeta>
+  registration?: ProjectRegistration
+}
+
+export interface VideoRegistration {
+  frame_idx: 0
+  points: [number, number][]
+  labels: number[]
+  polygon_vertices?: [number, number][]
+  mask_source?: 'point_prompts' | 'convex_hull_polygon' | null
+  mask_file?: string | null
+  source_corners?: [number, number][] | null
+  homography?: number[][] | null
+  labeled: boolean
+  registered: boolean
+  morphology_history?: RegistrationMorphologyEdit[]
+  morphology_cursor?: number
+  edge_points?: Record<'top' | 'right' | 'bottom' | 'left', [number, number][]>
+  calibration_source?: 'floor_mask' | 'partial_edges_radial_distortion' | null
+  camera_matrix?: number[][] | null
+  distortion_coefficients?: number[] | null
+  straightness_rms_pixels?: number | null
+}
+
+export interface RegistrationMorphologyEdit {
+  id: string
+  operation: 'opening' | 'closing'
+  kernel_size: number
+  pixels_added: number
+  pixels_removed: number
+  delta_file: string
+}
+
+export interface ProjectRegistration {
+  version: number
+  method: string
+  target_size: number
+  status: 'labeling' | 'complete'
+  videos: Record<string, VideoRegistration>
 }
 
 export interface PointAnnotation {
