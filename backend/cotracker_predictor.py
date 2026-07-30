@@ -77,13 +77,14 @@ class CoTracker3Predictor:
             "loaded": self.loaded,
             "device": self.device,
             "shape_regularization": {
-                "type": "per_object_similarity",
+                "type": "appearance_guided_per_object_similarity",
                 "strength": float(os.environ.get(
                     "COTRACKER3_POSE_SHAPE_STRENGTH",
                     str(DEFAULT_SHAPE_REGULARIZATION_STRENGTH),
                 )),
                 "minimum_reference_scale": 0.75,
                 "maximum_scale_change_per_frame": 0.025,
+                "orientation_source": "local_foreground_pca_with_temporal_sign",
             },
         }
 
@@ -175,6 +176,7 @@ class CoTracker3Predictor:
         max_scale_step: float = 0.025,
         max_rotation_step: float = np.deg2rad(20.0),
         skip_first: bool = False,
+        frame_images: np.ndarray | None = None,
     ) -> tuple[np.ndarray, dict]:
         """Regularize each object's landmarks toward a rotation-invariant reference shape.
 
@@ -221,17 +223,42 @@ class CoTracker3Predictor:
                     fitted_angle = float(angles.get(group_idx, 0.0))
 
                 previous_scale = float(scales.get(group_idx, 1.0))
+                previous_angle = float(angles.get(group_idx, 0.0))
+                previous_velocity = float(angular_velocities.get(group_idx, 0.0))
+                image_orientation_available = False
+                if frame_images is not None and frame_idx < len(frame_images):
+                    reference_axis = ref[-1] - ref[0]
+                    reference_span = float(np.linalg.norm(reference_axis))
+                    image_axis = CoTracker3Predictor._foreground_major_axis(
+                        frame_images[frame_idx],
+                        raw_mean,
+                        reference_span,
+                    )
+                    if image_axis is not None and reference_span > 1e-6:
+                        reference_angle = float(np.arctan2(reference_axis[1], reference_axis[0]))
+                        image_angle = float(np.arctan2(image_axis[1], image_axis[0]))
+                        image_transform = image_angle - reference_angle
+                        predicted_angle = previous_angle + previous_velocity
+                        candidates = (image_transform, image_transform + np.pi)
+                        fitted_angle = min(
+                            candidates,
+                            key=lambda candidate: abs(
+                                (candidate - predicted_angle + np.pi) % (2 * np.pi) - np.pi
+                            ),
+                        )
+                        image_orientation_available = True
                 # A collapsed landmark constellation has an ill-conditioned
                 # orientation and can flip as points cross. Continue the last
                 # trustworthy angular motion instead of accepting that flip.
-                orientation_reliable = fitted_scale >= max(0.55, previous_scale * 0.65)
+                orientation_reliable = (
+                    image_orientation_available
+                    or fitted_scale >= max(0.55, previous_scale * 0.65)
+                )
                 scale = float(np.clip(
                     fitted_scale,
                     max(0.75, previous_scale * (1.0 - max_scale_step)),
                     min(2.0, previous_scale * (1.0 + max_scale_step)),
                 ))
-                previous_angle = float(angles.get(group_idx, 0.0))
-                previous_velocity = float(angular_velocities.get(group_idx, 0.0))
                 if orientation_reliable:
                     angle_delta = (fitted_angle - previous_angle + np.pi) % (2 * np.pi) - np.pi
                     angle_delta = float(np.clip(angle_delta, -max_rotation_step, max_rotation_step))
@@ -251,6 +278,87 @@ class CoTracker3Predictor:
                 angles[group_idx] = angle
                 angular_velocities[group_idx] = angular_velocity
         return output, state
+
+    @staticmethod
+    def _foreground_major_axis(
+        frame_rgb: np.ndarray,
+        center_xy: np.ndarray,
+        reference_span: float,
+    ) -> np.ndarray | None:
+        """Estimate an oriented animal axis from local foreground appearance.
+
+        The connected component nearest the tracked centroid supplies an
+        unoriented PCA axis. Its longer, thinner extension is treated as the
+        tail side, resolving the 180-degree ambiguity for elongated animals.
+        """
+        frame = np.asarray(frame_rgb, dtype=np.uint8)
+        height, width = frame.shape[:2]
+        radius = int(np.clip(reference_span * 1.35, 48, min(height, width) * 0.35))
+        cx = int(np.clip(round(float(center_xy[0])), 0, width - 1))
+        cy = int(np.clip(round(float(center_xy[1])), 0, height - 1))
+        x0, x1 = max(0, cx - radius), min(width, cx + radius + 1)
+        y0, y1 = max(0, cy - radius), min(height, cy + radius + 1)
+        crop = frame[y0:y1, x0:x1]
+        if min(crop.shape[:2]) < 16:
+            return None
+        border = np.concatenate([
+            crop[0], crop[-1], crop[:, 0], crop[:, -1],
+        ], axis=0).astype(np.float32)
+        background = np.median(border, axis=0)
+        difference = np.linalg.norm(crop.astype(np.float32) - background, axis=2)
+        difference = cv2.GaussianBlur(difference, (5, 5), 0)
+        scaled = np.clip(difference, 0, 255).astype(np.uint8)
+        threshold, mask = cv2.threshold(scaled, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        if threshold < 10:
+            mask = (scaled >= 10).astype(np.uint8) * 255
+        kernel = np.ones((3, 3), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        count, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        if count <= 1:
+            return None
+        local_center = np.asarray([cx - x0, cy - y0], dtype=np.float32)
+        candidates = []
+        for label in range(1, count):
+            area = int(stats[label, cv2.CC_STAT_AREA])
+            if area < 40:
+                continue
+            distance = float(np.linalg.norm(centroids[label] - local_center))
+            candidates.append((distance, -area, label))
+        if not candidates:
+            return None
+        distance, _negative_area, label = min(candidates)
+        if distance > radius * 0.8:
+            return None
+        yy, xx = np.nonzero(labels == label)
+        points = np.column_stack([xx, yy]).astype(np.float32)
+        if len(points) < 40:
+            return None
+        centered = points - points.mean(axis=0)
+        covariance = centered.T @ centered / max(1, len(points) - 1)
+        eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+        if eigenvalues[-1] < max(16.0, eigenvalues[0] * 1.8):
+            return None
+        axis = eigenvectors[:, -1].astype(np.float32)
+        centered_on_median = points - np.median(points, axis=0)
+        projections = centered_on_median @ axis
+        perpendicular = centered_on_median @ np.asarray([-axis[1], axis[0]])
+        q10, q35, q65, q90 = np.quantile(projections, [0.10, 0.35, 0.65, 0.90])
+        negative_side = perpendicular[(projections >= q10) & (projections <= q35)]
+        positive_side = perpendicular[(projections >= q65) & (projections <= q90)]
+        negative_width = (
+            float(np.quantile(negative_side, 0.9) - np.quantile(negative_side, 0.1))
+            if len(negative_side) >= 10 else 0.0
+        )
+        positive_width = (
+            float(np.quantile(positive_side, 0.9) - np.quantile(positive_side, 0.1))
+            if len(positive_side) >= 10 else 0.0
+        )
+        # The rump / tail-base side is typically wider than the tapered snout
+        # side, so orient the major axis from snout toward tail base.
+        if positive_width < negative_width:
+            axis *= -1
+        return axis / max(float(np.linalg.norm(axis)), 1e-8)
 
     def track(
         self,
@@ -303,6 +411,7 @@ class CoTracker3Predictor:
                     state=regularization_state,
                     strength=regularization_strength,
                     skip_first=True,
+                    frame_images=frames,
                 )
                 all_tracks.extend(chunk_tracks[1:])
                 all_visibility.extend(chunk_visibility[1:])

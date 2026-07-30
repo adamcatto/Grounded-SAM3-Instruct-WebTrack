@@ -73,11 +73,16 @@ establishes stronger novelty:
   below 75% of the labeled reference. This directly suppresses the progressive
   landmark collapse and anatomical-order inversion observed across recurrent
   CoTracker clips.
-- **Confidence-gated orientation continuation.** When the raw constellation
-  collapses, its fitted orientation becomes ill-conditioned and can flip as
-  landmarks cross. The system detects this from relative fitted scale and
-  continues a smoothed, bounded angular velocity estimated during trustworthy
-  frames instead of accepting the unstable heading.
+- **Appearance-guided heading with temporal sign disambiguation.** When the raw
+  constellation collapses, its fitted orientation becomes ill-conditioned and
+  can become orthogonal or flip as landmarks cross. Around the tracked object
+  centroid, the system estimates the foreground component against a robust
+  local background color and obtains its major axis by PCA. Because this image
+  axis has an inherent 180-degree ambiguity, the system selects the direction
+  closest to the preceding trusted heading and angular velocity, then applies
+  a bounded rotation update. If no reliable foreground component is found, it
+  falls back to confidence-gated landmark geometry. This combines direct image
+  evidence for axis alignment with temporal evidence for head-tail identity.
 - **Human constraints override model memory.** A point placed directly on the
   query frame is treated as a hard constraint. Thus manual corrections,
   anchor-derived proposals, and CoTracker3 predictions form an explicit
