@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react'
-import { X, Plus, Film, FolderOpen, Trash2, ScanLine, CheckCircle2 } from 'lucide-react'
+import { ArrowDownAZ, ArrowDownWideNarrow, ArrowUpAZ, ArrowUpWideNarrow, X, Plus, Film, FolderOpen, Trash2, ScanLine, CheckCircle2 } from 'lucide-react'
 import { useStore } from '../store/useStore'
 import { useResizable } from '../hooks/useResizable'
 import ProjectsFolderBrowserModal from './ProjectsFolderBrowserModal'
@@ -36,6 +36,8 @@ export default function ProjectDrawer() {
     direction: 'horizontal',
   })
   const [registrationBusy, setRegistrationBusy] = useState(false)
+  const [projectSort, setProjectSort] = useState<'name' | 'created'>('name')
+  const [projectSortAscending, setProjectSortAscending] = useState(true)
 
   useEffect(() => {
     if (!drawerOpen) return
@@ -88,9 +90,36 @@ export default function ProjectDrawer() {
     } catch { /* ignore */ }
   }
 
+  function sortableProjectName(value: string): string {
+    return value.trim().replace(/^[0-9a-f]{8}(?:[-_\s]+|$)/i, '').trim()
+  }
+
+  const sortedProjects = useMemo(() => {
+    const direction = projectSortAscending ? 1 : -1
+    return [...projects].sort((a, b) => {
+      let comparison: number
+      if (projectSort === 'created') {
+        const aTime = Number.isFinite(Date.parse(a.created_at)) ? Date.parse(a.created_at) : 0
+        const bTime = Number.isFinite(Date.parse(b.created_at)) ? Date.parse(b.created_at) : 0
+        comparison = aTime - bTime
+      } else {
+        comparison = sortableProjectName(a.name).localeCompare(
+          sortableProjectName(b.name),
+          undefined,
+          { sensitivity: 'base', numeric: true },
+        )
+      }
+      return comparison === 0 ? a.id.localeCompare(b.id) : comparison * direction
+    })
+  }, [projectSort, projectSortAscending, projects])
+
   const mergeableProjects = useMemo(
     () => [...projects].sort((a, b) =>
-      a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }),
+      sortableProjectName(a.name).localeCompare(
+        sortableProjectName(b.name),
+        undefined,
+        { sensitivity: 'base', numeric: true },
+      ),
     ),
     [projects],
   )
@@ -383,8 +412,34 @@ export default function ProjectDrawer() {
           {/* Projects list */}
           {projects.length > 0 && (
             <div className="space-y-1">
-              <label className="text-xs text-[#666] uppercase tracking-wider">Projects</label>
-              {projects.map(p => (
+              <div className="flex items-center gap-1.5">
+                <label className="mr-auto text-xs text-[#666] uppercase tracking-wider">Projects</label>
+                <select
+                  value={projectSort}
+                  onChange={event => {
+                    const next = event.target.value as typeof projectSort
+                    setProjectSort(next)
+                    setProjectSortAscending(next === 'name')
+                  }}
+                  className="max-w-28 rounded border border-[#444] bg-[#e5e7eb] px-1.5 py-1 text-[10px] text-[#111827]"
+                  aria-label="Sort projects by"
+                >
+                  <option value="name">Name</option>
+                  <option value="created">Creation date</option>
+                </select>
+                <button
+                  type="button"
+                  onClick={() => setProjectSortAscending(value => !value)}
+                  className="btn btn-ghost p-1 text-[#888]"
+                  title={projectSortAscending ? 'Ascending; click for descending' : 'Descending; click for ascending'}
+                  aria-label={projectSortAscending ? 'Sort ascending' : 'Sort descending'}
+                >
+                  {projectSort === 'name'
+                    ? projectSortAscending ? <ArrowDownAZ size={14} /> : <ArrowUpAZ size={14} />
+                    : projectSortAscending ? <ArrowDownWideNarrow size={14} /> : <ArrowUpWideNarrow size={14} />}
+                </button>
+              </div>
+              {sortedProjects.map(p => (
                 <button
                   key={p.id}
                   onClick={() => handleSelectProject(p)}
