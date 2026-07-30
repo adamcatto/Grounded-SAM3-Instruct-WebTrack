@@ -64,6 +64,20 @@ establishes stronger novelty:
   same image still contribute. Anchor weights are normalized independently per
   landmark over the memories in which it is visible, preserving the intended
   recency-versus-anchor weighting despite heterogeneous occlusion.
+- **Rotation-invariant anatomical shape regularization.** CoTracker landmarks
+  are grouped by their top-level biological object. For every predicted frame,
+  the system fits a translation, rotation, and scale transform from a nearby
+  fully visible labeled pose to the raw landmark constellation, then blends
+  the transformed reference shape with the model output. Translation and
+  rotation remain free, while scale changes are rate-limited and cannot fall
+  below 75% of the labeled reference. This directly suppresses the progressive
+  landmark collapse and anatomical-order inversion observed across recurrent
+  CoTracker clips.
+- **Confidence-gated orientation continuation.** When the raw constellation
+  collapses, its fitted orientation becomes ill-conditioned and can flip as
+  landmarks cross. The system detects this from relative fitted scale and
+  continues a smoothed, bounded angular velocity estimated during trustworthy
+  frames instead of accepting the unstable heading.
 - **Human constraints override model memory.** A point placed directly on the
   query frame is treated as a hard constraint. Thus manual corrections,
   anchor-derived proposals, and CoTracker3 predictions form an explicit
@@ -85,6 +99,12 @@ establishes stronger novelty:
   clips, with each completed chunk atomically written to the project state.
   The annotation viewer polls that state, so newly predicted frames become
   inspectable and correctable before the entire requested range finishes.
+- **Separation of localization and anatomical regularization.** Regularized
+  landmarks are published for analysis and review, but the next CoTracker clip
+  is queried with CoTracker's own raw endpoint. This avoids converting a shape
+  prior into unsupported image evidence, an important safeguard identified by
+  an ablation on the SCORCH example where feeding corrected geometry back into
+  the model preserved spacing but displaced the entire pose from the animal.
 - **Resolution-independent, incrementally editable output.** Normalized
   coordinates and visibility values are stored by object, part, and frame.
   This supports different display resolutions and permits annotations and

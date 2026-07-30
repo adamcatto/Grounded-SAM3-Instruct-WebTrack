@@ -2690,6 +2690,36 @@ def predict_pose(pid: str, vid: str, req: PosePredictionRequest, background_task
     points_xy = normalized_xy.copy()
     points_xy[:, 0] *= max(1, native_width - 1)
     points_xy[:, 1] *= max(1, native_height - 1)
+    reference_points_xy = points_xy.copy()
+    groups_by_object: dict[str, list[int]] = {}
+    for point_idx, (oid, _part_id) in enumerate(point_keys):
+        groups_by_object.setdefault(oid, []).append(point_idx)
+    for oid, indices in groups_by_object.items():
+        object_part_ids = [point_keys[index][1] for index in indices]
+        fully_visible_reference_frames = sorted({
+            int(frame_key)
+            for part_id in object_part_ids
+            for frame_key in annotations.get(oid, {}).get(part_id, {})
+            if int(frame_key) not in skipped_memory_frames
+            if all(
+                (candidate := annotations.get(oid, {}).get(other_part_id, {}).get(str(frame_key)))
+                and candidate.get("visible", True)
+                and candidate.get("x") is not None
+                and candidate.get("y") is not None
+                for other_part_id in object_part_ids
+            )
+        })
+        if not fully_visible_reference_frames:
+            continue
+        reference_frame = min(fully_visible_reference_frames, key=lambda frame: abs(frame - start))
+        for point_idx in indices:
+            _object_id, part_id = point_keys[point_idx]
+            reference = annotations[oid][part_id][str(reference_frame)]
+            reference_points_xy[point_idx] = [
+                reference["x"] * max(1, native_width - 1),
+                reference["y"] * max(1, native_height - 1),
+            ]
+    point_groups = list(groups_by_object.values())
     job_key = (pid, vid)
     with _pose_prediction_jobs_lock:
         if job_key in _pose_prediction_jobs:
@@ -2700,6 +2730,7 @@ def predict_pose(pid: str, vid: str, req: PosePredictionRequest, background_task
     requested_end = start + count
     payload: dict = {
         "model": "facebook/cotracker3:scaled_offline.pth",
+        "shape_regularization": cotracker3.status()["shape_regularization"],
         "status": "running",
         "start_frame": start,
         "end_frame": start,
@@ -2756,7 +2787,13 @@ def predict_pose(pid: str, vid: str, req: PosePredictionRequest, background_task
     def run_prediction() -> None:
         try:
             tracks, visibility = cotracker3.track(
-                source_path, start, count, points_xy, on_progress=encode_progress,
+                source_path,
+                start,
+                count,
+                points_xy,
+                point_groups=point_groups,
+                reference_points_xy=reference_points_xy,
+                on_progress=encode_progress,
             )
             # Also persist here in case a predictor implementation does not invoke the callback.
             encode_progress(tracks, visibility)

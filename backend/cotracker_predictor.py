@@ -15,6 +15,7 @@ import torch.nn.functional as F
 MODEL_REPO = "facebook/cotracker3"
 MODEL_FILE = "scaled_offline.pth"
 DEFAULT_MODEL_PATH = Path("/opt/models/cotracker3/scaled_offline.pth")
+DEFAULT_SHAPE_REGULARIZATION_STRENGTH = 0.9
 
 
 class CoTracker3Predictor:
@@ -75,6 +76,15 @@ class CoTracker3Predictor:
             "checkpoint_ready": bool(path and path.is_file()),
             "loaded": self.loaded,
             "device": self.device,
+            "shape_regularization": {
+                "type": "per_object_similarity",
+                "strength": float(os.environ.get(
+                    "COTRACKER3_POSE_SHAPE_STRENGTH",
+                    str(DEFAULT_SHAPE_REGULARIZATION_STRENGTH),
+                )),
+                "minimum_reference_scale": 0.75,
+                "maximum_scale_change_per_frame": 0.025,
+            },
         }
 
     def extract_feature_map(self, source_path: str, frame_idx: int) -> np.ndarray:
@@ -154,12 +164,102 @@ class CoTracker3Predictor:
             )
         return np.stack(frames)
 
+    @staticmethod
+    def regularize_pose_tracks(
+        tracks: np.ndarray,
+        visibility: np.ndarray,
+        reference_points: np.ndarray,
+        point_groups: list[list[int]],
+        state: dict | None = None,
+        strength: float = 0.9,
+        max_scale_step: float = 0.025,
+        max_rotation_step: float = np.deg2rad(20.0),
+        skip_first: bool = False,
+    ) -> tuple[np.ndarray, dict]:
+        """Regularize each object's landmarks toward a rotation-invariant reference shape.
+
+        Translation remains unconstrained. Rotation and scale follow the raw tracks, but
+        their frame-to-frame changes are bounded; landmark residuals are blended with the
+        closest similarity-transformed reference configuration.
+        """
+        output = np.asarray(tracks, dtype=np.float32).copy()
+        visible = np.asarray(visibility, dtype=bool)
+        reference = np.asarray(reference_points, dtype=np.float32)
+        state = state or {"scales": {}, "angles": {}, "angular_velocities": {}}
+        scales = state.setdefault("scales", {})
+        angles = state.setdefault("angles", {})
+        angular_velocities = state.setdefault("angular_velocities", {})
+        strength = float(np.clip(strength, 0.0, 1.0))
+        start_index = 1 if skip_first else 0
+
+        for frame_idx in range(start_index, len(output)):
+            for group_idx, group in enumerate(point_groups):
+                indices = np.asarray(group, dtype=int)
+                if len(indices) < 2:
+                    continue
+                ref = reference[indices]
+                raw = output[frame_idx, indices]
+                finite = np.isfinite(raw).all(axis=1)
+                if finite.sum() >= 2:
+                    ref_mean = ref[finite].mean(axis=0)
+                    raw_mean = raw[finite].mean(axis=0)
+                    ref_centered = ref[finite] - ref_mean
+                    raw_centered = raw[finite] - raw_mean
+                    covariance = ref_centered.T @ raw_centered
+                    u, singular, vt = np.linalg.svd(covariance)
+                    rotation = u @ vt
+                    if np.linalg.det(rotation) < 0:
+                        u[:, -1] *= -1
+                        rotation = u @ vt
+                    denominator = float(np.square(ref_centered).sum())
+                    fitted_scale = float(singular.sum() / max(denominator, 1e-8))
+                    fitted_angle = float(np.arctan2(rotation[0, 1], rotation[0, 0]))
+                else:
+                    ref_mean = ref.mean(axis=0)
+                    raw_mean = raw[np.isfinite(raw).all(axis=1)].mean(axis=0) if np.isfinite(raw).all(axis=1).any() else ref_mean
+                    fitted_scale = float(scales.get(group_idx, 1.0))
+                    fitted_angle = float(angles.get(group_idx, 0.0))
+
+                previous_scale = float(scales.get(group_idx, 1.0))
+                # A collapsed landmark constellation has an ill-conditioned
+                # orientation and can flip as points cross. Continue the last
+                # trustworthy angular motion instead of accepting that flip.
+                orientation_reliable = fitted_scale >= max(0.55, previous_scale * 0.65)
+                scale = float(np.clip(
+                    fitted_scale,
+                    max(0.75, previous_scale * (1.0 - max_scale_step)),
+                    min(2.0, previous_scale * (1.0 + max_scale_step)),
+                ))
+                previous_angle = float(angles.get(group_idx, 0.0))
+                previous_velocity = float(angular_velocities.get(group_idx, 0.0))
+                if orientation_reliable:
+                    angle_delta = (fitted_angle - previous_angle + np.pi) % (2 * np.pi) - np.pi
+                    angle_delta = float(np.clip(angle_delta, -max_rotation_step, max_rotation_step))
+                    angular_velocity = 0.75 * previous_velocity + 0.25 * angle_delta
+                else:
+                    angle_delta = previous_velocity
+                    angular_velocity = previous_velocity
+                angle = previous_angle + float(np.clip(angle_delta, -max_rotation_step, max_rotation_step))
+                rotation = np.asarray([
+                    [np.cos(angle), np.sin(angle)],
+                    [-np.sin(angle), np.cos(angle)],
+                ], dtype=np.float32)
+                structured = raw_mean + scale * ((ref - ref_mean) @ rotation)
+                blend = np.where(visible[frame_idx, indices, None], strength, 1.0)
+                output[frame_idx, indices] = (1.0 - blend) * raw + blend * structured
+                scales[group_idx] = scale
+                angles[group_idx] = angle
+                angular_velocities[group_idx] = angular_velocity
+        return output, state
+
     def track(
         self,
         source_path: str,
         start_frame: int,
         num_next_frames: int,
         points_xy: np.ndarray,
+        point_groups: list[list[int]] | None = None,
+        reference_points_xy: np.ndarray | None = None,
         on_progress: Callable[[np.ndarray, np.ndarray], None] | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Track N points, publishing cumulative results after every inferred chunk."""
@@ -174,6 +274,16 @@ class CoTracker3Predictor:
         cursor = int(start_frame)
         remaining = int(num_next_frames)
         query_points = points.copy()
+        reference_points = (
+            np.asarray(reference_points_xy, dtype=np.float32).reshape(-1, 2)
+            if reference_points_xy is not None else points.copy()
+        )
+        groups = point_groups or [list(range(len(points)))]
+        regularization_state: dict = {"scales": {}, "angles": {}, "angular_velocities": {}}
+        regularization_strength = float(os.environ.get(
+            "COTRACKER3_POSE_SHAPE_STRENGTH",
+            str(DEFAULT_SHAPE_REGULARIZATION_STRENGTH),
+        ))
         with self._lock, torch.inference_mode():
             while remaining > 0:
                 steps = min(remaining, 59)
@@ -184,11 +294,24 @@ class CoTracker3Predictor:
                 tracks, visibility = model(video, queries=query_tensor)
                 chunk_tracks = tracks[0].detach().cpu().numpy()
                 chunk_visibility = visibility[0].detach().cpu().numpy().astype(bool)
+                next_query_points = chunk_tracks[-1].copy()
+                chunk_tracks, regularization_state = self.regularize_pose_tracks(
+                    chunk_tracks,
+                    chunk_visibility,
+                    reference_points,
+                    groups,
+                    state=regularization_state,
+                    strength=regularization_strength,
+                    skip_first=True,
+                )
                 all_tracks.extend(chunk_tracks[1:])
                 all_visibility.extend(chunk_visibility[1:])
                 if on_progress is not None:
                     on_progress(np.asarray(all_tracks), np.asarray(all_visibility))
-                query_points = chunk_tracks[-1]
+                # Preserve CoTracker's own point queries for localization. The
+                # shape prior regularizes published anatomy but does not invent
+                # image evidence for the next clip.
+                query_points = next_query_points
                 cursor += steps
                 remaining -= steps
                 del video, query_tensor, tracks, visibility
