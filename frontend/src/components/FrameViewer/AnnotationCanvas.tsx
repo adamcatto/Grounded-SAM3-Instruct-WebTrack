@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useStore, currentVideo as selectCurrentVideo } from '../../store/useStore'
-import { extractFrame, addPoints, addRegistrationPoints, rebuildFromConfig, replaceFramePromptsData, removeObject, getPoseTracks, setPoseAnnotation, getProject } from '../../api/client'
+import { extractFrame, addPoints, addRegistrationPoints, rebuildFromConfig, replaceFramePromptsData, removeObject, getPoseTracks, setPoseAnnotation, setPoseOccluded, deletePoseAnnotation, getProject } from '../../api/client'
 import type { PosePoint } from '../../types'
 import { drawCompositeMask, drawMasks, drawPoints, loadMaskBitmap } from '../../utils/maskUtils'
 import { getCompositeBitmap } from '../../utils/compositeMaskCache'
@@ -149,9 +149,11 @@ export default function AnnotationCanvas({ width, height, scrubbing = false }: P
       if (poseMode && video) {
         for (const [oid, object] of Object.entries(video.pose_objects ?? {})) {
           for (const [partId, part] of Object.entries(object.parts ?? {})) {
-            const point = poseTracks[oid]?.[partId]
-              ?? video.pose_annotations?.[oid]?.[partId]?.[String(currentFrame)]
-            if (!point) continue
+            const annotation = video.pose_annotations?.[oid]?.[partId]?.[String(currentFrame)]
+            const point = annotation
+              ? (annotation.visible === false ? undefined : annotation)
+              : poseTracks[oid]?.[partId]
+            if (!point || point.x === undefined || point.y === undefined) continue
             ctx.save()
             ctx.globalAlpha = point.visible === false ? 0.35 : 1
             ctx.fillStyle = part.color
@@ -282,19 +284,42 @@ export default function AnnotationCanvas({ width, height, scrubbing = false }: P
     const ny = Math.max(0, Math.min(1, py / height))
     if (poseMode) {
       if (!currentPoseObjectId || !currentPosePartId) return
+      const oid = currentPoseObjectId
+      const partId = currentPosePartId
+      const before = video.pose_annotations?.[oid]?.[partId]?.[String(frameToUse)]
       try {
         await setPoseAnnotation(
-          pid, vid, currentPoseObjectId, currentPosePartId, frameToUse, nx, ny,
+          pid, vid, oid, partId, frameToUse, nx, ny,
         )
         const fresh = await getProject(pid)
         useStore.getState().setProject(fresh)
         setPoseTracks(current => ({
           ...current,
-          [currentPoseObjectId]: {
-            ...(current[currentPoseObjectId] ?? {}),
-            [currentPosePartId]: { x: nx, y: ny, visible: true },
+          [oid]: {
+            ...(current[oid] ?? {}),
+            [partId]: { x: nx, y: ny, visible: true },
           },
         }))
+        useStore.getState().pushHistory({
+          labelUndo: before ? 'Move pose point' : 'Add pose point',
+          labelRedo: before ? 'Move pose point' : 'Add pose point',
+          undo: async () => {
+            if (before) {
+              if (before.visible === false) {
+                await setPoseOccluded(pid, vid, oid, partId, frameToUse)
+              } else if (before.x !== undefined && before.y !== undefined) {
+                await setPoseAnnotation(pid, vid, oid, partId, frameToUse, before.x, before.y)
+              }
+            } else {
+              await deletePoseAnnotation(pid, vid, oid, partId, frameToUse)
+            }
+            useStore.getState().setProject(await getProject(pid))
+          },
+          redo: async () => {
+            await setPoseAnnotation(pid, vid, oid, partId, frameToUse, nx, ny)
+            useStore.getState().setProject(await getProject(pid))
+          },
+        })
       } catch {
         addToast('Could not save pose point', 'error')
       }

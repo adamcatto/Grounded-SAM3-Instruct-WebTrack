@@ -25,6 +25,7 @@ import {
   videoAnchorBatchSize,
 } from '../../utils/anchorFrames'
 import NumericDraftInput from '../NumericDraftInput'
+import ValidatedIntegerInput from '../ValidatedIntegerInput'
 import ObjectCard from './ObjectCard'
 import StepIndicator from './StepIndicator'
 import RegistrationPanel from './RegistrationPanel'
@@ -1132,9 +1133,9 @@ export default function LeftPanel() {
     } catch { /* non-critical */ }
   }
 
-  function _commitStartFrame() {
+  function _commitStartFrame(value = propagationStartFrame) {
     const max = video?.num_frames ? video.num_frames - 1 : 0
-    const clamped = Math.max(0, Math.min(max, propagationStartFrame))
+    const clamped = Math.max(0, Math.min(max, value))
     setPropagationStartFrame(clamped)
     setCurrentFrame(clamped)
     _saveStartFrame(clamped)
@@ -1563,16 +1564,14 @@ export default function LeftPanel() {
       {/* Start frame */}
       <div className="px-3 pb-2 flex items-center gap-2 flex-shrink-0">
         <label className="text-xs text-[#666] whitespace-nowrap">Start frame</label>
-        <input
-          type="number"
+        <ValidatedIntegerInput
+          value={propagationStartFrame}
           min={0}
           max={video.num_frames - 1}
-          value={propagationStartFrame}
-          onChange={e => setPropagationStartFrame(Math.max(0, parseInt(e.target.value) || 0))}
-          onKeyDown={e => { if (e.key === 'Enter') _commitStartFrame() }}
-          onBlur={_commitStartFrame}
+          onCommit={_commitStartFrame}
           disabled={isTracking || anchorPhase}
-          className="w-full text-xs py-1 px-2 rounded bg-[#1a1a1a] border border-[#333] text-[#ccc] disabled:opacity-40"
+          wrapperClassName="min-w-0 flex-1"
+          className="w-full rounded border border-[#333] bg-[#1a1a1a] px-2 py-1 text-xs text-[#ccc] disabled:opacity-40"
         />
       </div>
 

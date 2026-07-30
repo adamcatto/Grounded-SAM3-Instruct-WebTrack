@@ -1,6 +1,7 @@
-import React, { useEffect, useState } from 'react'
+import React from 'react'
 import { Play, Pause, SkipBack, SkipForward } from 'lucide-react'
 import { useStore, currentVideo as selectCurrentVideo } from '../../store/useStore'
+import ValidatedIntegerInput from '../ValidatedIntegerInput'
 import ObjectTrackRow from './ObjectTrackRow'
 
 function JumpToFrame({ currentFrame, min, max, onJump }: {
@@ -9,31 +10,19 @@ function JumpToFrame({ currentFrame, min, max, onJump }: {
   max: number
   onJump: (f: number) => void
 }) {
-  const [value, setValue] = useState<string | null>(null)
-
-  const commit = (raw: string) => {
-    const n = parseInt(raw, 10)
-    if (!isNaN(n)) onJump(Math.max(min, Math.min(max, n)))
-    setValue(null)
-  }
-
   return (
-    <input
-      type="number"
-      min={min}
-      max={max}
-      value={value ?? currentFrame}
-      onChange={e => setValue(e.target.value)}
-      onKeyDown={e => {
-        if (e.key === 'Enter') { commit((e.target as HTMLInputElement).value); (e.target as HTMLInputElement).blur() }
-        if (e.key === 'Escape') { setValue(null); (e.target as HTMLInputElement).blur() }
-      }}
-      onBlur={e => commit(e.target.value)}
-      onFocus={e => { setValue(String(currentFrame)); e.target.select() }}
-      title="Jump to frame"
-      className="w-16 bg-[#1a1a1a] border border-[#333] rounded px-1.5 py-0.5 text-xs font-mono text-[#ccc] text-center focus:outline-none focus:border-[#555]"
-      style={{ MozAppearance: 'textfield' } as React.CSSProperties}
-    />
+    <label className="flex flex-col gap-1 text-[10px] text-[#777]">
+      Jump to frame
+      <ValidatedIntegerInput
+        value={currentFrame}
+        min={min}
+        max={max}
+        onCommit={onJump}
+        keepSteppers
+        title="Jump to frame"
+        className="w-24 rounded border border-[#333] bg-[#1a1a1a] px-2 py-1 text-center font-mono text-xs text-[#ccc] focus:border-[#555] focus:outline-none"
+      />
+    </label>
   )
 }
 
@@ -68,7 +57,7 @@ export default function Timeline() {
   return (
     <div className="flex-shrink-0 bg-[#0d0d0d]">
       {/* Controls row */}
-      <div className="flex items-center gap-3 px-3 py-2 border-b border-[#1a1a1a]">
+      <div className="flex min-h-[72px] items-center gap-3 border-b border-[#1a1a1a] px-3 py-3">
         {/* Play/Pause */}
         <button
           onClick={() => setPlaying(!isPlaying)}
@@ -124,19 +113,17 @@ export default function Timeline() {
         </button>
 
         {/* Jump amount input */}
-        <div className="flex items-center gap-1" title="Frame jump amount (arrow keys / skip buttons)">
-          <span className="text-[10px] text-[#444]">×</span>
-          <input
-            type="number"
+        <label className="flex flex-col gap-1 text-[10px] text-[#777]" title="Frame jump amount (arrow keys / skip buttons)">
+          Frame jump amount
+          <ValidatedIntegerInput
+            value={frameJump}
             min={1}
             max={9999}
-            value={frameJump}
-            onChange={e => { const n = parseInt(e.target.value, 10); if (!isNaN(n) && n >= 1) setFrameJump(n) }}
-            onFocus={e => e.target.select()}
-            className="w-10 bg-[#1a1a1a] border border-[#2a2a2a] rounded px-1 py-0.5 text-[10px] font-mono text-[#888] text-center focus:outline-none focus:border-[#444]"
-            style={{ MozAppearance: 'textfield' } as React.CSSProperties}
+            onCommit={setFrameJump}
+            keepSteppers
+            className="w-20 rounded border border-[#2a2a2a] bg-[#1a1a1a] px-2 py-1 text-center font-mono text-xs text-[#aaa] focus:border-[#444] focus:outline-none"
           />
-        </div>
+        </label>
 
         {/* Jump to frame */}
         <JumpToFrame
