@@ -456,16 +456,41 @@ export default function UploadModal() {
                 className="w-full"
                 disabled={busy}
               />
-              <label className="mt-3 block text-xs text-[#888] font-medium">Tracking mode</label>
-              <select
-                value={trackingMode}
-                onChange={event => setTrackingMode(event.target.value as typeof trackingMode)}
-                className="w-full"
-                disabled={busy}
-              >
-                <option value="segmentation_tracking">Segmentation tracking (SAM3)</option>
-                <option value="pose_tracking">Pose tracking (CoTracker3)</option>
-              </select>
+              <fieldset className="mt-3">
+                <legend className="mb-1.5 text-xs font-medium text-[#888]">Tracking mode</legend>
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => setTrackingMode('segmentation_tracking')}
+                    className={`rounded-lg border p-3 text-left transition-colors ${
+                      trackingMode === 'segmentation_tracking'
+                        ? 'border-sky-500 bg-sky-500/15'
+                        : 'border-[#333] bg-[#151515] hover:border-[#555]'
+                    }`}
+                  >
+                    <span className="block text-xs font-semibold text-white">Segmentation tracking</span>
+                    <span className="mt-1 block text-[10px] leading-4 text-[#888]">
+                      SAM3 masks for complete objects
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => setTrackingMode('pose_tracking')}
+                    className={`rounded-lg border p-3 text-left transition-colors ${
+                      trackingMode === 'pose_tracking'
+                        ? 'border-violet-500 bg-violet-500/15'
+                        : 'border-[#333] bg-[#151515] hover:border-[#555]'
+                    }`}
+                  >
+                    <span className="block text-xs font-semibold text-white">Pose tracking</span>
+                    <span className="mt-1 block text-[10px] leading-4 text-[#888]">
+                      CoTracker3 points for named body parts
+                    </span>
+                  </button>
+                </div>
+              </fieldset>
             </div>
           )}
 

@@ -372,7 +372,7 @@ export default function ProjectDrawer() {
               <select
                 value={newTrackingMode}
                 onChange={event => setNewTrackingMode(event.target.value as typeof newTrackingMode)}
-                className="w-full text-xs"
+                className="w-full bg-[#e5e7eb] text-xs text-[#111827]"
               >
                 <option value="segmentation_tracking">Segmentation tracking (SAM3)</option>
                 <option value="pose_tracking">Pose tracking (CoTracker3)</option>
