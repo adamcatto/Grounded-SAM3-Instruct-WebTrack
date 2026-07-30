@@ -2,6 +2,13 @@
 
 A full-stack web application for interactive video object segmentation and tracking, built on Meta's [SAM 3](https://github.com/facebookresearch/sam3) (Segment Anything Model 3). Point-click to annotate objects in a single frame, then propagate masks across the entire video. Includes a downstream behavioral analysis pipeline for quantifying animal behavior from tracked masks.
 
+The `cotracker3-pose` branch also supports CoTracker3 pose projects. Choose
+**Pose tracking (CoTracker3)** when creating a project, add top-level objects
+and colored landmark parts, label each part on a selected query frame, and
+predict the next configurable number of frames. Install the official scaled
+offline checkpoint with `python scripts/download_cotracker3.py`; the backend
+also supports `COTRACKER3_CHECKPOINT` or automatic Hugging Face download.
+
 ![UI Screenshot](assets/ai/sam_webapp/Screenshot%202026-02-12%20at%2012.52.08%20PM.png)
 
 ---

@@ -141,7 +141,12 @@ class ProjectManager:
                     pass
         return projects
 
-    def create_project(self, name: str, parent_dir: Optional[Path] = None) -> dict:
+    def create_project(
+        self,
+        name: str,
+        parent_dir: Optional[Path] = None,
+        tracking_mode: str = "segmentation_tracking",
+    ) -> dict:
         pid = str(uuid.uuid4())[:8]
         slug = self._slugify(name)
         dir_name = f"{pid}-{slug}" if slug else pid
@@ -153,6 +158,7 @@ class ProjectManager:
             "id": pid,
             "name": name,
             "created_at": datetime.now(timezone.utc).isoformat(),
+            "tracking_mode": tracking_mode,
             "videos": {},
         }
         self._save_config(pid, config, project_dir=project_dir)
@@ -442,6 +448,14 @@ class ProjectManager:
                 "updated_at": None,
                 "host": None,
             },
+            "pose_objects": {},
+            "pose_annotations": {},
+            "pose_tracking": {
+                "status": "none",
+                "start_frame": None,
+                "end_frame": None,
+                "tracks_file": None,
+            },
         }
         config["videos"][vid] = video_meta
         if config.get("registration"):
@@ -467,6 +481,57 @@ class ProjectManager:
             config["registration"]["status"] = "labeling"
         self._save_config(pid, config)
         return video_meta
+
+    def add_pose_object(self, pid: str, vid: str, name: str, color: str) -> dict:
+        config = self.get_project(pid)
+        if config is None or vid not in config.get("videos", {}):
+            raise ValueError("Video not found")
+        pose_objects = config["videos"][vid].setdefault("pose_objects", {})
+        oid = str(uuid.uuid4())[:8]
+        obj = {"id": oid, "name": name, "color": color, "parts": {}}
+        pose_objects[oid] = obj
+        config["videos"][vid].setdefault("pose_annotations", {})[oid] = {}
+        self._save_config(pid, config)
+        return obj
+
+    def add_pose_part(
+        self, pid: str, vid: str, object_id: str, name: str, color: str,
+    ) -> dict:
+        config = self.get_project(pid)
+        if config is None or vid not in config.get("videos", {}):
+            raise ValueError("Video not found")
+        obj = config["videos"][vid].setdefault("pose_objects", {}).get(object_id)
+        if obj is None:
+            raise ValueError("Pose object not found")
+        part_id = str(uuid.uuid4())[:8]
+        part = {"id": part_id, "name": name, "color": color}
+        obj.setdefault("parts", {})[part_id] = part
+        config["videos"][vid].setdefault("pose_annotations", {}).setdefault(object_id, {})[part_id] = {}
+        self._save_config(pid, config)
+        return part
+
+    def set_pose_annotation(
+        self,
+        pid: str,
+        vid: str,
+        object_id: str,
+        part_id: str,
+        frame_idx: int,
+        x: float,
+        y: float,
+    ) -> dict:
+        config = self.get_project(pid)
+        if config is None or vid not in config.get("videos", {}):
+            raise ValueError("Video not found")
+        obj = config["videos"][vid].setdefault("pose_objects", {}).get(object_id)
+        if obj is None or part_id not in obj.get("parts", {}):
+            raise ValueError("Pose part not found")
+        annotation = {"x": float(x), "y": float(y)}
+        config["videos"][vid].setdefault("pose_annotations", {}).setdefault(
+            object_id, {},
+        ).setdefault(part_id, {})[str(frame_idx)] = annotation
+        self._save_config(pid, config)
+        return annotation
 
     def get_video(self, pid: str, vid: str) -> Optional[dict]:
         config = self._load_config(pid)

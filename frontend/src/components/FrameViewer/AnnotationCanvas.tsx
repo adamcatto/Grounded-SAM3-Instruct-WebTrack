@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useStore, currentVideo as selectCurrentVideo } from '../../store/useStore'
-import { extractFrame, addPoints, addRegistrationPoints, rebuildFromConfig, replaceFramePromptsData, removeObject } from '../../api/client'
+import { extractFrame, addPoints, addRegistrationPoints, rebuildFromConfig, replaceFramePromptsData, removeObject, getPoseTracks, setPoseAnnotation, getProject } from '../../api/client'
+import type { PosePoint } from '../../types'
 import { drawCompositeMask, drawMasks, drawPoints, loadMaskBitmap } from '../../utils/maskUtils'
 import { getCompositeBitmap } from '../../utils/compositeMaskCache'
 import { loadDisplayBitmap } from '../../utils/maskLoader'
@@ -20,7 +21,7 @@ export default function AnnotationCanvas({ width, height, scrubbing = false }: P
 
   const {
     project, currentVideoId,
-    currentFrame, currentObjectId, pointMode,
+    currentFrame, currentObjectId, pointMode, currentPoseObjectId, currentPosePartId,
     localAnnotations, addLocalPoint,
     currentFrameMasks, currentFrameMasksFrame, setCurrentFrameMasks,
     savedMaskCache, setSavedMask,
@@ -39,10 +40,26 @@ export default function AnnotationCanvas({ width, height, scrubbing = false }: P
   const [hoverLabel, setHoverLabel] = useState<string | null>(null)
   const [hoverPos, setHoverPos] = useState<{ x: number; y: number } | null>(null)
   const [displayReady, setDisplayReady] = useState(0)
+  const [poseTracks, setPoseTracks] = useState<Record<string, Record<string, PosePoint>>>({})
   const maskPixelDataRef = useRef<Map<string, ImageData>>(new Map())
 
   const pid = project?.id ?? ''
   const vid = currentVideoId ?? ''
+  const poseMode = project?.tracking_mode === 'pose_tracking'
+
+  useEffect(() => {
+    if (!poseMode || !pid || !vid) {
+      setPoseTracks({})
+      return
+    }
+    let cancelled = false
+    void getPoseTracks(pid, vid, currentFrame).then(result => {
+      if (!cancelled) setPoseTracks(result.objects ?? {})
+    }).catch(() => {
+      if (!cancelled) setPoseTracks({})
+    })
+    return () => { cancelled = true }
+  }, [poseMode, pid, vid, currentFrame])
 
   const masksToShow = useMemo(() => {
     if (currentFrameMasksFrame === currentFrame && Object.keys(currentFrameMasks).length > 0) {
@@ -118,6 +135,28 @@ export default function AnnotationCanvas({ width, height, scrubbing = false }: P
         }
       }
       drawPoints(ctx, allPoints, width, height, config.pointSize)
+      if (poseMode && video) {
+        for (const [oid, object] of Object.entries(video.pose_objects ?? {})) {
+          for (const [partId, part] of Object.entries(object.parts ?? {})) {
+            const point = poseTracks[oid]?.[partId]
+              ?? video.pose_annotations?.[oid]?.[partId]?.[String(currentFrame)]
+            if (!point) continue
+            ctx.save()
+            ctx.globalAlpha = point.visible === false ? 0.35 : 1
+            ctx.fillStyle = part.color
+            ctx.strokeStyle = currentPoseObjectId === oid && currentPosePartId === partId ? '#ffffff' : '#111111'
+            ctx.lineWidth = currentPoseObjectId === oid && currentPosePartId === partId ? 3 : 1.5
+            ctx.beginPath()
+            ctx.arc(point.x * width, point.y * height, Math.max(5, config.pointSize), 0, Math.PI * 2)
+            ctx.fill()
+            ctx.stroke()
+            ctx.fillStyle = '#ffffff'
+            ctx.font = `${Math.max(11, Math.min(width, height) / 55)}px sans-serif`
+            ctx.fillText(`${object.name}: ${part.name}`, point.x * width + 9, point.y * height - 9)
+            ctx.restore()
+          }
+        }
+      }
       if (registrationMode && registrationPolygonPoints.length > 0) {
         ctx.save()
         ctx.strokeStyle = '#facc15'
@@ -184,6 +223,7 @@ export default function AnnotationCanvas({ width, height, scrubbing = false }: P
     config.showMasks, config.maskOpacity, config.pointSize, objectNames,
     scrubbing, pid, vid, displayReady, registrationMode, registrationTool,
     registrationPolygonPoints, registrationActiveEdge, registrationEdgePoints,
+    poseMode, poseTracks, video, currentPoseObjectId, currentPosePartId,
   ])
 
   const handleMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -212,7 +252,8 @@ export default function AnnotationCanvas({ width, height, scrubbing = false }: P
   }, [video, width, height, scrubbing])
 
   const handleClick = useCallback(async (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (!pointMode || !currentObjectId || !video) return
+    if (!pointMode || !video) return
+    if (!poseMode && !currentObjectId) return
 
     const canvas = canvasRef.current
     if (!canvas) return
@@ -228,6 +269,27 @@ export default function AnnotationCanvas({ width, height, scrubbing = false }: P
     // the image. Clamp normalized coordinates so edges are exactly 0 or 1.
     const nx = Math.max(0, Math.min(1, px / width))
     const ny = Math.max(0, Math.min(1, py / height))
+    if (poseMode) {
+      if (!currentPoseObjectId || !currentPosePartId) return
+      try {
+        await setPoseAnnotation(
+          pid, vid, currentPoseObjectId, currentPosePartId, frameToUse, nx, ny,
+        )
+        const fresh = await getProject(pid)
+        useStore.getState().setProject(fresh)
+        setPoseTracks(current => ({
+          ...current,
+          [currentPoseObjectId]: {
+            ...(current[currentPoseObjectId] ?? {}),
+            [currentPosePartId]: { x: nx, y: ny, visible: true },
+          },
+        }))
+      } catch {
+        addToast('Could not save pose point', 'error')
+      }
+      return
+    }
+    if (!currentObjectId) return
     if (registrationMode && registrationTool === 'polygon') {
       addRegistrationPolygonPoint(nx, ny)
       return
@@ -383,7 +445,7 @@ export default function AnnotationCanvas({ width, height, scrubbing = false }: P
         (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
       addToast(detail ?? 'Failed to add point', 'error')
     }
-  }, [pointMode, currentObjectId, video, currentFrame, width, height, pid, vid, addLocalPoint, setCurrentFrameMasks, setSavedMask, anchorPhase, registrationMode, registrationTool, addRegistrationPolygonPoint, registrationActiveEdge, addRegistrationEdgePoint, addToast])
+  }, [pointMode, currentObjectId, currentPoseObjectId, currentPosePartId, poseMode, video, currentFrame, width, height, pid, vid, addLocalPoint, setCurrentFrameMasks, setSavedMask, anchorPhase, registrationMode, registrationTool, addRegistrationPolygonPoint, registrationActiveEdge, addRegistrationEdgePoint, addToast])
 
   const cursor = pointMode ? 'crosshair' : 'default'
 

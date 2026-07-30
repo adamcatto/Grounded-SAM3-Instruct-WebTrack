@@ -56,8 +56,35 @@ export const listDir = (path?: string) =>
     .get<FsListDirResponse>('/fs/list_dir', { params: { path: path ?? '' } })
     .then(r => r.data)
 
-export const createProject = (name: string) =>
-  api.post<Project>('/projects', { name }).then(r => r.data)
+export const createProject = (
+  name: string,
+  trackingMode: 'segmentation_tracking' | 'pose_tracking' = 'segmentation_tracking',
+) =>
+  api.post<Project>('/projects', { name, tracking_mode: trackingMode }).then(r => r.data)
+
+export const addPoseObject = (pid: string, vid: string, name: string, color: string) =>
+  api.post(`/projects/${pid}/videos/${vid}/pose/objects`, { name, color }).then(r => r.data)
+
+export const addPosePart = (pid: string, vid: string, oid: string, name: string, color: string) =>
+  api.post(`/projects/${pid}/videos/${vid}/pose/objects/${oid}/parts`, { name, color }).then(r => r.data)
+
+export const setPoseAnnotation = (
+  pid: string, vid: string, oid: string, partId: string, frameIdx: number, x: number, y: number,
+) => api.put(
+  `/projects/${pid}/videos/${vid}/pose/objects/${oid}/parts/${partId}/frames/${frameIdx}`,
+  { x, y },
+).then(r => r.data)
+
+export const predictPose = (pid: string, vid: string, startFrame: number, numFrames: number) =>
+  api.post(`/projects/${pid}/videos/${vid}/pose/predict`, {
+    start_frame: startFrame,
+    num_frames: numFrames,
+  }).then(r => r.data)
+
+export const getPoseTracks = (pid: string, vid: string, frameIdx: number) =>
+  api.get(`/projects/${pid}/videos/${vid}/pose/tracks/${frameIdx}`).then(r => r.data)
+
+export const getPoseModelStatus = () => api.get('/pose/model').then(r => r.data)
 
 export const mergeProjects = (
   name: string,

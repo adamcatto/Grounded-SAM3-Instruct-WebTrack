@@ -47,6 +47,7 @@ from registration_geometry import (
     expanded_registration_canvas,
     fit_edge_registration,
 )
+from cotracker_predictor import cotracker3
 import display_cache as dc
 from video_processor import (
     compute_ds_dims,
@@ -790,11 +791,14 @@ def set_projects_root(req: SetProjectsRootRequest):
 
 class CreateProjectRequest(BaseModel):
     name: str
+    tracking_mode: str = "segmentation_tracking"
 
 
 @app.post("/api/projects", status_code=201)
 def create_project(req: CreateProjectRequest):
-    return pm.create_project(req.name)
+    if req.tracking_mode not in {"segmentation_tracking", "pose_tracking"}:
+        raise HTTPException(422, "Unknown tracking mode")
+    return pm.create_project(req.name, tracking_mode=req.tracking_mode)
 
 
 class MergeProjectsRequest(BaseModel):
@@ -2408,6 +2412,153 @@ def predict_frame(pid: str, vid: str, frame_idx: int):
 
     mask_b64, _raw = _encode_masks_from_sam_frame_output(frame_outputs or {}, objects)
     return {"frame_idx": frame_idx, "masks": mask_b64}
+
+
+# ─── Pose objects / CoTracker3 ───────────────────────────────────────────────
+
+class AddPoseEntityRequest(BaseModel):
+    name: str
+    color: str
+
+
+class PoseAnnotationRequest(BaseModel):
+    x: float
+    y: float
+
+
+class PosePredictionRequest(BaseModel):
+    start_frame: int
+    num_frames: int = 30
+
+
+@app.get("/api/pose/model")
+def pose_model_status():
+    return cotracker3.status()
+
+
+@app.post("/api/projects/{pid}/videos/{vid}/pose/objects", status_code=201)
+def add_pose_object(pid: str, vid: str, req: AddPoseEntityRequest):
+    if not req.name.strip():
+        raise HTTPException(422, "Object name is required")
+    try:
+        return pm.add_pose_object(pid, vid, req.name.strip(), req.color)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.post("/api/projects/{pid}/videos/{vid}/pose/objects/{oid}/parts", status_code=201)
+def add_pose_part(pid: str, vid: str, oid: str, req: AddPoseEntityRequest):
+    if not req.name.strip():
+        raise HTTPException(422, "Part name is required")
+    try:
+        return pm.add_pose_part(pid, vid, oid, req.name.strip(), req.color)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.put("/api/projects/{pid}/videos/{vid}/pose/objects/{oid}/parts/{part_id}/frames/{frame_idx}")
+def set_pose_annotation(pid: str, vid: str, oid: str, part_id: str, frame_idx: int, req: PoseAnnotationRequest):
+    video = pm.get_video(pid, vid)
+    if video is None:
+        raise HTTPException(404, "Video not found")
+    if frame_idx < 0 or frame_idx >= int(video.get("num_frames") or 1):
+        raise HTTPException(422, "Frame is outside the video")
+    if not (0.0 <= req.x <= 1.0 and 0.0 <= req.y <= 1.0):
+        raise HTTPException(422, "Pose coordinates must be normalized from 0 to 1")
+    try:
+        return pm.set_pose_annotation(pid, vid, oid, part_id, frame_idx, req.x, req.y)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+def _pose_tracks_path(pid: str, vid: str) -> Path:
+    return pm.video_dir(pid, vid) / "pose_tracks.json"
+
+
+@app.get("/api/projects/{pid}/videos/{vid}/pose/tracks/{frame_idx}")
+def get_pose_tracks(pid: str, vid: str, frame_idx: int):
+    path = _pose_tracks_path(pid, vid)
+    if not path.is_file():
+        return {"frame_idx": frame_idx, "objects": {}}
+    payload = json.loads(path.read_text())
+    return {
+        "frame_idx": frame_idx,
+        "objects": (payload.get("frames") or {}).get(str(frame_idx), {}),
+        "start_frame": payload.get("start_frame"),
+        "end_frame": payload.get("end_frame"),
+    }
+
+
+@app.post("/api/projects/{pid}/videos/{vid}/pose/predict")
+def predict_pose(pid: str, vid: str, req: PosePredictionRequest):
+    video = pm.get_video(pid, vid)
+    if video is None:
+        raise HTTPException(404, "Video not found")
+    start = int(req.start_frame)
+    total = max(1, int(video.get("num_frames") or 1))
+    if start < 0 or start >= total - 1:
+        raise HTTPException(422, "Start frame must have at least one following frame")
+    count = max(1, min(int(req.num_frames), total - start - 1))
+    pose_objects = video.get("pose_objects") or {}
+    annotations = video.get("pose_annotations") or {}
+    point_keys: list[tuple[str, str]] = []
+    normalized: list[list[float]] = []
+    missing: list[str] = []
+    for oid, obj in pose_objects.items():
+        for part_id, part in (obj.get("parts") or {}).items():
+            annotation = annotations.get(oid, {}).get(part_id, {}).get(str(start))
+            if annotation is None:
+                missing.append(f"{obj.get('name', oid)} / {part.get('name', part_id)}")
+                continue
+            point_keys.append((oid, part_id))
+            normalized.append([float(annotation["x"]), float(annotation["y"])])
+    if missing:
+        raise HTTPException(409, f"Label every pose part on frame {start}: {', '.join(missing)}")
+    if not point_keys:
+        raise HTTPException(409, "Create and label at least one pose part")
+    source_path = str(video.get("source_path") or "")
+    capture = cv2.VideoCapture(source_path)
+    native_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+    native_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    capture.release()
+    points_xy = np.asarray(normalized, dtype=np.float32)
+    points_xy[:, 0] *= max(1, native_width - 1)
+    points_xy[:, 1] *= max(1, native_height - 1)
+    try:
+        tracks, visibility = cotracker3.track(source_path, start, count, points_xy)
+    except Exception as e:
+        logger.exception("CoTracker3 pose prediction failed")
+        raise HTTPException(500, f"CoTracker3 prediction failed: {e}")
+    frames: dict[str, dict] = {}
+    for local_idx in range(len(tracks)):
+        frame_objects: dict[str, dict] = {}
+        for point_idx, (oid, part_id) in enumerate(point_keys):
+            frame_objects.setdefault(oid, {})[part_id] = {
+                "x": float(np.clip(tracks[local_idx, point_idx, 0] / max(1, native_width - 1), 0, 1)),
+                "y": float(np.clip(tracks[local_idx, point_idx, 1] / max(1, native_height - 1), 0, 1)),
+                "visible": bool(visibility[local_idx, point_idx]),
+            }
+        frames[str(start + local_idx)] = frame_objects
+    payload = {
+        "model": "facebook/cotracker3:scaled_offline.pth",
+        "start_frame": start,
+        "end_frame": start + count,
+        "frames": frames,
+    }
+    path = _pose_tracks_path(pid, vid)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, indent=2))
+    tmp.replace(path)
+    pm.update_video(pid, vid, {
+        "pose_tracking": {
+            "status": "complete",
+            "start_frame": start,
+            "end_frame": start + count,
+            "tracks_file": str(path.relative_to(pm._project_dir(pid))),
+            "model": payload["model"],
+        },
+    })
+    return {"status": "complete", "start_frame": start, "end_frame": start + count, "points": len(point_keys)}
 
 
 # ─── Objects ──────────────────────────────────────────────────────────────────

@@ -54,6 +54,7 @@ export default function App() {
     setProject, setCurrentVideo, setUploadModalOpen, setDrawerOpen, setViewerTab,
     configDirty, revertConfig,
   } = store
+  const poseMode = project?.tracking_mode === 'pose_tracking'
 
   // Guard tab switches away from Settings when there are unsaved changes.
   const handleSetViewerTab = useCallback((tab: ViewerTab) => {
@@ -136,7 +137,7 @@ export default function App() {
                   label="Annotate"
                   onClick={() => handleSetViewerTab('annotate')}
                 />
-                {!registrationMode && <TabButton
+                {!registrationMode && !poseMode && <TabButton
                   active={viewerTab === 'player'}
                   icon={<PlayCircle size={14} />}
                   label="Player"

@@ -25,6 +25,7 @@ export default function ProjectDrawer() {
   const [rootInfoError, setRootInfoError] = useState<string>('')
   const [folderBrowserOpen, setFolderBrowserOpen] = useState(false)
   const [newName, setNewName] = useState('')
+  const [newTrackingMode, setNewTrackingMode] = useState<'segmentation_tracking' | 'pose_tracking'>('segmentation_tracking')
   const [creating, setCreating] = useState(false)
   const [mergeMode, setMergeMode] = useState(false)
   const [mergeLeftId, setMergeLeftId] = useState('')
@@ -104,7 +105,7 @@ export default function ProjectDrawer() {
     try {
       const p = mergeMode
         ? await mergeProjects(newName.trim(), mergeLeftId, mergeRightId)
-        : await createProject(newName.trim())
+        : await createProject(newName.trim(), newTrackingMode)
       setProjects(prev => [...prev, p])
       setProject(p)
       const vids = Object.keys(p.videos)
@@ -367,6 +368,16 @@ export default function ProjectDrawer() {
                 <Plus size={14} />
               </button>
             </div>
+            {!mergeMode && (
+              <select
+                value={newTrackingMode}
+                onChange={event => setNewTrackingMode(event.target.value as typeof newTrackingMode)}
+                className="w-full text-xs"
+              >
+                <option value="segmentation_tracking">Segmentation tracking (SAM3)</option>
+                <option value="pose_tracking">Pose tracking (CoTracker3)</option>
+              </select>
+            )}
           </div>
 
           {/* Projects list */}

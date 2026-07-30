@@ -28,6 +28,7 @@ import NumericDraftInput from '../NumericDraftInput'
 import ObjectCard from './ObjectCard'
 import StepIndicator from './StepIndicator'
 import RegistrationPanel from './RegistrationPanel'
+import PoseTrackingPanel from './PoseTrackingPanel'
 import type { PropagationEvent } from '../../types'
 
 function targetIsTypingContext(target: EventTarget | null): boolean {
@@ -1285,6 +1286,7 @@ export default function LeftPanel() {
 
   if (!video) return null
   if (registrationMode) return <RegistrationPanel />
+  if (project?.tracking_mode === 'pose_tracking') return <PoseTrackingPanel />
 
   const manualNAnchors = manualAnchorPrefixRef.current
   const showInferRemainderButton =

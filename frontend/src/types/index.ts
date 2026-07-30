@@ -65,14 +65,43 @@ export interface VideoMeta {
     updated_at?: string | null
     host?: string | null
   }
+  pose_objects?: Record<string, PoseObject>
+  pose_annotations?: Record<string, Record<string, Record<string, PosePoint>>>
+  pose_tracking?: {
+    status?: 'none' | 'running' | 'complete' | 'failed'
+    start_frame?: number | null
+    end_frame?: number | null
+    tracks_file?: string | null
+    model?: string
+  }
 }
 
 export interface Project {
   id: string
   name: string
   created_at: string
+  tracking_mode?: 'segmentation_tracking' | 'pose_tracking'
   videos: Record<string, VideoMeta>
   registration?: ProjectRegistration
+}
+
+export interface PosePoint {
+  x: number
+  y: number
+  visible?: boolean
+}
+
+export interface PosePart {
+  id: string
+  name: string
+  color: string
+}
+
+export interface PoseObject {
+  id: string
+  name: string
+  color: string
+  parts: Record<string, PosePart>
 }
 
 export interface VideoRegistration {

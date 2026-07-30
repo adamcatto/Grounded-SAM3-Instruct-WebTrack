@@ -81,6 +81,8 @@ interface AppState {
   // Annotation state
   currentFrame: number
   currentObjectId: string | null
+  currentPoseObjectId: string | null
+  currentPosePartId: string | null
   pointMode: PointMode
   localAnnotations: Record<string, Record<string, LocalAnnotation>>  // objId → frameIdx → pts
 
@@ -141,6 +143,7 @@ interface AppState {
   clearRegistrationEdgePoints: (edge?: 'top' | 'right' | 'bottom' | 'left') => void
   setCurrentFrame: (f: number) => void
   setCurrentObject: (oid: string | null) => void
+  setCurrentPosePart: (objectId: string | null, partId: string | null) => void
   setPointMode: (m: PointMode) => void
   addLocalPoint: (objId: string, frameIdx: number, x: number, y: number, label: 0 | 1) => void
   clearLocalPoints: (objId: string) => void
@@ -194,6 +197,8 @@ export const useStore = create<AppState>((set, get) => ({
   registrationEdgePoints: { top: [], right: [], bottom: [], left: [] },
   currentFrame: 0,
   currentObjectId: null,
+  currentPoseObjectId: null,
+  currentPosePartId: null,
   pointMode: null,
   localAnnotations: {},
   currentFrameMasks: {},
@@ -314,6 +319,8 @@ export const useStore = create<AppState>((set, get) => ({
         currentFrame: startFrame,
         propagationStartFrame: startFrame,
         currentObjectId: null,
+        currentPoseObjectId: null,
+        currentPosePartId: null,
         pointMode: null,
         localAnnotations,
         currentFrameMasks: {},
@@ -409,6 +416,11 @@ export const useStore = create<AppState>((set, get) => ({
     set({ currentFrame: clamped })
   },
   setCurrentObject: oid => set({ currentObjectId: oid, pointMode: oid ? 'add' : null }),
+  setCurrentPosePart: (objectId, partId) => set({
+    currentPoseObjectId: objectId,
+    currentPosePartId: partId,
+    pointMode: partId ? 'add' : null,
+  }),
   setPointMode: m => set({ pointMode: m }),
 
   addLocalPoint: (objId, frameIdx, x, y, label) => {

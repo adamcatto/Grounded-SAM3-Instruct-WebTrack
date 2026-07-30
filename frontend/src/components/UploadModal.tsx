@@ -65,6 +65,7 @@ export default function UploadModal() {
   } = useStore()
 
   const [projectName, setProjectName] = useState('')
+  const [trackingMode, setTrackingMode] = useState<'segmentation_tracking' | 'pose_tracking'>('segmentation_tracking')
   const [inputMode, setInputMode] = useState<InputMode>('server')
 
   // File upload state
@@ -210,7 +211,7 @@ export default function UploadModal() {
   async function ensureProject(): Promise<string> {
     if (project) return project.id
     if (!projectName.trim()) throw new Error('Please enter a project name')
-    const proj = await createProject(projectName.trim())
+    const proj = await createProject(projectName.trim(), trackingMode)
     setProject(proj)
     return proj.id
   }
@@ -455,6 +456,16 @@ export default function UploadModal() {
                 className="w-full"
                 disabled={busy}
               />
+              <label className="mt-3 block text-xs text-[#888] font-medium">Tracking mode</label>
+              <select
+                value={trackingMode}
+                onChange={event => setTrackingMode(event.target.value as typeof trackingMode)}
+                className="w-full"
+                disabled={busy}
+              >
+                <option value="segmentation_tracking">Segmentation tracking (SAM3)</option>
+                <option value="pose_tracking">Pose tracking (CoTracker3)</option>
+              </select>
             </div>
           )}
 
