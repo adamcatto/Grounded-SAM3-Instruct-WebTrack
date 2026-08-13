@@ -66,7 +66,16 @@
       "Bash(git merge *)",
       "Bash(git push *)",
       "Bash(sed -n '1,60p' downstream_analysis/plots.py)",
-      "Bash(sed -n '1,40p' downstream_analysis/__main__.py)"
+      "Bash(sed -n '1,40p' downstream_analysis/__main__.py)",
+      "Bash(sed -i '/^    umap_dir\\\\.mkdir\\(parents=True, exist_ok=True\\)$/d' clustering/plots_umap.py)",
+      "Bash(sed -i '/^    out_dir\\\\.mkdir\\(parents=True, exist_ok=True\\)$/d' clustering/social_interaction.py)",
+      "Bash(sed -i '/^    outfile\\\\.parent\\\\.mkdir\\(parents=True, exist_ok=True\\)$/d' clustering/plots_transitions.py)",
+      "Bash(sed -i '/^    diff_dir\\\\.mkdir\\(parents=True, exist_ok=True\\)$/d' clustering/plots_transitions.py)",
+      "Bash(sed -i '/^    out_dir\\\\.mkdir\\(parents=True, exist_ok=True\\)$/d' clustering/plots_transitions.py)",
+      "Read(//sc/arion/projects/KennyComputational/Behavior/projects/merged_alberto_social_0126-5/**)",
+      "Read(//sc/arion/projects/KennyComputational/Behavior/projects/merged_alberto_social_0126-5/plots/**)",
+      "Bash(PYTHONPATH=/sc/arion/projects/KennyComputational/Behavior/Grounded-SAM3-Instruct-WebTrack conda run --no-capture-output -n sam3 python /tmp/claude-25413/-sc-arion-projects-KennyComputational-Behavior-Grounded-SAM3-Instruct-WebTrack/ce14740b-511a-4d96-84f8-1d69eab2916d/scratchpad/regen_plots_from_cache.py /sc/arion/projects/KennyComputational/Behavior/projects/merged_alberto_social_0126-5 /sc/arion/projects/KennyComputational/Behavior/projects/merged_alberto_social_0126-5_svg)",
+      "Bash(echo \"EXIT=$?\")"
     ]
   }
 }

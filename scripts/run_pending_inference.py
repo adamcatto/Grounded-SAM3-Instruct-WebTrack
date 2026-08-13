@@ -165,6 +165,14 @@ def _log_sse_to_terminal(ev: str, data: dict[str, Any], *, stream_active: list[b
 DEFAULT_SSE_INACTIVITY_TIMEOUT_S = 1200.0
 
 
+class _ProgressStall(Exception):
+    """Raised when the SSE stream keeps heart-beating but makes no forward progress."""
+
+    def __init__(self, elapsed_s: float) -> None:
+        self.elapsed_s = elapsed_s
+        super().__init__(f"no forward progress for {elapsed_s:.0f}s")
+
+
 def propagation_sse(
     backend_api_base: str,
     pid: str,
@@ -177,9 +185,18 @@ def propagation_sse(
     """
     Consume GET /api/.../propagate SSE until done or error.
 
-    ``timeout_s`` is the per-read socket (inactivity) timeout: if the stream goes
-    silent for this many seconds the read is aborted and a stall error returned,
-    rather than blocking forever. ``None`` uses DEFAULT_SSE_INACTIVITY_TIMEOUT_S.
+    ``timeout_s`` is both the per-read socket (byte-level inactivity) timeout AND
+    the forward-progress stall timeout: if the stream goes silent, or if only
+    heartbeats arrive with no real propagation event, for this many seconds the
+    read is aborted and a stall error returned rather than blocking forever.
+    ``None`` uses DEFAULT_SSE_INACTIVITY_TIMEOUT_S.
+
+    Two distinct stall detectors are needed because the backend emits a periodic
+    ``heartbeat`` event (server.py) whenever propagation makes no progress. Those
+    heartbeat bytes reset the socket read timeout, so a byte-level timeout alone
+    can never catch a backend that is wedged mid-propagation (it keeps
+    heart-beating forever). The progress-stall clock below is reset only by
+    non-heartbeat events, so it fires even while heartbeats keep flowing.
 
     Returns (ok, last_payload_dict, human_error_message).
     """
@@ -198,6 +215,7 @@ def propagation_sse(
     seen_err = False
     last_payload: dict[str, Any] | None = None
     stream_active_carry = [False]  # list so flush_block closure can mutate
+    last_progress = [time.monotonic()]  # list so flush_block closure can mutate
 
     ev_name: str | None = None
     data_parts: list[str] = []
@@ -208,6 +226,12 @@ def propagation_sse(
         cur_ev = ev_name or "message"
         data_parts = []
         ev_name = None
+        # A heartbeat means "still connected but no progress": do not reset the
+        # forward-progress clock, and do not overwrite last_payload/log it — we
+        # keep the last real event for diagnostics on stall.
+        if cur_ev == "heartbeat":
+            return
+        last_progress[0] = time.monotonic()
         if raw == "":
             return
         try:
@@ -241,6 +265,11 @@ def propagation_sse(
                     line = line[:-1]
                 if line == "":
                     flush_block()
+                    # Forward-progress watchdog: heartbeats keep the socket read
+                    # alive but do not advance last_progress, so a backend wedged
+                    # mid-propagation is caught here instead of hanging forever.
+                    if time.monotonic() - last_progress[0] > to:
+                        raise _ProgressStall(time.monotonic() - last_progress[0])
                     continue
                 if line.startswith(":"):
                     continue
@@ -260,6 +289,17 @@ def propagation_sse(
         except Exception:
             pass
         return False, last_payload, f"HTTP {e.code}: {body or e.reason}"
+    except _ProgressStall as e:
+        # Progress stall: heartbeats still arriving but no real propagation event
+        # for `to` seconds (backend wedged mid-propagation). Surface as a
+        # recoverable error so the worker releases the claim and moves on; the
+        # video stays retryable via video_eligibility.
+        return (
+            False,
+            last_payload,
+            f"SSE stream stalled: no forward progress for {e.elapsed_s:.0f}s "
+            f"(heartbeats still arriving; backend wedged mid-propagation)",
+        )
     except (TimeoutError, socket.timeout) as e:
         # Inactivity timeout: the stream went silent (backend wedged mid-
         # propagation). Surface as a recoverable error so the worker releases the
