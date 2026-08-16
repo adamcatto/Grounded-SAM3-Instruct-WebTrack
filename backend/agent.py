@@ -1089,47 +1089,49 @@ def _text_segment_impl(session: AgentSession, vid: str, frame_idx: int, text: st
     method = None
     error = None
 
-    # Prefer a throwaway single-frame session so detector object ids do not pollute tracking.
-    import shutil
-    import tempfile
-    from pathlib import Path
-    tmp_ann = tempfile.mkdtemp(prefix="sam3wt_agent_txt_")
-    try:
-        if jpg.exists():
-            shutil.copy2(str(jpg), str(Path(tmp_ann) / jpg.name))
-            s.sam.init_session(session.pid, vid, tmp_ann)
-            try:
-                out = s.sam.add_text_prompt(session.pid, vid, frame_idx, text)
-                frame_out = out.get(frame_idx) or out.get(str(frame_idx)) or {}
-                if not frame_out and out:
-                    frame_out = next(iter(out.values()))
-                detections = _detections_from_sam_outputs(frame_out)
-                method = "sam3_video_text"
-            except Exception as e:
-                error = str(e)
-                logger.warning(f"SAM3 video text prompt failed: {e}")
-    except Exception as e:
-        error = str(e)
-        logger.warning(f"temp text session failed: {e}")
-    finally:
-        shutil.rmtree(tmp_ann, ignore_errors=True)
-        try:
-            s.sam.close_session(session.pid, vid)
-        except Exception:
-            pass
-
-    if not detections and jpg.exists():
+    # Image-level grounding does not touch the video tracker session.
+    if jpg.exists():
         try:
             img_dets = s.sam.detect_text_on_image(str(jpg), text)
             detections = [
                 {"sam_obj_id": None, "mask": d["mask"], "score": d.get("score"), "bbox": d.get("bbox_xywh_norm")}
                 for d in img_dets
             ]
-            method = "sam3_image_text"
-            error = None
+            if detections:
+                method = "sam3_image_text"
+        except Exception as e:
+            error = str(e)
+            logger.warning(f"SAM3 image text detect failed: {e}")
+
+    # Prefer a throwaway single-frame session so detector object ids do not pollute tracking.
+    if not detections:
+        import shutil
+        import tempfile
+        from pathlib import Path
+        tmp_ann = tempfile.mkdtemp(prefix="sam3wt_agent_txt_")
+        try:
+            if jpg.exists():
+                shutil.copy2(str(jpg), str(Path(tmp_ann) / jpg.name))
+                s.sam.init_session(session.pid, vid, tmp_ann)
+                try:
+                    out = s.sam.add_text_prompt(session.pid, vid, frame_idx, text)
+                    frame_out = out.get(frame_idx) or out.get(str(frame_idx)) or {}
+                    if not frame_out and out:
+                        frame_out = next(iter(out.values()))
+                    detections = _detections_from_sam_outputs(frame_out)
+                    method = "sam3_video_text"
+                except Exception as e:
+                    error = error or str(e)
+                    logger.warning(f"SAM3 video text prompt failed: {e}")
         except Exception as e:
             error = error or str(e)
-            logger.warning(f"SAM3 image text detect failed: {e}")
+            logger.warning(f"temp text session failed: {e}")
+        finally:
+            shutil.rmtree(tmp_ann, ignore_errors=True)
+            try:
+                s.sam.close_session(session.pid, vid)
+            except Exception:
+                pass
 
     detections = [d for d in detections if (d.get("score") is None or d["score"] >= min_score)]
     if not detections:

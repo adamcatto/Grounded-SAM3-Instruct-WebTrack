@@ -617,8 +617,16 @@ class SAMPredictor:
         try:
             from sam3.model.sam3_image_processor import Sam3Processor
             predictor = _get_predictor()
-            # Video predictor may already expose the underlying image model.
-            image_model = getattr(predictor, "model", None) or getattr(predictor, "image_model", None)
+            # Video predictor is Sam3VideoInference*; the grounding model is `.detector`
+            # (has `.backbone`). Passing the video object into Sam3Processor raises
+            # `'Sam3VideoInferenceWithInstanceInteractivity' object has no attribute 'backbone'`.
+            image_model = None
+            if hasattr(predictor, "detector") and hasattr(predictor.detector, "backbone"):
+                image_model = predictor.detector
+            else:
+                cand = getattr(predictor, "model", None) or getattr(predictor, "image_model", None)
+                if cand is not None and hasattr(cand, "backbone"):
+                    image_model = cand
             if image_model is not None:
                 processor = Sam3Processor(image_model)
         except Exception as e:

@@ -23,10 +23,10 @@ const PROMPT = [
   'There are exactly two mice in this frame — one with a shaved/clipped patch and one without.',
   'Inspect this frame first so you can see both animals.',
   'Then segment BOTH of them (every mouse must get its own mask):',
-  '- NoShave (existing object 2): the unshaved mouse on the LEFT / center of the cage.',
-  '- HeadShave (existing object 1): the mouse with the shaved patch on the RIGHT, near the water bottle port.',
-  'Use text_segment with those visual descriptions, then evaluate_segmentation.',
-  'If a mask is missing, empty, on the wrong mouse, or covering bedding: inspect_frame again and add_point_prompt with one positive point on that mouse\'s back/chest from the JPEG and a negative point on the other mouse.',
+  '- NoShave (existing object 2): unshaved mouse on the LEFT / center of the bedding. After inspect, a good torso click is around normalized (0.32, 0.50).',
+  '- HeadShave (existing object 1): shaved mouse on the FAR RIGHT of the cage, against the wall by the circular water-bottle port. After inspect, a good torso click is around normalized (0.80, 0.42). Do NOT click 0.50 or 0.67 in x — that is empty bedding between them.',
+  'Prefer text_segment with those descriptions, then evaluate_segmentation.',
+  'If a mask is missing or on the wrong mouse, add_point_prompt with one positive point on that mouse\'s back from the JPEG and a negative point on the other mouse.',
   'Do not copy one object\'s points onto the other. Do not finish until both HeadShave and NoShave have a compact mask on this frame. Do not start propagation.',
 ].join(' ')
 
