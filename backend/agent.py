@@ -29,6 +29,11 @@ MAX_HISTORY_TURNS = 16
 INSPECT_MAX_EDGE = 640
 DEFAULT_NEARBY_OFFSET = 20
 CONFIDENCE_RETRY_THRESHOLD = 0.45
+# Inspect JPEGs stay in the chat until pruned. Keep the last two so the model can
+# compare the current frame with the previous one without blowing the context.
+KEEP_INSPECT_IMAGES = 2
+# Tool calls are short; 4096 reserved tokens would eat half of an 8k window.
+AGENT_MAX_TOKENS = 2048
 
 
 # ─── LLM configuration (local Ollama / vLLM first, same idea as SAM 3 Agent) ──
@@ -1558,9 +1563,9 @@ def _call_openai(cfg: LLMConfig, messages: list[dict]) -> dict:
     }
     # SAM 3 Agent / vLLM use max_tokens; newer OpenAI prefers max_completion_tokens.
     if cfg.local or cfg.provider in LOCAL_PROVIDERS:
-        payload["max_tokens"] = 4096
+        payload["max_tokens"] = AGENT_MAX_TOKENS
     else:
-        payload["max_completion_tokens"] = 4096
+        payload["max_completion_tokens"] = AGENT_MAX_TOKENS
     headers = {"Authorization": f"Bearer {cfg.api_key or LOCAL_DUMMY_KEY}"}
     timeout = 300.0 if cfg.local else 120.0
     data = _http_json("POST", url, headers, payload, timeout=timeout)
@@ -1638,7 +1643,7 @@ def _call_anthropic(cfg: LLMConfig, messages: list[dict]) -> dict:
 
     payload = {
         "model": cfg.model,
-        "max_tokens": 4096,
+        "max_tokens": AGENT_MAX_TOKENS,
         "system": sys_text.strip() or SYSTEM_PROMPT,
         "messages": merged,
         "tools": _anthropic_tools(),
@@ -1687,6 +1692,30 @@ def build_initial_messages(
         ),
     })
     return msgs
+
+
+def prune_stale_inspect_images(messages: list[dict], keep: int = KEEP_INSPECT_IMAGES) -> int:
+    """Drop all but the last `keep` inspect JPEGs from the in-flight transcript.
+
+    The agent loop appends every inspect_frame image and never expires them.
+    Qwen-VL charges ~400 tokens per 640×480 JPEG; a 36-step run with 4 inspects
+    already overflows an 8k window, and a full every-1000th pass would not fit
+    even 32k if every image were kept.
+    """
+    idxs = [i for i, m in enumerate(messages) if m.get("images")]
+    if keep < 0:
+        keep = 0
+    drop = idxs if keep == 0 else idxs[:-keep]
+    removed = 0
+    for i in drop:
+        n = len(messages[i].get("images") or [])
+        messages[i].pop("images", None)
+        removed += n
+        prev = (messages[i].get("content") or "").strip()
+        stub = f"[dropped {n} inspect JPEG(s) to save context; frame was already described in the tool result]"
+        if stub not in prev:
+            messages[i]["content"] = f"{prev}\n{stub}".strip() if prev else stub
+    return removed
 
 
 def _tool_result_for_llm(result: dict) -> str:
@@ -1750,6 +1779,7 @@ def run_agent_sync(
                 "images": list(pending_images),
             })
             pending_images = []
+        prune_stale_inspect_images(messages)
         emit("status", {"phase": "thinking", "step": step + 1, "max_steps": MAX_AGENT_STEPS})
         try:
             llm = call_llm(cfg, messages)

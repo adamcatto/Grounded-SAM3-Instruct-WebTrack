@@ -66,7 +66,7 @@ case "$PROFILE" in
     VLLM_THINKING_MODEL="Qwen/Qwen3-VL-32B-Thinking"
     OLLAMA_MODEL="qwen2.5vl:32b"
     TP_DEFAULT=1
-    MAX_LEN=8192
+    MAX_LEN_DEFAULT=24576
     GPU_UTIL=0.95
     REASONING=0
     TOOLS=1
@@ -78,7 +78,7 @@ case "$PROFILE" in
     VLLM_THINKING_MODEL="Qwen/Qwen3-VL-32B-Thinking"
     OLLAMA_MODEL="qwen2.5vl:72b"
     TP_DEFAULT=4
-    MAX_LEN=16384
+    MAX_LEN_DEFAULT=32768
     GPU_UTIL=0.90
     REASONING=0
     TOOLS=1
@@ -90,7 +90,7 @@ case "$PROFILE" in
     VLLM_THINKING_MODEL="Qwen/Qwen3-VL-8B-Thinking"
     OLLAMA_MODEL="qwen2.5vl"
     TP_DEFAULT=1
-    MAX_LEN=8192
+    MAX_LEN_DEFAULT=8192
     GPU_UTIL=0.40
     REASONING=0
     TOOLS=1
@@ -102,7 +102,7 @@ case "$PROFILE" in
     VLLM_THINKING_MODEL="Qwen/Qwen3-VL-8B-Thinking"
     OLLAMA_MODEL="qwen2.5vl"
     TP_DEFAULT=1
-    MAX_LEN=16384
+    MAX_LEN_DEFAULT=16384
     GPU_UTIL=0.90
     REASONING=1
     TOOLS=1
@@ -115,6 +115,8 @@ case "$PROFILE" in
     exit 1
     ;;
 esac
+
+MAX_LEN="${VLLM_MAX_MODEL_LEN:-$MAX_LEN_DEFAULT}"
 
 if thinking_on; then
   VLLM_MODEL="$VLLM_THINKING_MODEL"

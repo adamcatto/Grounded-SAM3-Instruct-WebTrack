@@ -250,6 +250,28 @@ class TestLLMConfig(unittest.TestCase):
         )
 
 
+class TestContextPruning(unittest.TestCase):
+    def test_keeps_only_last_two_inspect_images(self):
+        msgs = [{"role": "system", "content": "sys"}]
+        for i in range(4):
+            msgs.append({
+                "role": "user",
+                "content": f"Visual frame {i}",
+                "images": [{"jpeg_b64": f"fake{i}", "frame_idx": i}],
+            })
+        dropped = agent.prune_stale_inspect_images(msgs, keep=2)
+        self.assertEqual(dropped, 2)
+        with_images = [m for m in msgs if m.get("images")]
+        self.assertEqual(len(with_images), 2)
+        self.assertEqual(with_images[0]["images"][0]["frame_idx"], 2)
+        self.assertEqual(with_images[1]["images"][0]["frame_idx"], 3)
+        self.assertIn("dropped", msgs[1]["content"])
+
+    def test_agent_max_tokens_is_below_8k_window(self):
+        self.assertLessEqual(agent.AGENT_MAX_TOKENS, 2048)
+        self.assertEqual(agent.KEEP_INSPECT_IMAGES, 2)
+
+
 class TestSyntheticVideoFixture(unittest.TestCase):
     """Write a tiny MP4 so import/extract can be tested against a real file."""
 

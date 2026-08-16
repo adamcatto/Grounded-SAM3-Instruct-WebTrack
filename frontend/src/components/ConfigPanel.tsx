@@ -523,8 +523,8 @@ export default function ConfigPanel() {
               API. The backend auto-detects <span className="font-mono text-[#888]">Ollama</span> on
               :11434 or <span className="font-mono text-[#888]">vLLM</span> on :8001 (dummy API key).
               Default profile is <span className="font-mono text-[#888]">a100</span> (Qwen3-VL-32B-Instruct
-              on a dedicated 80GB GPU). Use <span className="font-mono text-[#888]">h100x4</span> for
-              Qwen2.5-VL-72B on 4× 80GB H100 NVL. Do not co-locate 32B/72B with SAM3 on one card —
+              on a dedicated 80GB GPU, 24k context). Use <span className="font-mono text-[#888]">h100x4</span> for
+              Qwen2.5-VL-72B on 4× 80GB H100 NVL (32k context). Do not co-locate 32B/72B with SAM3 on one card —
               run SAM on the workstation A100 and point{' '}
               <span className="font-mono text-[#888]">AGENT_LLM_BASE_URL</span> at the H100 vLLM
               server, or use <span className="font-mono text-[#888]">a100-shared</span> /{' '}
