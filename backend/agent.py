@@ -35,12 +35,62 @@ CONFIDENCE_RETRY_THRESHOLD = 0.45
 
 # SAM 3 Agent serves Qwen-VL via vLLM at :8001 with a dummy OpenAI key.
 # Ollama exposes the same /v1/chat/completions surface on :11434.
+#
+# Hardware profiles (AGENT_LLM_PROFILE / `scripts/serve_agent_llm.sh --profile`):
+#   a100         1× 80GB A100 dedicated to the LLM → Qwen3-VL-32B-Instruct
+#   h100x4       4× 80GB H100 NVL → Qwen2.5-VL-72B-Instruct (tensor parallel 4)
+#   a100-shared  same 80GB GPU as SAM3 → Qwen3-VL-8B (leave VRAM for tracking)
+#   demo         SAM 3 Agent notebook default (8B Thinking)
 VLLM_DEFAULT_BASE = "http://127.0.0.1:8001/v1"
 OLLAMA_DEFAULT_BASE = "http://127.0.0.1:11434/v1"
 OLLAMA_NATIVE_BASE = "http://127.0.0.1:11434"
-VLLM_DEFAULT_MODEL = "Qwen/Qwen3-VL-8B-Thinking"
-OLLAMA_DEFAULT_MODEL = "qwen2.5vl"
+SAM3_AGENT_DEFAULT_MODEL = "Qwen/Qwen3-VL-8B-Thinking"
+VLLM_DEFAULT_MODEL = "Qwen/Qwen3-VL-32B-Instruct"
+OLLAMA_DEFAULT_MODEL = "qwen2.5vl:32b"
 LOCAL_DUMMY_KEY = "DUMMY_API_KEY"
+
+LLM_PROFILES: dict[str, dict[str, Any]] = {
+    "a100": {
+        "vllm_model": "Qwen/Qwen3-VL-32B-Instruct",
+        "vllm_thinking_model": "Qwen/Qwen3-VL-32B-Thinking",
+        "ollama_model": "qwen2.5vl:32b",
+        "tensor_parallel": 1,
+        "blurb": "1× 80GB A100 dedicated to the vision LLM (do not co-locate with SAM3)",
+    },
+    "h100x4": {
+        "vllm_model": "Qwen/Qwen2.5-VL-72B-Instruct",
+        "vllm_thinking_model": "Qwen/Qwen3-VL-32B-Thinking",
+        "ollama_model": "qwen2.5vl:72b",
+        "tensor_parallel": 4,
+        "blurb": "4× 80GB H100 NVL; 72B bf16 at TP=4. Point the tracker at this server.",
+    },
+    "a100-shared": {
+        "vllm_model": "Qwen/Qwen3-VL-8B-Instruct",
+        "vllm_thinking_model": "Qwen/Qwen3-VL-8B-Thinking",
+        "ollama_model": "qwen2.5vl",
+        "tensor_parallel": 1,
+        "blurb": "Same 80GB GPU as SAM3 — 8B VL so tracking still fits",
+    },
+    "demo": {
+        "vllm_model": SAM3_AGENT_DEFAULT_MODEL,
+        "vllm_thinking_model": SAM3_AGENT_DEFAULT_MODEL,
+        "ollama_model": "qwen2.5vl",
+        "tensor_parallel": 1,
+        "blurb": "SAM 3 Agent notebook default (Qwen3-VL-8B-Thinking)",
+    },
+}
+_PROFILE_ALIASES = {
+    "workstation": "a100",
+    "a100-80": "a100",
+    "80gb": "a100",
+    "cluster": "h100x4",
+    "h100": "h100x4",
+    "4xh100": "h100x4",
+    "h100nvl": "h100x4",
+    "shared": "a100-shared",
+    "sam3": "demo",
+    "8b": "demo",
+}
 VISION_MODEL_HINTS = (
     "vl", "vision", "llava", "minicpm", "pixtral", "gemma3", "qwen2.5-vl",
     "qwen2.5vl", "qwen3-vl", "qwen3_vl", "internvl", "phi-4-multimodal",
@@ -64,9 +114,40 @@ class LLMConfig:
 
 def _env_true(name: str, default: bool = True) -> bool:
     raw = os.environ.get(name)
-    if raw is None:
+    if raw is None or not str(raw).strip():
         return default
-    return raw.strip().lower() not in ("0", "false", "no", "off")
+    return str(raw).strip().lower() not in ("0", "false", "no", "off")
+
+
+def normalize_llm_profile(raw: Optional[str] = None) -> str:
+    name = (raw if raw is not None else os.environ.get("AGENT_LLM_PROFILE") or "").strip().lower()
+    name = _PROFILE_ALIASES.get(name, name)
+    if not name:
+        return "a100"
+    if name not in LLM_PROFILES:
+        return "a100"
+    return name
+
+
+def default_vllm_model(profile: Optional[str] = None, thinking: Optional[bool] = None) -> str:
+    spec = LLM_PROFILES[normalize_llm_profile(profile)]
+    think = _env_true("AGENT_LLM_THINKING", False) if thinking is None else bool(thinking)
+    return str(spec["vllm_thinking_model"] if think else spec["vllm_model"])
+
+
+def default_ollama_model(profile: Optional[str] = None) -> str:
+    return str(LLM_PROFILES[normalize_llm_profile(profile)]["ollama_model"])
+
+
+def _serve_hint() -> str:
+    profile = normalize_llm_profile()
+    model = default_vllm_model()
+    return (
+        f"bash scripts/serve_agent_llm.sh vllm --profile {profile}  "
+        f"(serves {model} on :8001). "
+        "Profiles: a100 (32B on dedicated 80GB), h100x4 (72B TP=4), "
+        "a100-shared / demo (8B, can share a GPU with SAM3)."
+    )
 
 
 def _normalize_openai_base(url: str, provider: str = "") -> str:
@@ -245,7 +326,7 @@ def load_llm_config(*, probe: bool = True) -> LLMConfig:
         else:
             base_url = _normalize_openai_base(base_url, provider)
         if not model:
-            default_model = OLLAMA_DEFAULT_MODEL if provider == "ollama" else VLLM_DEFAULT_MODEL
+            default_model = default_ollama_model() if provider == "ollama" else default_vllm_model()
             model = _prefer_vision_model(available, default_model)
         if not api_key:
             api_key = LOCAL_DUMMY_KEY
@@ -259,9 +340,9 @@ def load_llm_config(*, probe: bool = True) -> LLMConfig:
         if probe and not reachable:
             missing = (
                 f"No {provider} server answered at {base_url}. "
-                "Start Ollama (`ollama serve` + `ollama pull qwen2.5vl`) or vLLM "
-                f"(`vllm serve {VLLM_DEFAULT_MODEL} --port 8001 --allowed-local-media-path /`), "
-                "same pattern as SAM 3 Agent."
+                f"{_serve_hint()} "
+                "Or Ollama: `ollama pull qwen2.5vl:32b && ollama serve`. "
+                "Same OpenAI-compat pattern as SAM 3 Agent (dummy API key)."
             )
             configured = False
         return LLMConfig(
@@ -288,9 +369,8 @@ def load_llm_config(*, probe: bool = True) -> LLMConfig:
             configured=False,
             missing_reason=(
                 "No local Ollama/vLLM server detected and no cloud API key. "
-                "Start Ollama (`ollama pull qwen2.5vl && ollama serve`) or vLLM on :8001 "
-                f"(`vllm serve {VLLM_DEFAULT_MODEL} --port 8001 --allowed-local-media-path /`), "
-                "or set AGENT_LLM_BASE_URL / AGENT_LLM_PROVIDER=ollama|vllm. "
+                f"{_serve_hint()} "
+                "Or set AGENT_LLM_BASE_URL / AGENT_LLM_PROVIDER=ollama|vllm. "
                 "Cloud fallback: AGENT_LLM_API_KEY or OPENAI_API_KEY / ANTHROPIC_API_KEY."
             ),
             reachable=False,
@@ -309,6 +389,7 @@ def load_llm_config(*, probe: bool = True) -> LLMConfig:
 
 def llm_status_dict() -> dict:
     cfg = load_llm_config()
+    profile = normalize_llm_profile()
     return {
         "configured": cfg.configured,
         "provider": cfg.provider,
@@ -318,6 +399,9 @@ def llm_status_dict() -> dict:
         "reachable": cfg.reachable,
         "local": cfg.local,
         "available_models": cfg.available_models,
+        "profile": profile,
+        "recommended_model": default_vllm_model(profile),
+        "profile_blurb": LLM_PROFILES[profile]["blurb"],
     }
 
 
