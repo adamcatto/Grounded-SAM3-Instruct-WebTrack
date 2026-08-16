@@ -102,9 +102,10 @@ async function hydrateSavedMasks(pid: string, videoId: string | undefined, frame
     if (Object.keys(masks).length === 0) return
     const s = useStore.getState()
     if (s.currentVideoId !== videoId) return
-    const liveEmpty = Object.keys(s.currentFrameMasks).length === 0 || s.currentFrameMasksFrame !== frameIdx
-    if (liveEmpty) s.setCurrentFrameMasks(masks, frameIdx)
-    s.setSavedMask(frameIdx, { ...(s.savedMaskCache[frameIdx] ?? {}), ...masks })
+    const live = s.currentFrameMasksFrame === frameIdx ? s.currentFrameMasks : {}
+    const merged = { ...(s.savedMaskCache[frameIdx] ?? {}), ...live, ...masks }
+    s.setCurrentFrameMasks(merged, frameIdx)
+    s.setSavedMask(frameIdx, merged)
   } catch { /* ignore */ }
 }
 
@@ -142,8 +143,10 @@ async function applyUiEvent(ev: Record<string, unknown>) {
       const masks = (ev.masks || {}) as MaskData
       const s2 = useStore.getState()
       s2.setCurrentFrame(frameIdx)
-      s2.setCurrentFrameMasks(masks, frameIdx)
-      s2.setSavedMask(frameIdx, { ...(s2.savedMaskCache[frameIdx] ?? {}), ...masks })
+      const live = s2.currentFrameMasksFrame === frameIdx ? s2.currentFrameMasks : {}
+      const merged = { ...(s2.savedMaskCache[frameIdx] ?? {}), ...live, ...masks }
+      s2.setCurrentFrameMasks(merged, frameIdx)
+      s2.setSavedMask(frameIdx, merged)
       break
     }
     case 'select_object': {

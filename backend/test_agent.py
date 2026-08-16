@@ -134,7 +134,7 @@ class TestTwoMouseAssignment(unittest.TestCase):
         }
         summary = agent.finalize_segmentation_eval(objects, [swapped_left, bedding])
         self.assertFalse(summary["ok"])
-        self.assertTrue(summary["incomplete"])
+        self.assertFalse(summary["incomplete"])
         by_id = {p["object_id"]: p["reason"] for p in summary["objects"]}
         self.assertIn("identity_swap", by_id["1"])
         self.assertIn("likely_bedding", by_id["2"])

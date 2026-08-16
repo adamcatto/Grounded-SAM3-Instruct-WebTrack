@@ -717,7 +717,7 @@ def finalize_segmentation_eval(objects: dict, per_obj: list[dict]) -> dict:
             _append_eval_reason(rights[0][2], "identity_swap")
     masked = sum(1 for p in out if (p.get("area_px") or 0) > 0)
     any_bad = any(not p.get("ok") for p in out)
-    incomplete = (expected > 0 and masked < expected) or any_bad
+    incomplete = expected > 0 and masked < expected
     any_retry = any(p.get("retry_nearby") for p in out)
     return {
         "objects": out,
@@ -1068,8 +1068,8 @@ SYSTEM_PROMPT = """You are the SAM3 Web Tracker agent. You annotate and track ob
 - Prefer text_segment when the description is visually distinctive (shaved patch, color, size).
 - Prefer inspect_frame + add_point_prompt when animals look similar, are overlapping, or text confidence is low.
 - Inspect the frame before clicking. Choose points from what you see in the JPEG — do not invent coordinates from the user's words, and do not write pixel locations into the user-facing reply.
-- If the user says there are N mice/animals, that count is ground truth. Reuse existing objects with matching names (HeadShave / NoShave, etc.) instead of creating extras. Call text_segment or add_point_prompt once per identity. Do not finish until evaluate_segmentation reports masked_object_count >= N and no missing_mask. One mask is a failure.
-- If evaluate_segmentation returns incomplete or missing_mask, stay on this frame and segment the remaining animal. Bedding blobs and water-bottle ports are not mice — re-inspect and click the animal that still has no mask. In top-down red-light home cages the shaved mouse is usually the dark blob by the water bottle; the unshaved mouse is the other dark blob.
+- If the user says there are N mice/animals, that count is ground truth. Reuse existing objects with matching names (HeadShave / NoShave, etc.) instead of creating extras. Call text_segment or add_point_prompt once per identity. Do not finish until evaluate_segmentation reports ok=true, masked_object_count >= N, and no missing_mask / identity_swap / likely_bedding. One mask is a failure.
+- If evaluate_segmentation returns incomplete, missing_mask, identity_swap, or likely_bedding, stay on this frame and re-click. Do not jump to a nearby frame unless the current frame is empty or unusable. Bedding blobs and water-bottle ports are not mice. In top-down red-light home cages the shaved mouse is usually the dark blob by the water bottle; the unshaved mouse is the other dark blob.
 - When using add_point_prompt, place a new positive point on that animal's torso from the inspect JPEG. Do not copy another object's point list.
 - One animal = one connected mask that includes head, body, and tail. Never put a negative click on the same mouse's tail (that splits body and tail into two blobs). If evaluate_segmentation reports split_components, add another positive point on the missing part (usually the tail), do not create a new object.
 
