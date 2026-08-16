@@ -93,6 +93,25 @@ class TestProjectOverview(unittest.TestCase):
         self.assertNotIn("prompted_frame_count", other)
         self.assertIn("name", other)
 
+    def test_detections_from_numpy_outputs(self):
+        mask = np.zeros((8, 8), dtype=np.uint8)
+        mask[2:6, 2:6] = 1
+        dets = agent._detections_from_sam_outputs({
+            "out_obj_ids": np.array([3]),
+            "out_binary_masks": np.array([mask]),
+            "out_boxes_xywh": np.array([[0.1, 0.2, 0.3, 0.4]]),
+            "out_probs": np.array([0.9]),
+        })
+        self.assertEqual(len(dets), 1)
+        self.assertEqual(dets[0]["score"], 0.9)
+        self.assertEqual(dets[0]["mask"].shape, (8, 8))
+
+    def test_detections_empty_numpy_is_not_ambiguous(self):
+        self.assertEqual(agent._detections_from_sam_outputs({
+            "out_obj_ids": np.array([]),
+            "out_binary_masks": np.array([]),
+        }), [])
+
 
 class TestToolSurface(unittest.TestCase):
     def test_required_tools_exist(self):

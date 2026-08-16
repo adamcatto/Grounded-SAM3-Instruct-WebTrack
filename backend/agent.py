@@ -1011,13 +1011,29 @@ def _apply_points(session: AgentSession, vid: str, oid: str, frame_idx: int, poi
     return result
 
 
+def _as_seq(val: Any) -> list:
+    """Numpy arrays are truthy-ambiguous; never use `arr or []`."""
+    if val is None:
+        return []
+    if isinstance(val, np.ndarray):
+        if val.size == 0:
+            return []
+        return list(val)
+    if isinstance(val, (list, tuple)):
+        return list(val)
+    try:
+        return list(val)
+    except TypeError:
+        return []
+
+
 def _detections_from_sam_outputs(frame_outputs: dict) -> list[dict]:
     if not isinstance(frame_outputs, dict):
         return []
-    obj_ids = frame_outputs.get("out_obj_ids") or []
-    masks = frame_outputs.get("out_binary_masks") or []
-    boxes = frame_outputs.get("out_boxes_xywh") or []
-    probs = frame_outputs.get("out_probs") or []
+    obj_ids = _as_seq(frame_outputs.get("out_obj_ids"))
+    masks = _as_seq(frame_outputs.get("out_binary_masks"))
+    boxes = _as_seq(frame_outputs.get("out_boxes_xywh"))
+    probs = _as_seq(frame_outputs.get("out_probs"))
     dets: list[dict] = []
     for i, oid in enumerate(obj_ids):
         mask = masks[i] if i < len(masks) else None
