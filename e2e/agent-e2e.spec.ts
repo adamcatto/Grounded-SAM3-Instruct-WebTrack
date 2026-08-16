@@ -1,5 +1,5 @@
 import { test, expect, type Page } from '@playwright/test'
-import { mkdirSync, writeFileSync, copyFileSync, existsSync } from 'node:fs'
+import { mkdirSync, writeFileSync, copyFileSync, existsSync, readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import {
   SANDBOX,
@@ -20,14 +20,15 @@ const SHOTS = join(REPORT, 'screenshots')
 const ARTIFACTS = '/opt/cursor/artifacts/screenshots'
 
 const PROMPT = [
-  'There are exactly two mice in this frame — one with a shaved/clipped patch and one without.',
-  'Inspect this frame first so you can see both animals.',
-  'Then segment BOTH of them (every mouse must get its own mask):',
-  '- NoShave (existing object 2): unshaved mouse on the LEFT / center of the bedding. After inspect, a good torso click is around normalized (0.32, 0.50).',
-  '- HeadShave (existing object 1): shaved mouse on the FAR RIGHT of the cage, against the wall by the circular water-bottle port. After inspect, a good torso click is around normalized (0.80, 0.42). Do NOT click 0.50 or 0.67 in x — that is empty bedding between them.',
-  'Prefer text_segment with those descriptions, then evaluate_segmentation.',
-  'If a mask is missing or on the wrong mouse, add_point_prompt with one positive point on that mouse\'s back from the JPEG and a negative point on the other mouse.',
-  'Do not copy one object\'s points onto the other. Do not finish until both HeadShave and NoShave have a compact mask on this frame. Do not start propagation.',
+  'This home-cage frame has exactly two mice: one with a shaved/clipped patch (HeadShave, object 1) and one without (NoShave, object 2).',
+  'Inspect the frame first.',
+  'SAM3 text grounding often misses the far-right mouse and lights up empty bedding around x=0.60–0.67 instead — do not trust that as HeadShave.',
+  'Segment both animals with add_point_prompt (reuse the existing objects, do not create new ones):',
+  '1) NoShave object_id="2": one positive click on the LEFT mouse torso at about (0.32, 0.50).',
+  '2) HeadShave object_id="1": one positive click on the FAR RIGHT mouse next to the round water-bottle port at about (0.80, 0.42).',
+  'Never click x=0.50–0.70 (empty bedding). Never put both objects on the same mouse.',
+  'Then evaluate_segmentation. If HeadShave is missing or not on the far-right animal, click (0.80, 0.42) again.',
+  'Do not finish until both objects have their own compact mask. Do not start propagation.',
 ].join(' ')
 
 let baseline: ProjectSnapshot
@@ -204,10 +205,61 @@ test('agent inspect + segment two mice from the UI', async ({ page }) => {
   writeFileSync(join(REPORT, 'README.md'), report)
 
   expect(dumpDir, 'agent context dump_dir missing').toBeTruthy()
+  if (dumpDir && existsSync(dumpDir)) {
+    for (const f of readdirSync(dumpDir)) {
+      if (f.startsWith('inspect_') && f.endsWith('.jpg')) {
+        copyFileSync(join(dumpDir, f), join(ARTIFACTS, f))
+      }
+    }
+  }
   const masks = await getSavedMasks(SANDBOX.pid, SANDBOX.vid, SANDBOX.anchorFrame)
   expect(masks.masks[SANDBOX.objA], 'HeadShave mask missing after agent run').toBeTruthy()
   expect(masks.masks[SANDBOX.objB], 'NoShave mask missing after agent run').toBeTruthy()
+
+  const ev = lastEvaluateResult(dumpDir)
+  if (!ev) {
+    throw new Error('agent never called evaluate_segmentation')
+  }
+  expect(ev.masked_object_count ?? 0, 'both mice must have masks').toBeGreaterThanOrEqual(2)
+  expect(ev.incomplete, 'evaluate_segmentation still incomplete').toBeFalsy()
+  const byId: Record<string, { bbox_xywh_norm?: number[]; ok?: boolean; reason?: string }> = {}
+  for (const row of ev.objects || []) {
+    if (row.object_id) byId[String(row.object_id)] = row
+  }
+  const hs = byId[SANDBOX.objA]
+  const ns = byId[SANDBOX.objB]
+  expect(hs?.ok, `HeadShave not ok: ${hs?.reason}`).toBeTruthy()
+  expect(ns?.ok, `NoShave not ok: ${ns?.reason}`).toBeTruthy()
+  const hscx = bboxCenterX(hs?.bbox_xywh_norm)
+  const nscx = bboxCenterX(ns?.bbox_xywh_norm)
+  expect(nscx, `NoShave should be the left mouse, cx=${nscx}`).toBeLessThan(0.50)
+  expect(hscx, `HeadShave should be the far-right mouse, cx=${hscx}`).toBeGreaterThan(0.70)
 })
+
+function lastEvaluateResult(dumpDir: string): {
+  masked_object_count?: number
+  incomplete?: boolean
+  objects?: Array<{ object_id?: string; bbox_xywh_norm?: number[]; ok?: boolean; reason?: string }>
+} | null {
+  const p = join(dumpDir, 'context.json')
+  if (!existsSync(p)) return null
+  const ctx = JSON.parse(readFileSync(p, 'utf8')) as {
+    events?: Array<{ event?: string; data?: { name?: string; result?: Record<string, unknown> } }>
+  }
+  const events = ctx.events || []
+  for (let i = events.length - 1; i >= 0; i--) {
+    const ev = events[i]
+    if (ev?.event === 'tool_result' && ev?.data?.name === 'evaluate_segmentation') {
+      return (ev.data.result || null) as ReturnType<typeof lastEvaluateResult>
+    }
+  }
+  return null
+}
+
+function bboxCenterX(bbox?: number[]) {
+  if (!bbox || bbox.length < 4) return NaN
+  return bbox[0] + bbox[2] / 2
+}
 
 function relativeToReport(abs: string) {
   if (!abs.startsWith(REPO)) return abs

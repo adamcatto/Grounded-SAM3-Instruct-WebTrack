@@ -538,6 +538,150 @@ def evaluate_mask_quality(
     }
 
 
+SAME_LOCATION_TOL = 0.08
+
+
+def _compact_label(s: str) -> str:
+    return (s or "").lower().replace(" ", "").replace("_", "").replace("-", "")
+
+
+def _bbox_center_xy(det: dict) -> tuple[float, float]:
+    bbox = det.get("bbox") or det.get("bbox_xywh_norm")
+    if bbox is not None:
+        try:
+            x, y, w, h = [float(v) for v in list(bbox)[:4]]
+            return (x + w / 2.0, y + h / 2.0)
+        except (TypeError, ValueError):
+            pass
+    mask = det.get("mask")
+    if mask is None:
+        return (0.5, 0.5)
+    m = np.squeeze(np.asarray(mask))
+    if m.ndim != 2:
+        return (0.5, 0.5)
+    ys, xs = np.where(m > 0)
+    if xs.size == 0:
+        return (0.5, 0.5)
+    h, w = m.shape
+    return (float(xs.mean()) / w, float(ys.mean()) / h)
+
+
+def _prefer_side_from_text_and_object(text: str, obj: Optional[dict]) -> Optional[str]:
+    """Map shave-state / side language onto leftmost vs rightmost detections."""
+    name = _compact_label((obj or {}).get("name") or "")
+    desc = (obj or {}).get("description") or ""
+    blob = f"{text or ''} {desc}".lower()
+    compact_blob = _compact_label(blob)
+    if any(k in name for k in ("noshave", "unshaved", "unclipped")):
+        return "left"
+    if any(k in name for k in ("headshave", "backshave")):
+        return "right"
+    left_phrases = (
+        "on the left", "left mouse", "left side", "left of the cage",
+        "unshaved", "unclipped", "no shave", "noshave", "fully furred",
+    )
+    right_phrases = (
+        "on the right", "right mouse", "right side", "far right",
+        "water bottle", "water port", "clipped patch", "head shave", "shaved",
+    )
+    if any(p in blob or _compact_label(p) in compact_blob for p in left_phrases):
+        return "left"
+    if any(p in blob or _compact_label(p) in compact_blob for p in right_phrases):
+        return "right"
+    return None
+
+
+def _text_implies_far_right(text: str, obj: Optional[dict]) -> bool:
+    blob = f"{text or ''} {(obj or {}).get('description') or ''}".lower()
+    return any(k in blob for k in ("far right", "water bottle", "water port", "right wall", "right of the cage"))
+
+
+def _pick_detection(detections: list[dict], text: str, obj: Optional[dict]) -> dict:
+    if not detections:
+        raise ValueError("no detections")
+    if len(detections) == 1:
+        return detections[0]
+    side = _prefer_side_from_text_and_object(text, obj)
+    ranked = sorted(detections, key=lambda d: _bbox_center_xy(d)[0])
+    if side == "left":
+        return ranked[0]
+    if side == "right":
+        return ranked[-1]
+    return detections[0]
+
+
+def _detection_summary(det: dict) -> dict:
+    cx, cy = _bbox_center_xy(det)
+    bbox = det.get("bbox") or det.get("bbox_xywh_norm")
+    bbox_out = None
+    if bbox is not None:
+        try:
+            bbox_out = [round(float(x), 5) for x in list(bbox)[:4]]
+        except (TypeError, ValueError):
+            bbox_out = None
+    score = det.get("score")
+    try:
+        score = None if score is None else round(float(score), 4)
+    except (TypeError, ValueError):
+        score = None
+    return {
+        "score": score,
+        "bbox_xywh_norm": bbox_out,
+        "center_xy": [round(cx, 4), round(cy, 4)],
+    }
+
+
+def finalize_segmentation_eval(objects: dict, per_obj: list[dict]) -> dict:
+    """Fill in missing objects and flag two masks sitting on the same spot."""
+    out = [dict(p) for p in per_obj]
+    seen = {str(p.get("object_id")) for p in out}
+    expected = len(objects or {})
+    for oid, obj in (objects or {}).items():
+        if str(oid) in seen:
+            continue
+        out.append({
+            "ok": False,
+            "confidence": 0.0,
+            "reason": "missing_mask",
+            "area_px": 0,
+            "coverage": 0.0,
+            "object_id": str(oid),
+            "name": (obj or {}).get("name"),
+            "overlap_px": 0,
+            "retry_nearby": False,
+        })
+    with_bbox = [p for p in out if p.get("area_px") and p.get("bbox_xywh_norm")]
+    for i, a in enumerate(with_bbox):
+        for b in with_bbox[i + 1:]:
+            ba = a["bbox_xywh_norm"]
+            bb = b["bbox_xywh_norm"]
+            ca = (ba[0] + ba[2] / 2.0, ba[1] + ba[3] / 2.0)
+            cb = (bb[0] + bb[2] / 2.0, bb[1] + bb[3] / 2.0)
+            if abs(ca[0] - cb[0]) < SAME_LOCATION_TOL and abs(ca[1] - cb[1]) < SAME_LOCATION_TOL:
+                extra = "same_location_as_other_object"
+                for p in (a, b):
+                    p["ok"] = False
+                    reason = p.get("reason") or "ok"
+                    if extra not in reason:
+                        p["reason"] = extra if reason in ("ok", "") else f"{reason},{extra}"
+    masked = sum(1 for p in out if (p.get("area_px") or 0) > 0)
+    incomplete = expected > 0 and masked < expected
+    any_retry = any(p.get("retry_nearby") for p in out)
+    return {
+        "objects": out,
+        "expected_object_count": expected,
+        "masked_object_count": masked,
+        "incomplete": incomplete,
+        "ok": bool(out) and all(p.get("ok") for p in out) and not incomplete,
+        "retry_nearby": any_retry,
+        "note": (
+            f"Expected {expected} object masks on this frame, found {masked}. "
+            "Stay on this frame and segment each remaining object."
+            if incomplete else None
+        ),
+    }
+
+
 def project_overview(project: dict, current_video_id: Optional[str], current_frame: int) -> dict:
     """Compact project snapshot the LLM can reason over."""
     videos = project.get("videos") or {}
@@ -728,9 +872,11 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "name": "text_segment",
         "description": (
-            "Run SAM3 text-based segmentation on a frame and bind the best mask to an "
-            "object id (creates the object if needed). Persists like a normal annotation "
-            "so the canvas and later propagation work as usual. If confidence is low, "
+            "Run SAM3 text-based segmentation on a frame and bind a mask to an "
+            "object id (creates the object if needed). When several mice are detected, "
+            "the leftmost or rightmost mask is chosen if the text or object name implies "
+            "a side (NoShave/unshaved/left vs HeadShave/shaved/right). Call once per "
+            "identity. Persists like a normal annotation. If confidence is low, "
             "try inspect_frame on a nearby frame (±20) and retry."
         ),
         "parameters": {
@@ -780,7 +926,12 @@ TOOL_SCHEMAS: list[dict] = [
     },
     {
         "name": "evaluate_segmentation",
-        "description": "Score saved masks on a frame (area, coverage, overlap, confidence).",
+        "description": (
+            "Score saved masks on a frame (area, coverage, overlap, confidence). "
+            "Compares against every object in the video: missing objects are failures "
+            "(reason=missing_mask, incomplete=true). Do not finish while "
+            "masked_object_count is below the expected animal count."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -847,8 +998,8 @@ SYSTEM_PROMPT = """You are the SAM3 Web Tracker agent. You annotate and track ob
 3. For each planned frame:
    a. goto_frame then inspect_frame so you can see animals, occlusion, blur, and identity cues.
    b. create_object once per identity (reuse existing objects with the same name).
-   c. text_segment with a specific phrase per object (e.g. "mouse with a shaved patch on its back" vs "unshaved mouse").
-   d. evaluate_segmentation. If confidence is low, the frame is empty, identities are swapped, or animals overlap badly: think, then try nearby frames (±20, then ±40) via plan_frames(around_frame=..., nearby_offset=20).
+              c. text_segment once per identity with a phrase that includes count/side/shave-state (e.g. "unshaved mouse on the left" vs "shaved mouse on the right near the water port"). Reuse existing object ids.
+   d. evaluate_segmentation. If confidence is low, the frame is empty, identities are swapped, or animals overlap badly: think, then try nearby frames (±20, then ±40) via plan_frames(around_frame=..., nearby_offset=20). If the result is incomplete / missing_mask, stay on this frame and segment the remaining animals.
    e. If text segmentation is weak but you can see the animal, add_point_prompt at a chest/back point (positive=1). Use a negative point (0) on the other animal if they touch.
    f. commit_anchor when the frame is a planned grid/anchor frame and the masks look right.
 4. Adapt. Do not blindly march the grid if a frame is unusable. Skip to a clearer neighbor, then continue the plan.
@@ -858,7 +1009,8 @@ SYSTEM_PROMPT = """You are the SAM3 Web Tracker agent. You annotate and track ob
 - Prefer text_segment when the description is visually distinctive (shaved patch, color, size).
 - Prefer inspect_frame + add_point_prompt when animals look similar, are overlapping, or text confidence is low.
 - Never invent coordinates without having inspected the frame (or a text_segment result that returned a bbox).
-- If the user says there are N mice/animals, do not finish until N distinct objects have masks on that frame. One mask is a failure. After segmenting, evaluate_segmentation (and re-inspect if needed) to confirm each animal is covered and identities are not swapped.
+- If the user says there are N mice/animals, that count is ground truth. Call text_segment once per identity. Put side and shave-state in the phrase. The backend binds the leftmost or rightmost detection when the phrase or object name (NoShave / HeadShave) implies a side. Do not finish until evaluate_segmentation reports masked_object_count >= N and no missing_mask. One mask is a failure.
+- If evaluate_segmentation returns incomplete or missing_mask, stay on this frame and segment the remaining object. A blob on empty bedding is not a mouse — re-inspect and click the animal that still has no mask. In top-down home-cage videos the two mice are often on opposite sides; a "second" mask around x=0.60–0.67 is frequently bedding, not the far-right animal.
 - When using add_point_prompt, place a new positive point on that animal's torso from the inspect JPEG. Do not copy another object's point list.
 
 ## Style
@@ -1148,10 +1300,34 @@ def _text_segment_impl(session: AgentSession, vid: str, frame_idx: int, text: st
             ),
         }
 
-    best = detections[0]
+    best = _pick_detection(detections, text, obj)
+    picked_side = _prefer_side_from_text_and_object(text, obj)
+    picked_xy = _bbox_center_xy(best)
     quality = evaluate_mask_quality(best["mask"], score=best.get("score"))
+    far_right_miss = bool(
+        picked_side == "right"
+        and _text_implies_far_right(text, obj)
+        and picked_xy[0] < 0.70
+    )
+    suggestion = None
+    if far_right_miss:
+        quality = {
+            **quality,
+            "ok": False,
+            "reason": (
+                "detection_not_on_far_right"
+                if quality.get("reason") in (None, "", "ok")
+                else f"{quality.get('reason')},detection_not_on_far_right"
+            ),
+            "retry_nearby": False,
+        }
+        suggestion = (
+            "Text grounding's rightmost hit is still mid-cage (often empty bedding around x=0.60–0.67). "
+            "add_point_prompt on the far-right mouse torso from the inspect JPEG (about 0.80, 0.42)."
+        )
+
     bound = None
-    if obj is not None:
+    if obj is not None and not far_right_miss:
         points = sample_points_from_mask(best["mask"], n_total=8)
         if not points:
             return {**quality, "ok": False, "error": "empty_best_mask", "frame_idx": frame_idx}
@@ -1159,13 +1335,10 @@ def _text_segment_impl(session: AgentSession, vid: str, frame_idx: int, text: st
         bound = _apply_points(session, vid, str(obj["id"]), frame_idx, points, labels)
         color = obj.get("color") or "#5B8DD9"
     else:
-        color = "#5B8DD9"
+        color = (obj or {}).get("color") or "#5B8DD9"
 
     mask_b64 = encode_mask_as_png(best["mask"], color)
-    extra = []
-    for d in detections[1:5]:
-        q = evaluate_mask_quality(d["mask"], score=d.get("score"))
-        extra.append({"score": d.get("score"), "quality": q})
+    extra = [_detection_summary(d) for d in detections]
 
     return {
         "ok": quality["ok"],
@@ -1175,11 +1348,14 @@ def _text_segment_impl(session: AgentSession, vid: str, frame_idx: int, text: st
         "video_id": vid,
         "object": obj,
         "quality": quality,
+        "picked_side": picked_side,
+        "picked_center_xy": [round(picked_xy[0], 4), round(picked_xy[1], 4)],
         "detection_count": len(detections),
-        "other_detections": extra,
-        "seed_points": (bound.get("masks") and True) if bound else False,
-        "masks": (bound or {}).get("masks") or {str(obj["id"]): mask_b64} if obj else {"det": mask_b64},
+        "all_detections": extra,
+        "seed_points": bool(bound and bound.get("masks")),
+        "masks": (bound or {}).get("masks") or ({str(obj["id"]): mask_b64} if obj and not far_right_miss else {"det": mask_b64}),
         "retry_nearby": quality.get("retry_nearby"),
+        "suggestion": suggestion,
     }
 
 
@@ -1415,14 +1591,18 @@ def _execute_tool_inner(name: str, args: dict, session: AgentSession) -> dict:
                 q["retry_nearby"] = True
                 q["reason"] = (q.get("reason") or "") + ",high_overlap"
             per_obj.append(q)
-        any_retry = any(p.get("retry_nearby") for p in per_obj) or not per_obj
+        summary = finalize_segmentation_eval(objects, per_obj)
         return {
-            "ok": bool(per_obj) and not any_retry,
+            "ok": summary["ok"],
             "frame_idx": fidx,
             "video_id": vid,
-            "objects": per_obj,
-            "object_count": len(per_obj),
-            "retry_nearby": any_retry,
+            "objects": summary["objects"],
+            "object_count": len(summary["objects"]),
+            "expected_object_count": summary["expected_object_count"],
+            "masked_object_count": summary["masked_object_count"],
+            "incomplete": summary["incomplete"],
+            "note": summary["note"],
+            "retry_nearby": summary["retry_nearby"],
             "nearby_suggestion": nearby_frames(fidx, int(video.get("num_frames") or 1)),
         }
 

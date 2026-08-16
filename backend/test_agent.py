@@ -53,6 +53,66 @@ class TestMaskQuality(unittest.TestCase):
         self.assertIn("mask_covers_most_of_frame", q["reason"])
 
 
+class TestTwoMouseAssignment(unittest.TestCase):
+    def _det(self, cx: float, score: float = 0.9) -> dict:
+        return {"bbox": [cx - 0.05, 0.4, 0.1, 0.2], "score": score, "mask": np.ones((8, 8), dtype=np.uint8)}
+
+    def test_noshave_picks_leftmost(self):
+        dets = [self._det(0.8, 0.99), self._det(0.3, 0.7)]
+        picked = agent._pick_detection(dets, "mouse", {"name": "NoShave"})
+        self.assertAlmostEqual(agent._bbox_center_xy(picked)[0], 0.3)
+
+    def test_headshave_picks_rightmost(self):
+        dets = [self._det(0.8, 0.4), self._det(0.3, 0.99)]
+        picked = agent._pick_detection(dets, "mouse", {"name": "HeadShave"})
+        self.assertAlmostEqual(agent._bbox_center_xy(picked)[0], 0.8)
+
+    def test_text_left_overrides_score(self):
+        dets = [self._det(0.8, 0.99), self._det(0.25, 0.2)]
+        picked = agent._pick_detection(dets, "unshaved mouse on the left", None)
+        self.assertAlmostEqual(agent._bbox_center_xy(picked)[0], 0.25)
+
+    def test_far_right_phrase(self):
+        self.assertTrue(agent._text_implies_far_right(
+            "shaved mouse on the far right by the circular water bottle port", None
+        ))
+        self.assertFalse(agent._text_implies_far_right("mouse", {"name": "HeadShave"}))
+
+    def test_evaluate_reports_missing_object(self):
+        objects = {"1": {"name": "HeadShave"}, "2": {"name": "NoShave"}}
+        left = {
+            "ok": True,
+            "reason": "ok",
+            "area_px": 1000,
+            "bbox_xywh_norm": [0.2, 0.4, 0.15, 0.2],
+            "object_id": "2",
+            "name": "NoShave",
+            "retry_nearby": False,
+        }
+        summary = agent.finalize_segmentation_eval(objects, [left])
+        self.assertFalse(summary["ok"])
+        self.assertTrue(summary["incomplete"])
+        self.assertEqual(summary["masked_object_count"], 1)
+        reasons = {p["object_id"]: p["reason"] for p in summary["objects"]}
+        self.assertEqual(reasons["1"], "missing_mask")
+
+    def test_evaluate_flags_same_location(self):
+        objects = {"1": {"name": "HeadShave"}, "2": {"name": "NoShave"}}
+        a = {
+            "ok": True, "reason": "ok", "area_px": 2000,
+            "bbox_xywh_norm": [0.30, 0.40, 0.10, 0.10],
+            "object_id": "1", "name": "HeadShave", "retry_nearby": False,
+        }
+        b = {
+            "ok": True, "reason": "ok", "area_px": 1800,
+            "bbox_xywh_norm": [0.31, 0.41, 0.10, 0.10],
+            "object_id": "2", "name": "NoShave", "retry_nearby": False,
+        }
+        summary = agent.finalize_segmentation_eval(objects, [a, b])
+        self.assertFalse(summary["ok"])
+        self.assertTrue(all("same_location" in p["reason"] for p in summary["objects"]))
+
+
 class TestProjectOverview(unittest.TestCase):
     def test_overview_lists_videos_and_current(self):
         project = {
