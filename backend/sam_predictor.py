@@ -652,21 +652,29 @@ class SAMPredictor:
         if masks is None:
             return []
 
-        if hasattr(masks, "cpu"):
-            masks = masks.cpu().numpy()
+        def _to_numpy(t):
+            if t is None:
+                return None
+            if hasattr(t, "detach"):
+                t = t.detach()
+            if hasattr(t, "float"):
+                t = t.float()
+            if hasattr(t, "cpu"):
+                t = t.cpu()
+            return t.numpy() if hasattr(t, "numpy") else np.asarray(t)
+
+        masks = _to_numpy(masks)
         masks = np.asarray(masks)
         if masks.ndim == 2:
             masks = masks[None, ...]
         n = masks.shape[0]
         score_list = []
         if scores is not None:
-            if hasattr(scores, "cpu"):
-                scores = scores.cpu().numpy()
+            scores = _to_numpy(scores)
             score_list = [float(s) for s in np.asarray(scores).reshape(-1)]
         box_list = []
         if boxes is not None:
-            if hasattr(boxes, "cpu"):
-                boxes = boxes.cpu().numpy()
+            boxes = _to_numpy(boxes)
             box_list = np.asarray(boxes).reshape(-1, 4)
 
         for i in range(n):

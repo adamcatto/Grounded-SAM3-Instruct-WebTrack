@@ -120,6 +120,41 @@ class TestTwoMouseAssignment(unittest.TestCase):
         self.assertFalse(summary["ok"])
         self.assertTrue(all("same_location" in p["reason"] for p in summary["objects"]))
 
+    def test_evaluate_flags_bedding_and_identity_swap(self):
+        objects = {"1": {"name": "HeadShave"}, "2": {"name": "NoShave"}}
+        swapped_left = {
+            "ok": True, "reason": "ok", "area_px": 20000,
+            "bbox_xywh_norm": [0.17, 0.42, 0.20, 0.28],
+            "object_id": "1", "name": "HeadShave", "retry_nearby": False,
+        }
+        bedding = {
+            "ok": True, "reason": "ok", "area_px": 29000,
+            "bbox_xywh_norm": [0.61, 0.36, 0.10, 0.22],
+            "object_id": "2", "name": "NoShave", "retry_nearby": False,
+        }
+        summary = agent.finalize_segmentation_eval(objects, [swapped_left, bedding])
+        self.assertFalse(summary["ok"])
+        self.assertTrue(summary["incomplete"])
+        by_id = {p["object_id"]: p["reason"] for p in summary["objects"]}
+        self.assertIn("identity_swap", by_id["1"])
+        self.assertIn("likely_bedding", by_id["2"])
+
+    def test_evaluate_accepts_opposite_sides(self):
+        objects = {"1": {"name": "HeadShave"}, "2": {"name": "NoShave"}}
+        right = {
+            "ok": True, "reason": "ok", "area_px": 26000,
+            "bbox_xywh_norm": [0.73, 0.39, 0.10, 0.22],
+            "object_id": "1", "name": "HeadShave", "retry_nearby": False,
+        }
+        left = {
+            "ok": True, "reason": "ok", "area_px": 22000,
+            "bbox_xywh_norm": [0.17, 0.42, 0.20, 0.28],
+            "object_id": "2", "name": "NoShave", "retry_nearby": False,
+        }
+        summary = agent.finalize_segmentation_eval(objects, [right, left])
+        self.assertTrue(summary["ok"])
+        self.assertFalse(summary["incomplete"])
+
 
 class TestProjectOverview(unittest.TestCase):
     def test_overview_lists_videos_and_current(self):

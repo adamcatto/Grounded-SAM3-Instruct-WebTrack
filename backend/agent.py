@@ -652,6 +652,23 @@ def _detection_summary(det: dict) -> dict:
     }
 
 
+def _row_center_x(row: dict) -> Optional[float]:
+    bbox = row.get("bbox_xywh_norm") or []
+    if len(bbox) < 4:
+        return None
+    try:
+        return float(bbox[0]) + float(bbox[2]) / 2.0
+    except (TypeError, ValueError):
+        return None
+
+
+def _append_eval_reason(row: dict, extra: str) -> None:
+    row["ok"] = False
+    reason = str(row.get("reason") or "ok")
+    if extra not in reason:
+        row["reason"] = extra if reason in ("ok", "") else f"{reason},{extra}"
+
+
 def finalize_segmentation_eval(objects: dict, per_obj: list[dict]) -> dict:
     """Fill in missing objects and flag two masks sitting on the same spot."""
     out = [dict(p) for p in per_obj]
@@ -681,12 +698,26 @@ def finalize_segmentation_eval(objects: dict, per_obj: list[dict]) -> dict:
             if abs(ca[0] - cb[0]) < SAME_LOCATION_TOL and abs(ca[1] - cb[1]) < SAME_LOCATION_TOL:
                 extra = "same_location_as_other_object"
                 for p in (a, b):
-                    p["ok"] = False
-                    reason = p.get("reason") or "ok"
-                    if extra not in reason:
-                        p["reason"] = extra if reason in ("ok", "") else f"{reason},{extra}"
+                    _append_eval_reason(p, extra)
+    if expected >= 2:
+        for p in with_bbox:
+            cx = _row_center_x(p)
+            if cx is not None and 0.50 <= cx <= 0.70:
+                _append_eval_reason(p, "likely_bedding")
+        named = []
+        for p in with_bbox:
+            side = _prefer_side_from_text_and_object("", {"name": p.get("name") or ""})
+            cx = _row_center_x(p)
+            if side and cx is not None:
+                named.append((side, cx, p))
+        lefts = [r for r in named if r[0] == "left"]
+        rights = [r for r in named if r[0] == "right"]
+        if lefts and rights and lefts[0][1] > rights[0][1]:
+            _append_eval_reason(lefts[0][2], "identity_swap")
+            _append_eval_reason(rights[0][2], "identity_swap")
     masked = sum(1 for p in out if (p.get("area_px") or 0) > 0)
-    incomplete = expected > 0 and masked < expected
+    any_bad = any(not p.get("ok") for p in out)
+    incomplete = (expected > 0 and masked < expected) or any_bad
     any_retry = any(p.get("retry_nearby") for p in out)
     return {
         "objects": out,
@@ -698,7 +729,14 @@ def finalize_segmentation_eval(objects: dict, per_obj: list[dict]) -> dict:
         "note": (
             f"Expected {expected} object masks on this frame, found {masked}. "
             "Stay on this frame and segment each remaining object."
-            if incomplete else None
+            if expected > 0 and masked < expected
+            else (
+                "Masks failed quality checks (bedding blob, identity swap, or overlap). "
+                "Re-inspect and click each animal's torso; HeadShave/shaved is the far-side "
+                "mouse, NoShave is the other dark blob — not empty bedding."
+                if any_bad
+                else None
+            )
         ),
     }
 
@@ -1031,7 +1069,7 @@ SYSTEM_PROMPT = """You are the SAM3 Web Tracker agent. You annotate and track ob
 - Prefer inspect_frame + add_point_prompt when animals look similar, are overlapping, or text confidence is low.
 - Inspect the frame before clicking. Choose points from what you see in the JPEG — do not invent coordinates from the user's words, and do not write pixel locations into the user-facing reply.
 - If the user says there are N mice/animals, that count is ground truth. Reuse existing objects with matching names (HeadShave / NoShave, etc.) instead of creating extras. Call text_segment or add_point_prompt once per identity. Do not finish until evaluate_segmentation reports masked_object_count >= N and no missing_mask. One mask is a failure.
-- If evaluate_segmentation returns incomplete or missing_mask, stay on this frame and segment the remaining animal. Bedding blobs and water-bottle ports are not mice — re-inspect and click the animal that still has no mask.
+- If evaluate_segmentation returns incomplete or missing_mask, stay on this frame and segment the remaining animal. Bedding blobs and water-bottle ports are not mice — re-inspect and click the animal that still has no mask. In top-down red-light home cages the shaved mouse is usually the dark blob by the water bottle; the unshaved mouse is the other dark blob.
 - When using add_point_prompt, place a new positive point on that animal's torso from the inspect JPEG. Do not copy another object's point list.
 - One animal = one connected mask that includes head, body, and tail. Never put a negative click on the same mouse's tail (that splits body and tail into two blobs). If evaluate_segmentation reports split_components, add another positive point on the missing part (usually the tail), do not create a new object.
 
@@ -1328,7 +1366,6 @@ def _text_segment_impl(session: AgentSession, vid: str, frame_idx: int, text: st
     quality = evaluate_mask_quality(best["mask"], score=best.get("score"))
     far_right_miss = bool(
         picked_side == "right"
-        and _text_implies_far_right(text, obj)
         and picked_xy[0] < 0.70
     )
     suggestion = None
@@ -1574,15 +1611,47 @@ def _execute_tool_inner(name: str, args: dict, session: AgentSession) -> dict:
         )
 
     if name == "add_point_prompt":
-        vid, _video = _resolve_video(session, args.get("video_id"))
+        vid, video = _resolve_video(session, args.get("video_id"))
         fidx = int(args["frame_idx"]) if args.get("frame_idx") is not None else session.frame_idx
         _ensure_frame(session, vid, fidx)
         points = args.get("points") or []
         labels = args.get("labels") or []
         if len(points) != len(labels) or not points:
             raise ValueError("points and labels must be non-empty and the same length")
-        result = _apply_points(session, vid, str(args["object_id"]), fidx, points, labels)
-        return {"ok": True, "frame_idx": fidx, "object_id": str(args["object_id"]), "mask_ids": list((result.get("masks") or {}).keys())}
+        oid = str(args["object_id"])
+        result = _apply_points(session, vid, oid, fidx, points, labels)
+        obj = (video.get("objects") or {}).get(oid) or {}
+        warning = None
+        quality = None
+        try:
+            ms = VideoMaskStorage(s.pm.video_dir(session.pid, vid))
+            dense = ms.load_masks_dense(fidx) if hasattr(ms, "load_masks_dense") else {}
+            mask = (dense or {}).get(oid) or (dense or {}).get(int(oid) if oid.isdigit() else oid)
+            if mask is not None:
+                quality = evaluate_mask_quality(mask)
+                cx = (quality.get("bbox_xywh_norm") or [None])
+                cx = (cx[0] + cx[2] / 2.0) if len(cx) >= 4 else None
+                side = _prefer_side_from_text_and_object("", obj)
+                if side == "right" and cx is not None and cx < 0.70:
+                    warning = (
+                        "This click did not land on the far-side (shaved) mouse; "
+                        "x≈0.50–0.70 is often empty bedding. Re-inspect and click that mouse's torso."
+                    )
+                elif side == "left" and cx is not None and cx > 0.50:
+                    warning = (
+                        "This click did not land on the unshaved mouse. "
+                        "Re-inspect and click that mouse's torso, not the other animal or bedding."
+                    )
+        except Exception:
+            pass
+        return {
+            "ok": warning is None,
+            "frame_idx": fidx,
+            "object_id": oid,
+            "mask_ids": list((result.get("masks") or {}).keys()),
+            "quality": quality,
+            "warning": warning,
+        }
 
     if name == "evaluate_segmentation":
         vid, video = _resolve_video(session, args.get("video_id"))
