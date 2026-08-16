@@ -1,62 +1,79 @@
-# Agent E2E — A100-80GB shared with SAM3
+# Agent E2E (A100-80GB shared profile)
 
-Workstation: My Machines worker `a100-80gb`. SAM3 was already resident (~4 GB), so the vision LLM used **`a100-shared`** (not 32B):
+Project: `sandbox_Home-Cage-Interactions-0126-test-day`  video: `1A_video_test1a_20260130_090255.mp4`  frame: 160
 
-```bash
-bash scripts/serve_agent_llm.sh vllm --profile a100-shared
-```
+LLM: `{"provider":"vllm","model":"Qwen/Qwen3-VL-8B-Instruct","base_url":"http://127.0.0.1:8001/v1","profile":"a100","local":true}`
 
-| | |
-|---|---|
-| GPU | 1× NVIDIA A100 80GB PCIe |
-| SAM3 | `sam3` conda, uvicorn `:8000` (~4034 MiB) |
-| Agent LLM | vLLM `Qwen/Qwen3-VL-8B-Instruct` `:8001` (~39 GB, `max_model_len=16384`, `gpu_mem=0.50`) |
-| Combined | ~43 GB / 80 GB |
-| Project | `sandbox_Home-Cage-Interactions-0126-test-day` (`9f8a7b6c`) |
-| Video | `1A_video_test1a_20260130_090255.mp4` (`f09434ac`), frame **160** |
-| Prompt | Inspect the current frame. If two mice are present, segment each of them. Reuse existing objects when the names already match; otherwise create objects. Do not start propagation. |
+Tool calls: 4
 
-Playwright: `e2e/agent-e2e.spec.ts` (passed).
+## Outcome
 
-Full LLM transcript (system prompt, retrieved project JSON, every tool call/result, which inspect JPEGs were in context):
+Both mice were masked on frame 160 (`evaluate_segmentation` ok, `masked_object_count=2`):
 
-[`../agent-runs/20260816-155409/context.md`](../agent-runs/20260816-155409/context.md)
+| Object | Name | Mask bbox xywh (norm) | Center x |
+|---|---|---|---|
+| 2 | NoShave (left, unshaved) | `[0.179, 0.429, 0.198, 0.285]` | 0.278 |
+| 1 | HeadShave (far right, shaved) | `[0.737, 0.398, 0.046, 0.182]` | 0.760 |
 
-## What the agent did
+The agent inspected, then `add_point_prompt` on object 2 at `(0.32, 0.50)` and object 1 at `(0.78, 0.50)`. A click on the water port (~0.80, 0.42) fills most of the cage; the torso click at 0.78 is on the right mouse.
 
-1. **`inspect_frame`** frame 160 of `f09434ac` — JPEG stayed in the LLM context for steps 2–6.
-2. **`text_segment`** ×2 (`HeadShave` / `NoShave`) — failed on a numpy truthiness bug (`array or []`); fixed in this branch after the run.
-3. **`add_point_prompt`** ×2 on objects `1` and `2` — succeeded; reused existing HeadShave / NoShave.
-4. Final message: inspected frame 160, annotated both mice, did not start propagation.
+Context dump: `reports/agent-runs/20260816-162842/`
+
 
 ## Screenshots
 
-### 01 — App loaded
+### 01-app-loaded
 
 ![01-app-loaded](screenshots/01-app-loaded.png)
 
-### 02 — Project / video open (frame 160)
+### 02-project-open
 
 ![02-project-open](screenshots/02-project-open.png)
 
-### 03 — Agent pane
+### 03-agent-pane
 
 ![03-agent-pane](screenshots/03-agent-pane.png)
 
-### 04 — After inspect (run completed in one burst)
+### 04-after-inspect
 
 ![04-after-inspect](screenshots/04-after-inspect.png)
 
-### 05 — After segment
+### 05-after-segment
 
 ![05-after-segment](screenshots/05-after-segment.png)
 
-### 06 — Final
+### 06-final
 
 ![06-final](screenshots/06-final.png)
 
-## Inspect JPEG in LLM context
+## Context trace
 
-![inspect frame 160](../agent-runs/20260816-155409/inspect_vid-f09434ac_frame-160.jpg)
+Full dump: `/opt/software/Grounded-SAM3-Instruct-WebTrack/reports/agent-runs/20260816-162842`  ([context.md](../../reports/agent-runs/20260816-162842/context.md))
 
-Kept in the final transcript (`KEEP_INSPECT_IMAGES=2`; only one inspect this run).
+Inspect JPEGs in final LLM context:
+
+```json
+[
+  {
+    "message_index": 4,
+    "image_index": 0,
+    "role": "user",
+    "frame_idx": 160,
+    "video_id": "f09434ac",
+    "has_jpeg": true
+  }
+]
+```
+
+Inspect JPEGs seen:
+
+```json
+[
+  {
+    "file": "inspect_vid-f09434ac_frame-160.jpg",
+    "frame_idx": 160,
+    "video_id": "f09434ac",
+    "in_final_llm_context": true
+  }
+]
+```
