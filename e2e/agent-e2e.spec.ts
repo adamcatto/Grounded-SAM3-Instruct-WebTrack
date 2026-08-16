@@ -125,6 +125,7 @@ async function waitForCanvasMasks(page: Page, minCount: number, timeoutMs: numbe
 }
 
 test('agent inspect + segment two mice from the UI', async ({ page }) => {
+  await waitForBackend()
   await page.setViewportSize({ width: 1600, height: 960 })
   await page.goto('/')
   await page.getByText('SAM3 Web Tracker').first().waitFor({ timeout: 180_000 })
@@ -252,9 +253,9 @@ test('agent inspect + segment two mice from the UI', async ({ page }) => {
   expect(canvasIds?.split(','), 'HeadShave not on canvas').toContain(objHead)
   expect(canvasIds?.split(','), 'NoShave not on canvas').toContain(objNo)
 
-  const ev = lastEvaluateResult(dumpDir)
+  const ev = lastEvaluateResult(dumpDir, SANDBOX.anchorFrame)
   if (!ev) {
-    throw new Error('agent never called evaluate_segmentation')
+    throw new Error(`agent never called evaluate_segmentation on frame ${SANDBOX.anchorFrame}`)
   }
   expect(ev.masked_object_count ?? 0, 'both mice must have masks').toBeGreaterThanOrEqual(2)
   expect(ev.incomplete, 'evaluate_segmentation still incomplete').toBeFalsy()
@@ -274,7 +275,8 @@ test('agent inspect + segment two mice from the UI', async ({ page }) => {
   expect(hscx, `HeadShave should be the far-right mouse, cx=${hscx}`).toBeGreaterThan(0.70)
 })
 
-function lastEvaluateResult(dumpDir: string): {
+function lastEvaluateResult(dumpDir: string, frameIdx?: number): {
+  frame_idx?: number
   masked_object_count?: number
   incomplete?: boolean
   objects?: Array<{ object_id?: string; bbox_xywh_norm?: number[]; ok?: boolean; reason?: string }>
@@ -288,7 +290,10 @@ function lastEvaluateResult(dumpDir: string): {
   for (let i = events.length - 1; i >= 0; i--) {
     const ev = events[i]
     if (ev?.event === 'tool_result' && ev?.data?.name === 'evaluate_segmentation') {
-      return (ev.data.result || null) as ReturnType<typeof lastEvaluateResult>
+      const result = (ev.data.result || null) as ReturnType<typeof lastEvaluateResult>
+      if (frameIdx == null || Number(result?.frame_idx) === frameIdx) {
+        return result
+      }
     }
   }
   return null

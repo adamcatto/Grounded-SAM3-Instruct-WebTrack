@@ -137,7 +137,7 @@ export function promptsUnchanged(
 }
 
 export async function waitForBackend(): Promise<void> {
-  for (let i = 0; i < 60; i++) {
+  for (let i = 0; i < 90; i++) {
     try {
       const h = await apiJson<{ sam_loaded?: boolean }>('/health')
       if (h.sam_loaded) return
