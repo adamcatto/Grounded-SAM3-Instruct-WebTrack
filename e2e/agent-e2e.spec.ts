@@ -92,7 +92,7 @@ test.beforeAll(async () => {
   expect(ids.noshave, 'NoShave object missing after reset').toBeTruthy()
   objHead = ids.headshave as string
   objNo = ids.noshave as string
-  const prompts = await getPointPrompts()
+  const prompts = await getPointPrompts(SANDBOX.pid)
   expect(prompts, 'point prompts should be empty after reset').toEqual({})
   const masks = await getSavedMasks(SANDBOX.pid, SANDBOX.vid, SANDBOX.anchorFrame)
   expect(masks.hasMasks, 'saved masks should be empty after reset').toBeFalsy()

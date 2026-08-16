@@ -48,7 +48,7 @@ export async function getSavedMasks(pid: string, vid: string, frame: number): Pr
   return { masks, hasMasks: Object.keys(masks).length > 0 }
 }
 
-export async function getPointPrompts(pid: string): Promise<Record<string, Record<string, PromptSnapshot>>> {
+export async function getPointPrompts(pid: string = SANDBOX.pid): Promise<Record<string, Record<string, PromptSnapshot>>> {
   const proj = await apiJson<{ videos: Record<string, { point_prompts?: Record<string, Record<string, PromptSnapshot>> }> }>(
     `/projects/${pid}`,
   )
