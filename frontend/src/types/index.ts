@@ -187,3 +187,24 @@ export interface PropagationEvent {
   // extract_progress event fields
   extracted?: number
 }
+
+export interface AgentHistoryTurn {
+  role: 'user' | 'assistant'
+  content: string
+}
+
+export type AgentUiAction =
+  | { action: 'select_video'; video_id: string }
+  | { action: 'goto_frame'; video_id: string; frame_idx: number }
+  | { action: 'refresh_project' }
+  | { action: 'set_masks'; video_id: string; frame_idx: number; masks: MaskData }
+  | { action: 'select_object'; object_id: string; video_id?: string }
+  | { action: 'set_points'; video_id: string; object_id: string; frame_idx: number; points: [number, number][]; labels: number[] }
+  | { action: 'start_propagation'; video_id: string; start_frame?: number; end_frame?: number; use_all_anchors?: boolean }
+  | { action: 'set_anchor_phase'; video_id?: string; frames: number[]; current_index: number; committed_frame?: number }
+  | { action: string; [key: string]: unknown }
+
+export interface AgentChatEvent {
+  event: string
+  data: Record<string, unknown>
+}

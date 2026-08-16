@@ -111,6 +111,24 @@ interface AppState {
   /** User edited a predicted anchor and must commit with Done, next */
   anchorRemainderAwaitingCommit: boolean
 
+  // Agent chat pane
+  agentPaneOpen: boolean
+  setAgentPaneOpen: (v: boolean) => void
+  agentPropagationNonce: number
+  agentPropagationRequest: {
+    video_id?: string
+    start_frame?: number
+    end_frame?: number
+    use_all_anchors?: boolean
+  } | null
+  requestAgentPropagation: (req: {
+    video_id?: string
+    start_frame?: number
+    end_frame?: number
+    use_all_anchors?: boolean
+  }) => void
+  clearAgentPropagationRequest: () => void
+
   // UI
   viewerTab: ViewerTab
   drawerOpen: boolean
@@ -217,6 +235,16 @@ export const useStore = create<AppState>((set, get) => ({
   sessionInitialized: false,
   frameJump: 1,
   setFrameJump: (n: number) => set({ frameJump: Math.max(1, Math.round(n)) }),
+
+  agentPaneOpen: false,
+  setAgentPaneOpen: v => set({ agentPaneOpen: v }),
+  agentPropagationNonce: 0,
+  agentPropagationRequest: null,
+  requestAgentPropagation: req => set(s => ({
+    agentPropagationRequest: req,
+    agentPropagationNonce: s.agentPropagationNonce + 1,
+  })),
+  clearAgentPropagationRequest: () => set({ agentPropagationRequest: null }),
 
   // Anchor phase state
   anchorPhase: false,

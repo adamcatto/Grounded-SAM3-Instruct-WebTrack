@@ -4420,3 +4420,100 @@ async def resume_from_frame(pid: str, vid: str, req: ResumeFromFrameRequest):
         "deleted_files": deleted_count,
         "kept_propagated_frames": kept_count,
     }
+
+
+# ─── Agentic text prompting ───────────────────────────────────────────────────
+
+class TextSegmentRequest(BaseModel):
+    frame_idx: int
+    text: str
+    object_id: Optional[str] = None
+    object_name: Optional[str] = None
+    min_score: float = 0.0
+
+
+class AgentHistoryTurn(BaseModel):
+    role: str
+    content: str
+
+
+class AgentRunRequest(BaseModel):
+    message: str
+    video_id: Optional[str] = None
+    frame_idx: int = 0
+    history: list[AgentHistoryTurn] = []
+
+
+@app.get("/api/agent/status")
+def agent_status():
+    from agent import get_agent_run_state, llm_status_dict
+    st = llm_status_dict()
+    return st
+
+
+@app.get("/api/projects/{pid}/agent/status")
+def project_agent_status(pid: str):
+    from agent import get_agent_run_state, llm_status_dict
+    if pm.get_project(pid) is None:
+        raise HTTPException(404, "Project not found")
+    run = get_agent_run_state(pid)
+    return {
+        **llm_status_dict(),
+        "running": run.is_running,
+        "run_id": run.run_id,
+    }
+
+
+@app.post("/api/projects/{pid}/agent/cancel")
+def project_agent_cancel(pid: str):
+    from agent import cancel_agent_run
+    if pm.get_project(pid) is None:
+        raise HTTPException(404, "Project not found")
+    cancelled = cancel_agent_run(pid)
+    return {"status": "ok", "cancelled": cancelled}
+
+
+@app.post("/api/projects/{pid}/videos/{vid}/text_segment")
+def text_segment(pid: str, vid: str, req: TextSegmentRequest):
+    """SAM3 text/grounding segmentation on one frame, bound to an object id."""
+    from agent import AgentSession, _text_segment_impl
+    video = pm.get_video(pid, vid)
+    if video is None:
+        raise HTTPException(404, "Video not found")
+    session = AgentSession(pid=pid, video_id=vid, frame_idx=req.frame_idx)
+    try:
+        result = _text_segment_impl(
+            session, vid, req.frame_idx, req.text,
+            object_id=req.object_id,
+            object_name=req.object_name,
+            min_score=req.min_score,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        logger.exception("text_segment failed")
+        raise HTTPException(500, str(e))
+    result["ui"] = list(session.ui_events)
+    return result
+
+
+@app.post("/api/projects/{pid}/agent/run")
+async def agent_run(pid: str, req: AgentRunRequest):
+    """Run the annotation agent; stream reasoning + tool traces as SSE."""
+    from agent import run_agent_sse
+    if pm.get_project(pid) is None:
+        raise HTTPException(404, "Project not found")
+    if not (req.message or "").strip():
+        raise HTTPException(400, "message is required")
+
+    async def event_gen():
+        async for item in run_agent_sse(
+            pid,
+            req.video_id,
+            req.frame_idx,
+            req.message.strip(),
+            [t.model_dump() for t in req.history],
+        ):
+            yield item
+
+    return EventSourceResponse(event_gen())

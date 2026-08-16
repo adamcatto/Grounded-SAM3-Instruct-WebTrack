@@ -107,3 +107,11 @@ lsf_parallel_tracking:
   # Additional environment variables for the submitted job (merged into os.environ)
   environment: {}
   # SAM3_BACKEND_URL: "http://inference-host:8000"
+
+# Local vision LLM for the Agent chat pane (same idea as SAM 3 Agent + vLLM).
+# The backend auto-detects a running server; these are the defaults it probes.
+agent_llm:
+  provider: auto          # auto | ollama | vllm | openai | anthropic
+  # Ollama:  http://127.0.0.1:11434/v1   (ollama pull qwen2.5vl && ollama serve)
+  # vLLM:    http://127.0.0.1:8001/v1    (vllm serve Qwen/Qwen3-VL-8B-Thinking --port 8001 --allowed-local-media-path /)
+  # Cloud keys are optional. Local servers use API key DUMMY_API_KEY.

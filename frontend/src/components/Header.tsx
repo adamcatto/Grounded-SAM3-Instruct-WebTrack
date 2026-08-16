@@ -1,9 +1,9 @@
 import React from 'react'
-import { Menu, Info, Database } from 'lucide-react'
+import { Menu, Info, Database, Bot } from 'lucide-react'
 import { useStore } from '../store/useStore'
 
 export default function Header() {
-  const { project, setDrawerOpen, drawerOpen } = useStore()
+  const { project, setDrawerOpen, drawerOpen, agentPaneOpen, setAgentPaneOpen } = useStore()
 
   return (
     <header className="flex items-center h-12 px-4 border-b border-[#2a2a2a] bg-[#111111] flex-shrink-0">
@@ -31,6 +31,19 @@ export default function Header() {
 
       {/* Nav links */}
       <nav className="flex items-center gap-1 text-sm text-[#999]">
+        <button
+          type="button"
+          onClick={() => setAgentPaneOpen(!agentPaneOpen)}
+          className={`flex items-center gap-1 px-2 py-1 rounded transition-colors ${
+            agentPaneOpen
+              ? 'text-violet-300 bg-violet-500/15'
+              : 'hover:text-white hover:bg-[#1a1a1a]'
+          }`}
+          title="Open agent chat"
+        >
+          <Bot size={14} />
+          <span>Agent</span>
+        </button>
         <a
           href={project?.tracking_mode === 'pose_tracking'
             ? 'https://github.com/facebookresearch/co-tracker'

@@ -1,7 +1,7 @@
 import React from 'react'
 import { Save } from 'lucide-react'
 import { useStore, currentVideo as selectCurrentVideo } from '../store/useStore'
-import { checkHealth, updateVideoMeta, downsampleVideo } from '../api/client'
+import { checkHealth, updateVideoMeta, downsampleVideo, getAgentStatus, type AgentLlmStatus } from '../api/client'
 import type { DownsampleOptions } from '../api/client'
 import { useEffect, useState } from 'react'
 import NumericDraftInput from './NumericDraftInput'
@@ -160,6 +160,7 @@ export default function ConfigPanel() {
   const vid = currentVideoId ?? ''
 
   const [modelInfo, setModelInfo] = useState<{ model: string; sam_ready: boolean } | null>(null)
+  const [agentInfo, setAgentInfo] = useState<AgentLlmStatus | null>(null)
   const [dsMode, setDsMode] = useState<'max_dim' | 'factor'>('max_dim')
   const [dsMaxDim, setDsMaxDim] = useState(1080)
   const [dsFactor, setDsFactor] = useState(2)
@@ -174,6 +175,7 @@ export default function ConfigPanel() {
 
   useEffect(() => {
     checkHealth().then(h => setModelInfo({ model: h.sam_model, sam_ready: h.sam_ready })).catch(() => {})
+    getAgentStatus().then(setAgentInfo).catch(() => {})
   }, [])
 
   useEffect(() => {
@@ -511,6 +513,29 @@ export default function ConfigPanel() {
             value={config.autoInferAnchorRemainder}
             onChange={v => setConfig({ autoInferAnchorRemainder: v })}
           />
+        </Section>
+
+        <Section title="Agent">
+          <div className="py-3">
+            <p className="text-sm text-[#ddd] font-medium">LLM backend</p>
+            <p className="text-xs text-[#666] mt-0.5 leading-relaxed">
+              Same pattern as SAM 3 Agent: a vision model served locally over an OpenAI-compatible
+              API. The backend auto-detects <span className="font-mono text-[#888]">Ollama</span> on
+              :11434 or <span className="font-mono text-[#888]">vLLM</span> on :8001 (dummy API key).
+              Optional env: <span className="font-mono text-[#888]">AGENT_LLM_PROVIDER</span>
+              (ollama|vllm), <span className="font-mono text-[#888]">AGENT_LLM_MODEL</span>,{' '}
+              <span className="font-mono text-[#888]">AGENT_LLM_BASE_URL</span>. Cloud keys are a
+              fallback, not required.
+            </p>
+            <p className="text-xs mt-2 text-[#999] whitespace-pre-wrap">
+              {agentInfo == null
+                ? 'Checking…'
+                : agentInfo.configured
+                  ? `Ready · ${agentInfo.local ? 'local' : 'cloud'} · ${agentInfo.provider} · ${agentInfo.model}`
+                    + (agentInfo.base_url ? `\n${agentInfo.base_url}` : '')
+                  : agentInfo.missing_reason}
+            </p>
+          </div>
         </Section>
 
         {/* Single-frame prediction */}
