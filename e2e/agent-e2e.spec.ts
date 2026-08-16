@@ -43,12 +43,20 @@ async function screenshot(page: Page, name: string) {
 }
 
 async function openSandbox(page: Page) {
-  await page.goto('/')
-  await page.getByText('SAM3 Web Tracker').first().waitFor({ timeout: 180_000 })
+  const jump = page.getByTitle('Jump to frame')
+  const onProject = page.locator('header').getByText(SANDBOX.projectName)
+  if (await onProject.isVisible().catch(() => false) && await jump.isVisible().catch(() => false)) {
+    return
+  }
   await page.getByTitle('Switch video / project').click()
   await page.getByRole('button', { name: SANDBOX.projectName }).click()
-  await page.locator('button.flex-1').filter({ hasText: SANDBOX.videoName }).first().click()
-  await page.getByTitle('Switch video / project').click()
+  const vid = page.getByText(SANDBOX.videoName, { exact: true }).first()
+  await vid.waitFor({ timeout: 20_000 })
+  await vid.click({ force: true, timeout: 10_000 })
+  await page.getByText('Projects', { exact: true }).locator('xpath=..').getByRole('button').click().catch(async () => {
+    await page.getByTitle('Switch video / project').click()
+  })
+  await jump.waitFor({ timeout: 30_000 })
 }
 
 async function jumpToFrame(page: Page, frame: number) {
@@ -83,8 +91,11 @@ test.afterAll(async () => {
 
 test('agent inspect + segment two mice from the UI', async ({ page }) => {
   await page.setViewportSize({ width: 1600, height: 960 })
-  await openSandbox(page)
+  await page.goto('/')
+  await page.getByText('SAM3 Web Tracker').first().waitFor({ timeout: 180_000 })
   await screenshot(page, '01-app-loaded')
+
+  await openSandbox(page)
 
   await jumpToFrame(page, SANDBOX.anchorFrame)
   await expect(page.getByText(SANDBOX.projectName).first()).toBeVisible()
