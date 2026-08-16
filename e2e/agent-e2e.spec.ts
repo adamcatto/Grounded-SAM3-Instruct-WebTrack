@@ -20,13 +20,12 @@ const SHOTS = join(REPORT, 'screenshots')
 const ARTIFACTS = '/opt/cursor/artifacts/screenshots'
 
 const PROMPT = [
-  'This home-cage frame has exactly two mice: one shaved (HeadShave, object 1) and one unshaved (NoShave, object 2). Inspect first.',
-  'Do not click the circular water-bottle port (~0.85, 0.42) or empty bedding (x=0.50–0.70) — those make SAM fill the whole cage.',
-  'Reuse the existing objects. Call add_point_prompt twice:',
-  '1) object_id="2" points=[[0.32,0.50],[0.78,0.50]] labels=[1,0]  // + left mouse torso, − right mouse',
-  '2) object_id="1" points=[[0.78,0.50],[0.32,0.50]] labels=[1,0]  // + right mouse torso, − left mouse',
-  'The right mouse torso is at about (0.78, 0.50), not (0.80, 0.42).',
-  'Then evaluate_segmentation. Do not finish until both objects have compact masks on opposite sides of the cage. Do not start propagation.',
+  'This home-cage frame has exactly two mice: shaved HeadShave (object 1) on the far right, unshaved NoShave (object 2) on the left.',
+  'Inspect first, then add_point_prompt once per object (reuse ids, do not create objects):',
+  '1) object_id="2" points=[[0.32,0.50]] labels=[1]',
+  '2) object_id="1" points=[[0.78,0.50]] labels=[1]',
+  'Click the mouse bodies only. Do not click the circular water-bottle port or empty bedding (x=0.50–0.70).',
+  'evaluate_segmentation. Do not finish until both objects have compact masks on opposite sides. Do not start propagation.',
 ].join(' ')
 
 let baseline: ProjectSnapshot
