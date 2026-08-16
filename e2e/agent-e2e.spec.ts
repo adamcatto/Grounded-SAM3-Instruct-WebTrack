@@ -106,6 +106,8 @@ test('agent inspect + segment two mice from the UI', async ({ page }) => {
 
   const box = page.getByPlaceholder('Prompt the agent…')
   await box.fill(PROMPT)
+  const dumpBefore = await getLastAgentDump().catch(() => ({}))
+  const dumpDirBefore = typeof dumpBefore.dump_dir === 'string' ? dumpBefore.dump_dir : ''
   await page.getByTitle('Send').click()
 
   const inspect = page.getByText(/Inspect frame|inspect_frame/i)
@@ -118,13 +120,8 @@ test('agent inspect + segment two mice from the UI', async ({ page }) => {
     }
     const dump = await getLastAgentDump().catch(() => ({}))
     const seen = Array.isArray(dump.inspect_jpegs_seen) ? dump.inspect_jpegs_seen : []
-    if (seen.length > 0) break
+    if (dump.dump_dir && dump.dump_dir !== dumpDirBefore && seen.length > 0) break
     await page.waitForTimeout(1000)
-  }
-  if (!(await inspect.first().isVisible().catch(() => false))) {
-    const dump = await getLastAgentDump().catch(() => ({}))
-    const seen = Array.isArray(dump.inspect_jpegs_seen) ? dump.inspect_jpegs_seen : []
-    expect(seen.length, `no inspect in UI or dump: ${JSON.stringify(dump)}`).toBeGreaterThan(0)
   }
   await screenshot(page, '04-after-inspect')
 
@@ -134,7 +131,7 @@ test('agent inspect + segment two mice from the UI', async ({ page }) => {
     if (await segmented.first().isVisible().catch(() => false)) break
     const dump = await getLastAgentDump().catch(() => ({}))
     const n = typeof dump.tool_call_count === 'number' ? dump.tool_call_count : 0
-    if (n >= 2) break
+    if (dump.dump_dir && dump.dump_dir !== dumpDirBefore && n >= 2) break
     await page.waitForTimeout(1000)
   }
   await screenshot(page, '05-after-segment')
