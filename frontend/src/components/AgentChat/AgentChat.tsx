@@ -22,7 +22,7 @@ interface TraceItem {
 }
 
 const EXAMPLES = [
-  'There are two mice in this video, one with a shaved spot on its back and one without. On this frame, segment each as BackShave and NoShave.',
+  'There are exactly two mice in this frame: one with a shaved patch (HeadShave) and one without (NoShave). Inspect, then segment BOTH — left mouse = NoShave, right mouse near the water port = HeadShave. Do not finish until each has its own mask.',
   'Every 1000th frame, segment each mouse with those names. If a frame is unclear, try about 20 frames away.',
   'Plan anchors for the current video, inspect the first one, and tell me what you see before segmenting.',
 ]

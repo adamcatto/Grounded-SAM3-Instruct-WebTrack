@@ -9,6 +9,7 @@ import {
   deleteSandboxObject,
   getAgentLlmStatus,
   getLastAgentDump,
+  getSavedMasks,
   waitForBackend,
   type ProjectSnapshot,
 } from './helpers/maskOps'
@@ -18,10 +19,16 @@ const REPORT = join(REPO, 'reports', 'agent-e2e-a100-shared')
 const SHOTS = join(REPORT, 'screenshots')
 const ARTIFACTS = '/opt/cursor/artifacts/screenshots'
 
-const PROMPT =
-  'Inspect the current frame. If two mice are present, segment each of them. ' +
-  'Reuse existing objects when the names already match; otherwise create objects. ' +
-  'Do not start propagation.'
+const PROMPT = [
+  'There are exactly two mice in this frame — one with a shaved/clipped patch and one without.',
+  'Inspect this frame first so you can see both animals.',
+  'Then segment BOTH of them (every mouse must get its own mask):',
+  '- NoShave (existing object 2): the unshaved mouse on the LEFT / center of the cage.',
+  '- HeadShave (existing object 1): the mouse with the shaved patch on the RIGHT, near the water bottle port.',
+  'Use text_segment with those visual descriptions, then evaluate_segmentation.',
+  'If a mask is missing, empty, on the wrong mouse, or covering bedding: inspect_frame again and add_point_prompt with one positive point on that mouse\'s back/chest from the JPEG and a negative point on the other mouse.',
+  'Do not copy one object\'s points onto the other. Do not finish until both HeadShave and NoShave have a compact mask on this frame. Do not start propagation.',
+].join(' ')
 
 let baseline: ProjectSnapshot
 let objectIdsBefore: string[] = []
@@ -56,6 +63,13 @@ async function openSandbox(page: Page) {
   await vidBtn.waitFor({ state: 'attached', timeout: 20_000 })
   await vidBtn.evaluate((el: HTMLElement) => el.click())
   await jump.waitFor({ timeout: 30_000 })
+}
+
+async function scrollAgentPane(page: Page) {
+  const scroller = page.locator('div.h-full.flex.flex-col').filter({ has: page.getByText('Prompt the agent…') }).locator('.overflow-y-auto').first()
+  if (await scroller.count()) {
+    await scroller.evaluate((el: HTMLElement) => { el.scrollTop = el.scrollHeight })
+  }
 }
 
 async function jumpToFrame(page: Page, frame: number) {
@@ -123,6 +137,7 @@ test('agent inspect + segment two mice from the UI', async ({ page }) => {
     if (dump.dump_dir && dump.dump_dir !== dumpDirBefore && seen.length > 0) break
     await page.waitForTimeout(1000)
   }
+  await scrollAgentPane(page)
   await screenshot(page, '04-after-inspect')
 
   const segmented = page.getByText(/Text segment|Point prompt|Create object|Evaluate masks/i)
@@ -134,9 +149,11 @@ test('agent inspect + segment two mice from the UI', async ({ page }) => {
     if (dump.dump_dir && dump.dump_dir !== dumpDirBefore && n >= 2) break
     await page.waitForTimeout(1000)
   }
+  await scrollAgentPane(page)
   await screenshot(page, '05-after-segment')
 
   await expect(page.getByTitle('Send')).toBeVisible({ timeout: 360_000 })
+  await scrollAgentPane(page)
   await screenshot(page, '06-final')
 
   const dump = await getLastAgentDump()
@@ -187,6 +204,9 @@ test('agent inspect + segment two mice from the UI', async ({ page }) => {
   writeFileSync(join(REPORT, 'README.md'), report)
 
   expect(dumpDir, 'agent context dump_dir missing').toBeTruthy()
+  const masks = await getSavedMasks(SANDBOX.pid, SANDBOX.vid, SANDBOX.anchorFrame)
+  expect(masks.masks[SANDBOX.objA], 'HeadShave mask missing after agent run').toBeTruthy()
+  expect(masks.masks[SANDBOX.objB], 'NoShave mask missing after agent run').toBeTruthy()
 })
 
 function relativeToReport(abs: string) {
