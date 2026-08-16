@@ -4522,4 +4522,8 @@ async def agent_run(pid: str, req: AgentRunRequest):
         ):
             yield item
 
-    return EventSourceResponse(event_gen())
+    return EventSourceResponse(
+        event_gen(),
+        ping=15,
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )

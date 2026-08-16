@@ -662,7 +662,7 @@ export async function startAgentRun(
   onEvent: (event: string, data: Record<string, unknown>) => void,
   signal?: AbortSignal,
 ): Promise<void> {
-  const res = await fetch(`/api/projects/${pid}/agent/run`, {
+  const res = await fetch(`${BACKEND}/api/projects/${pid}/agent/run`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
     body: JSON.stringify(body),

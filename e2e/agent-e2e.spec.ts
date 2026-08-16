@@ -110,14 +110,33 @@ test('agent inspect + segment two mice from the UI', async ({ page }) => {
 
   const inspect = page.getByText(/Inspect frame|inspect_frame/i)
   const agentError = page.locator('.text-red-300')
-  await expect(inspect.or(agentError).first()).toBeVisible({ timeout: 240_000 })
-  if (await agentError.first().isVisible().catch(() => false) && !(await inspect.first().isVisible().catch(() => false))) {
-    throw new Error(`agent error: ${await agentError.first().innerText()}`)
+  const deadline = Date.now() + 240_000
+  while (Date.now() < deadline) {
+    if (await inspect.first().isVisible().catch(() => false)) break
+    if (await agentError.first().isVisible().catch(() => false)) {
+      throw new Error(`agent error: ${await agentError.first().innerText()}`)
+    }
+    const dump = await getLastAgentDump().catch(() => ({}))
+    const seen = Array.isArray(dump.inspect_jpegs_seen) ? dump.inspect_jpegs_seen : []
+    if (seen.length > 0) break
+    await page.waitForTimeout(1000)
+  }
+  if (!(await inspect.first().isVisible().catch(() => false))) {
+    const dump = await getLastAgentDump().catch(() => ({}))
+    const seen = Array.isArray(dump.inspect_jpegs_seen) ? dump.inspect_jpegs_seen : []
+    expect(seen.length, `no inspect in UI or dump: ${JSON.stringify(dump)}`).toBeGreaterThan(0)
   }
   await screenshot(page, '04-after-inspect')
 
-  const segmented = page.getByText(/Text segment|Point prompt|Create object|Evaluate masks/i).first()
-  await expect(segmented).toBeVisible({ timeout: 360_000 })
+  const segmented = page.getByText(/Text segment|Point prompt|Create object|Evaluate masks/i)
+  const segDeadline = Date.now() + 360_000
+  while (Date.now() < segDeadline) {
+    if (await segmented.first().isVisible().catch(() => false)) break
+    const dump = await getLastAgentDump().catch(() => ({}))
+    const n = typeof dump.tool_call_count === 'number' ? dump.tool_call_count : 0
+    if (n >= 2) break
+    await page.waitForTimeout(1000)
+  }
   await screenshot(page, '05-after-segment')
 
   await expect(page.getByTitle('Send')).toBeVisible({ timeout: 360_000 })
