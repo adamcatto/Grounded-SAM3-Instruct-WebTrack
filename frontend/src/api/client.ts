@@ -598,3 +598,102 @@ export const continueAnchorRemainderReview = (pid: string, vid: string) =>
 
 export const startExportSSE = (pid: string, vid: string) =>
   new EventSource(`/api/projects/${pid}/videos/${vid}/export`)
+
+// ─── Agentic prompting ───────────────────────────────────────────────────────
+
+export interface AgentLlmStatus {
+  configured: boolean
+  provider: string
+  model: string
+  base_url: string | null
+  missing_reason: string
+  running?: boolean
+  run_id?: string | null
+}
+
+export const getAgentStatus = (pid?: string) =>
+  api.get<AgentLlmStatus>(pid ? `/projects/${pid}/agent/status` : '/agent/status').then(r => r.data)
+
+export const cancelAgentRun = (pid: string) =>
+  api.post<{ status: string; cancelled: boolean }>(`/projects/${pid}/agent/cancel`).then(r => r.data)
+
+export interface AgentRunBody {
+  message: string
+  video_id?: string | null
+  frame_idx?: number
+  history?: { role: string; content: string }[]
+}
+
+export const textSegment = (
+  pid: string,
+  vid: string,
+  frameIdx: number,
+  text: string,
+  opts?: { objectId?: string; objectName?: string; minScore?: number },
+) =>
+  api.post(`/projects/${pid}/videos/${vid}/text_segment`, {
+    frame_idx: frameIdx,
+    text,
+    object_id: opts?.objectId,
+    object_name: opts?.objectName,
+    min_score: opts?.minScore ?? 0,
+  }).then(r => r.data)
+
+function parseSseChunk(chunk: string): { event: string; data: string } | null {
+  let event = 'message'
+  const dataLines: string[] = []
+  for (const line of chunk.split('\n')) {
+    if (line.startsWith('event:')) event = line.slice(6).trim()
+    else if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart())
+  }
+  if (dataLines.length === 0) return null
+  return { event, data: dataLines.join('\n') }
+}
+
+export async function startAgentRun(
+  pid: string,
+  body: AgentRunBody,
+  onEvent: (event: string, data: Record<string, unknown>) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const res = await fetch(`/api/projects/${pid}/agent/run`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+    body: JSON.stringify(body),
+    signal,
+  })
+  if (!res.ok) {
+    let detail = `Agent request failed (${res.status})`
+    try {
+      const j = await res.json()
+      if (j?.detail) detail = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail)
+    } catch { /* ignore */ }
+    throw new Error(detail)
+  }
+  if (!res.body) throw new Error('No response body from agent')
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buf = ''
+  while (true) {
+    const { value, done } = await reader.read()
+    if (done) break
+    buf += decoder.decode(value, { stream: true })
+    const parts = buf.split('\n\n')
+    buf = parts.pop() ?? ''
+    for (const chunk of parts) {
+      const parsed = parseSseChunk(chunk)
+      if (!parsed) continue
+      let data: Record<string, unknown> = {}
+      try { data = JSON.parse(parsed.data) as Record<string, unknown> } catch { data = { raw: parsed.data } }
+      onEvent(parsed.event, data)
+    }
+  }
+  if (buf.trim()) {
+    const parsed = parseSseChunk(buf)
+    if (parsed) {
+      let data: Record<string, unknown> = {}
+      try { data = JSON.parse(parsed.data) as Record<string, unknown> } catch { data = { raw: parsed.data } }
+      onEvent(parsed.event, data)
+    }
+  }
+}

@@ -3,6 +3,7 @@ import { useStore, currentVideo as selectCurrentVideo } from './store/useStore'
 import type { ViewerTab } from './store/useStore'
 import { listProjects } from './api/client'
 import { Crosshair, PlayCircle, BrainCircuit, Settings2 } from 'lucide-react'
+import AgentChat from './components/AgentChat/AgentChat'
 import Header from './components/Header'
 import ProjectDrawer from './components/ProjectDrawer'
 import UploadModal from './components/UploadModal'
@@ -50,7 +51,7 @@ export default function App() {
   const video = selectCurrentVideo(store)
   const {
     project, currentVideoId, viewerTab,
-    registrationMode,
+    registrationMode, agentPaneOpen,
     setProject, setCurrentVideo, setUploadModalOpen, setDrawerOpen, setViewerTab,
     configDirty, revertConfig,
   } = store
@@ -69,6 +70,7 @@ export default function App() {
 
   // ── Resizable panels ──────────────────────────────────────────────────────
   const [leftWidth, leftHandleMouseDown] = useResizable(256, { min: 180, max: 450 })
+  const [agentWidth, agentHandleMouseDown] = useResizable(380, { min: 280, max: 560 })
   const [timelineHeight, timelineHandleMouseDown] = useResizable(130, {
     min: 70,
     max: 280,
@@ -178,6 +180,18 @@ export default function App() {
             </div>
           )}
         </div>
+
+        {agentPaneOpen && (
+          <>
+            <ResizeHandle direction="horizontal" onMouseDown={agentHandleMouseDown} />
+            <div
+              className="flex-shrink-0 overflow-hidden bg-[#111111]"
+              style={{ width: agentWidth }}
+            >
+              <AgentChat />
+            </div>
+          </>
+        )}
       </div>
 
       {/* Overlays */}

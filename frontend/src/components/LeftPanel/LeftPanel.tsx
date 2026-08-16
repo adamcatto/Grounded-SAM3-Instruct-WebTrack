@@ -787,6 +787,35 @@ export default function LeftPanel() {
     _connectSSE(0, undefined, -1, useAllAnchors)
   }
 
+  const agentPropagationNonce = useStore(s => s.agentPropagationNonce)
+  useEffect(() => {
+    if (!agentPropagationNonce) return
+    const req = useStore.getState().agentPropagationRequest
+    if (!req) return
+    useStore.getState().clearAgentPropagationRequest()
+    if (req.video_id && req.video_id !== vid) return
+    if (!hasObjects) return
+    const useAll = req.use_all_anchors ?? config.useAllAnchors
+    if (req.end_frame != null && req.end_frame >= 0) {
+      const from = req.start_frame ?? 0
+      const to = req.end_frame
+      setTrackingError('')
+      setTrackingRetryMsg('')
+      resetAnchorState()
+      setPropagationStatus('running')
+      setExtractingPhase(false)
+      setTrackFrame(from)
+      setExtractedFrameCount(from)
+      setTotalFramesToProcess(to - from + 1)
+      setActualStartFrame(from)
+      totalBatchesRef.current = Math.max(1, Math.ceil((to - from + 1) / 1000))
+      _connectSSE(0, from, to, useAll)
+    } else {
+      _doStartTracking(useAll)
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentPropagationNonce])
+
   async function handlePredictFrame() {
     if (!pid || !vid || !hasObjects || predicting) return
     setPredicting(true)

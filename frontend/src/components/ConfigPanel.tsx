@@ -1,7 +1,7 @@
 import React from 'react'
 import { Save } from 'lucide-react'
 import { useStore, currentVideo as selectCurrentVideo } from '../store/useStore'
-import { checkHealth, updateVideoMeta, downsampleVideo } from '../api/client'
+import { checkHealth, updateVideoMeta, downsampleVideo, getAgentStatus, type AgentLlmStatus } from '../api/client'
 import type { DownsampleOptions } from '../api/client'
 import { useEffect, useState } from 'react'
 import NumericDraftInput from './NumericDraftInput'
@@ -160,6 +160,7 @@ export default function ConfigPanel() {
   const vid = currentVideoId ?? ''
 
   const [modelInfo, setModelInfo] = useState<{ model: string; sam_ready: boolean } | null>(null)
+  const [agentInfo, setAgentInfo] = useState<AgentLlmStatus | null>(null)
   const [dsMode, setDsMode] = useState<'max_dim' | 'factor'>('max_dim')
   const [dsMaxDim, setDsMaxDim] = useState(1080)
   const [dsFactor, setDsFactor] = useState(2)
@@ -174,6 +175,7 @@ export default function ConfigPanel() {
 
   useEffect(() => {
     checkHealth().then(h => setModelInfo({ model: h.sam_model, sam_ready: h.sam_ready })).catch(() => {})
+    getAgentStatus().then(setAgentInfo).catch(() => {})
   }, [])
 
   useEffect(() => {
@@ -511,6 +513,28 @@ export default function ConfigPanel() {
             value={config.autoInferAnchorRemainder}
             onChange={v => setConfig({ autoInferAnchorRemainder: v })}
           />
+        </Section>
+
+        <Section title="Agent">
+          <div className="py-3">
+            <p className="text-sm text-[#ddd] font-medium">LLM backend</p>
+            <p className="text-xs text-[#666] mt-0.5 leading-relaxed">
+              The Agent pane uses a vision-capable chat model to inspect frames, run SAM3 text
+              prompts, place point prompts, and start tracking. Configure via environment variables
+              on the backend: <span className="font-mono text-[#888]">AGENT_LLM_API_KEY</span> (or
+              OPENAI_API_KEY / ANTHROPIC_API_KEY), optional{' '}
+              <span className="font-mono text-[#888]">AGENT_LLM_PROVIDER</span>,{' '}
+              <span className="font-mono text-[#888]">AGENT_LLM_MODEL</span>,{' '}
+              <span className="font-mono text-[#888]">AGENT_LLM_BASE_URL</span>.
+            </p>
+            <p className="text-xs mt-2 text-[#999]">
+              {agentInfo == null
+                ? 'Checking…'
+                : agentInfo.configured
+                  ? `Ready · ${agentInfo.provider} · ${agentInfo.model}`
+                  : agentInfo.missing_reason}
+            </p>
+          </div>
         </Section>
 
         {/* Single-frame prediction */}

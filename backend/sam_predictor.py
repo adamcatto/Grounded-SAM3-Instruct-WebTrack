@@ -144,6 +144,44 @@ def _clear_tracker_output(out: dict) -> bool:
     return True
 
 
+def sample_points_from_mask(mask, n_total: int = 25) -> list:
+    """Normalized [x, y] points covering a binary mask (centroid + spatial samples)."""
+    import numpy as np
+    mask_np = np.squeeze(mask)
+    ys, xs = np.where(mask_np > 0)
+    if len(xs) == 0:
+        return []
+    h, w = mask_np.shape[:2]
+    cx = float(xs.mean()) / w
+    cy = float(ys.mean()) / h
+    sample_points = [[cx, cy]]
+    n = len(xs)
+    if n >= 2:
+        orderings = [
+            np.argsort(xs + ys),
+            np.argsort(xs - ys),
+            np.argsort(xs),
+            np.argsort(ys),
+            np.argsort(xs * xs + ys * ys),
+            np.argsort(-(xs * xs + ys * ys)),
+        ]
+        seen: set[tuple[int, int]] = set()
+        per_ord = max(1, (n_total - 1) // len(orderings))
+        for order in orderings:
+            steps = min(per_ord, n)
+            for i in range(steps):
+                idx = order[int(i * n / steps)]
+                key = (int(xs[idx]), int(ys[idx]))
+                if key not in seen:
+                    seen.add(key)
+                    sample_points.append([float(xs[idx]) / w, float(ys[idx]) / h])
+                if len(sample_points) >= n_total:
+                    break
+            if len(sample_points) >= n_total:
+                break
+    return sample_points
+
+
 def _config_obj_id_to_sam(obj_id_str: str) -> int:
     if "_" in obj_id_str:
         parts = obj_id_str.split("_")
@@ -472,45 +510,10 @@ class SAMPredictor:
             # center-of-mass happens to fall on another tracked object (e.g. a mouse
             # sitting in the middle of the blanket).
             mask_np = np.squeeze(mask)
-            ys, xs = np.where(mask_np > 0)
-            if len(xs) == 0:
+            sample_points = sample_points_from_mask(mask_np)
+            if not sample_points:
                 logger.warning(f"Empty mask for obj {obj_id} on frame {frame_idx}, skipping")
                 return {}
-            h, w = mask_np.shape
-            # Always include center-of-mass
-            cx = float(xs.mean()) / w
-            cy = float(ys.mean()) / h
-            sample_points = [[cx, cy]]
-            # Sample up to 24 more points evenly distributed across the mask using
-            # multiple sort orderings (main diagonal, anti-diagonal, horizontal,
-            # vertical) so all spatial quadrants of the object are represented.
-            # 25 total gives SAM strong appearance anchors for large or complex
-            # masks (e.g. a mouse partially occluded by another).
-            N_TOTAL = 25
-            n = len(xs)
-            if n >= 2:
-                orderings = [
-                    np.argsort(xs + ys),      # main diagonal  (bottom-left → top-right)
-                    np.argsort(xs - ys),      # anti-diagonal  (top-left  → bottom-right)
-                    np.argsort(xs),           # left → right
-                    np.argsort(ys),           # top  → bottom
-                    np.argsort(xs * xs + ys * ys),  # inner → outer
-                    np.argsort(-(xs * xs + ys * ys)),  # outer → inner
-                ]
-                seen: set[tuple[int, int]] = set()
-                per_ord = max(1, (N_TOTAL - 1) // len(orderings))
-                for order in orderings:
-                    steps = min(per_ord, n)
-                    for i in range(steps):
-                        idx = order[int(i * n / steps)]
-                        key = (int(xs[idx]), int(ys[idx]))
-                        if key not in seen:
-                            seen.add(key)
-                            sample_points.append([float(xs[idx]) / w, float(ys[idx]) / h])
-                        if len(sample_points) >= N_TOTAL:
-                            break
-                    if len(sample_points) >= N_TOTAL:
-                        break
             logger.debug(
                 f"add_mask_prompt: obj {obj_id} frame {frame_idx} → "
                 f"{len(sample_points)} seed point(s)"
@@ -536,6 +539,154 @@ class SAMPredictor:
                 )
             outputs = resp.get("outputs", {})
             return {frame_idx: outputs}  # key by real frame_idx for callers
+
+    def add_text_prompt(
+        self,
+        pid: str,
+        vid: str,
+        frame_idx: int,
+        text: str,
+    ) -> dict:
+        """
+        SAM3 text / grounding prompt on one frame (detector mode, no points).
+
+        Returns {frame_idx: {out_obj_ids, out_binary_masks, out_boxes_xywh, out_probs}}.
+        SAM2 has no text API — raises ValueError.
+        """
+        with self.lock:
+            return self._add_text_prompt_locked(pid, vid, frame_idx, text)
+
+    def _add_text_prompt_locked(
+        self,
+        pid: str,
+        vid: str,
+        frame_idx: int,
+        text: str,
+    ) -> dict:
+        session_id = self.get_session_id(pid, vid)
+        if session_id is None:
+            raise ValueError(f"No active session for {pid}/{vid}. Call init_session first.")
+        if _model_name == "sam2":
+            raise ValueError("Text prompts require SAM3. The loaded model is SAM2.")
+        if not (text or "").strip():
+            raise ValueError("text prompt is empty")
+
+        import torch
+        predictor = _get_predictor()
+        sam_frame_idx = self._to_sam_idx(pid, vid, frame_idx)
+        state = predictor._ALL_INFERENCE_STATES[session_id]["state"]
+        if sam_frame_idx not in state["cached_frame_outputs"]:
+            state["cached_frame_outputs"][sam_frame_idx] = {}
+
+        req = {
+            "type": "add_prompt",
+            "session_id": session_id,
+            "frame_index": sam_frame_idx,
+            "text": text.strip(),
+        }
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+            resp = predictor.handle_request(req)
+        outputs = resp.get("outputs", {}) if isinstance(resp, dict) else {}
+        if not outputs and isinstance(resp, dict):
+            outputs = resp
+        logger.info(
+            f"add_text_prompt: frame={frame_idx} text={text!r} "
+            f"obj_ids={outputs.get('out_obj_ids', []) if isinstance(outputs, dict) else '?'}"
+        )
+        return {frame_idx: outputs}
+
+    def detect_text_on_image(self, image_path: str, text: str) -> list[dict]:
+        """
+        Image-level SAM3 text detection that does not touch the video tracker session.
+
+        Returns a list of {mask, score, bbox_xywh_norm}.
+        """
+        if _model_name == "sam2":
+            raise ValueError("Text prompts require SAM3. The loaded model is SAM2.")
+        if not (text or "").strip():
+            raise ValueError("text prompt is empty")
+
+        import numpy as np
+        from PIL import Image
+
+        detections: list[dict] = []
+        img = Image.open(image_path).convert("RGB")
+        w, h = img.size
+
+        processor = None
+        try:
+            from sam3.model.sam3_image_processor import Sam3Processor
+            predictor = _get_predictor()
+            # Video predictor may already expose the underlying image model.
+            image_model = getattr(predictor, "model", None) or getattr(predictor, "image_model", None)
+            if image_model is not None:
+                processor = Sam3Processor(image_model)
+        except Exception as e:
+            logger.debug(f"SAM3 image processor via video predictor unavailable: {e}")
+
+        if processor is None:
+            try:
+                from sam3.model_builder import build_sam3_image_model
+                from sam3.model.sam3_image_processor import Sam3Processor
+                image_model = build_sam3_image_model(checkpoint_path=str(SAM3_CHECKPOINT))
+                processor = Sam3Processor(image_model)
+            except Exception as e:
+                raise ValueError(f"SAM3 image text detector is unavailable: {e}") from e
+
+        import torch
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+            state = processor.set_image(img)
+            output = processor.set_text_prompt(state=state, prompt=text.strip())
+
+        masks = output.get("masks") if isinstance(output, dict) else None
+        scores = output.get("scores") if isinstance(output, dict) else None
+        boxes = output.get("boxes") if isinstance(output, dict) else None
+        if masks is None:
+            return []
+
+        if hasattr(masks, "cpu"):
+            masks = masks.cpu().numpy()
+        masks = np.asarray(masks)
+        if masks.ndim == 2:
+            masks = masks[None, ...]
+        n = masks.shape[0]
+        score_list = []
+        if scores is not None:
+            if hasattr(scores, "cpu"):
+                scores = scores.cpu().numpy()
+            score_list = [float(s) for s in np.asarray(scores).reshape(-1)]
+        box_list = []
+        if boxes is not None:
+            if hasattr(boxes, "cpu"):
+                boxes = boxes.cpu().numpy()
+            box_list = np.asarray(boxes).reshape(-1, 4)
+
+        for i in range(n):
+            mask = np.squeeze(masks[i])
+            if mask.ndim != 2:
+                continue
+            binary = (mask > 0.5).astype(np.uint8) if mask.dtype != np.uint8 else (mask > 0).astype(np.uint8)
+            if int(binary.sum()) == 0:
+                continue
+            score = score_list[i] if i < len(score_list) else 0.0
+            if i < len(box_list):
+                x0, y0, x1, y1 = [float(v) for v in box_list[i][:4]]
+                # SAM3 image boxes are typically absolute xyxy
+                if max(x1, y1) <= 1.5:
+                    bbox = [x0, y0, max(0.0, x1 - x0), max(0.0, y1 - y0)]
+                else:
+                    bbox = [x0 / w, y0 / h, max(0.0, x1 - x0) / w, max(0.0, y1 - y0) / h]
+            else:
+                ys, xs = np.where(binary > 0)
+                bbox = [
+                    float(xs.min()) / w,
+                    float(ys.min()) / h,
+                    float(xs.max() - xs.min() + 1) / w,
+                    float(ys.max() - ys.min() + 1) / h,
+                ]
+            detections.append({"mask": binary, "score": score, "bbox_xywh_norm": bbox})
+        detections.sort(key=lambda d: d["score"], reverse=True)
+        return detections
 
     # ── Object management ────────────────────────────────────────────────────
 

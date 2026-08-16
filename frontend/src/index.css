@@ -69,7 +69,7 @@ html, body, #root {
 }
 
 /* Input */
-input[type="text"], input[type="file"] {
+input[type="text"], input[type="file"], textarea {
   @apply bg-[#2a2a2a] border border-[#444] rounded-md px-3 py-2 text-sm text-[#f0f0f0] outline-none;
 }
 input[type="text"]:focus {
