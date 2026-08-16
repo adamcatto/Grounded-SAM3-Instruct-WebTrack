@@ -60,6 +60,35 @@ thinking_on() {
   esac
 }
 
+_ensure_vllm_env() {
+  if command -v vllm >/dev/null 2>&1; then
+    # Conda-built libicu needs the env libstdc++, not the older system one.
+    local bindir
+    bindir="$(dirname "$(command -v vllm)")"
+    local libdir
+    libdir="$(cd "$bindir/../lib" 2>/dev/null && pwd || true)"
+    if [[ -n "$libdir" && -d "$libdir" ]]; then
+      export LD_LIBRARY_PATH="$libdir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    fi
+    return 0
+  fi
+  local cand
+  for cand in \
+    "${VLLM_CONDA_PREFIX:-}" \
+    "${HOME}/miniconda3/envs/vllm" \
+    "${HOME}/mambaforge/envs/vllm" \
+    "/opt/conda/envs/vllm"
+  do
+    [[ -n "$cand" && -x "$cand/bin/vllm" ]] || continue
+    export PATH="$cand/bin:$PATH"
+    export LD_LIBRARY_PATH="$cand/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    echo "Using vLLM from $cand"
+    return 0
+  done
+  echo "vLLM not found on PATH. Activate a vLLM env or set VLLM_CONDA_PREFIX." >&2
+  exit 1
+}
+
 case "$PROFILE" in
   a100)
     VLLM_MODEL="Qwen/Qwen3-VL-32B-Instruct"
@@ -143,6 +172,7 @@ case "$MODE" in
     exec ollama serve
     ;;
   vllm)
+    _ensure_vllm_env
     MODEL="${AGENT_LLM_MODEL:-$VLLM_MODEL}"
     TP="${VLLM_TENSOR_PARALLEL_SIZE:-$TP_DEFAULT}"
     PORT="${VLLM_PORT:-8001}"
@@ -152,6 +182,9 @@ case "$MODE" in
     echo "API key: DUMMY_API_KEY (not used)"
     if [[ "$PROFILE" == "a100" ]]; then
       echo "Note: 32B bf16 needs a dedicated 80GB GPU. Do not share it with SAM3."
+    fi
+    if [[ "$PROFILE" == "a100-shared" ]]; then
+      echo "Note: 8B at gpu_mem=${GPU_UTIL} so SAM3 can stay on the same 80GB card."
     fi
     ARGS=(
       serve "$MODEL"

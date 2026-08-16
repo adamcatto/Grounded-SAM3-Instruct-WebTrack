@@ -18,6 +18,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 import numpy as np
@@ -1718,6 +1719,215 @@ def prune_stale_inspect_images(messages: list[dict], keep: int = KEEP_INSPECT_IM
     return removed
 
 
+_LAST_AGENT_DUMP: dict[str, Any] = {}
+
+
+def get_last_agent_dump() -> dict[str, Any]:
+    return dict(_LAST_AGENT_DUMP)
+
+
+def inspect_jpegs_in_messages(messages: list[dict]) -> list[dict]:
+    """Metadata for inspect JPEGs currently attached to the in-flight transcript."""
+    out: list[dict] = []
+    for mi, m in enumerate(messages):
+        for ii, im in enumerate(m.get("images") or []):
+            out.append({
+                "message_index": mi,
+                "image_index": ii,
+                "role": m.get("role"),
+                "frame_idx": im.get("frame_idx"),
+                "video_id": im.get("video_id"),
+                "has_jpeg": bool(im.get("jpeg_b64")),
+            })
+    return out
+
+
+def default_agent_dump_dir() -> Path:
+    env = (os.environ.get("AGENT_LLM_DUMP_DIR") or "").strip()
+    if env:
+        return Path(env)
+    root = Path(__file__).resolve().parents[1]
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    return root / "reports" / "agent-runs" / stamp
+
+
+def _messages_without_jpegs(messages: list[dict]) -> list[dict]:
+    slim: list[dict] = []
+    for m in messages:
+        item = {k: v for k, v in m.items() if k != "images"}
+        images = m.get("images") or []
+        if images:
+            item["images"] = [
+                {
+                    "frame_idx": im.get("frame_idx"),
+                    "video_id": im.get("video_id"),
+                    "jpeg_chars": len(im.get("jpeg_b64") or ""),
+                }
+                for im in images
+            ]
+        slim.append(item)
+    return slim
+
+
+def write_agent_context_dump(
+    dump_dir: Path,
+    *,
+    system_prompt: str,
+    overview: dict,
+    user_text: str,
+    messages: list[dict],
+    events: list[dict],
+    llm_turns: list[dict],
+    cfg: LLMConfig,
+    inspect_images: list[dict],
+) -> dict:
+    """Write a readable agent-context report (markdown + JSON + inspect JPEGs)."""
+    dump_dir.mkdir(parents=True, exist_ok=True)
+    jpeg_files: list[dict] = []
+    seen: set[tuple] = set()
+    for im in inspect_images:
+        key = (str(im.get("video_id") or ""), im.get("frame_idx"))
+        b64 = im.get("jpeg_b64") or ""
+        if not b64 or key in seen:
+            continue
+        seen.add(key)
+        name = f"inspect_vid-{key[0]}_frame-{im.get('frame_idx')}.jpg"
+        try:
+            (dump_dir / name).write_bytes(base64.b64decode(b64))
+        except Exception:
+            continue
+        jpeg_files.append({
+            "file": name,
+            "frame_idx": im.get("frame_idx"),
+            "video_id": im.get("video_id"),
+        })
+
+    final_in_context = inspect_jpegs_in_messages(messages)
+    in_context_keys = {
+        (str(x.get("video_id") or ""), x.get("frame_idx"))
+        for x in final_in_context
+    }
+    for rec in jpeg_files:
+        rec["in_final_llm_context"] = (
+            str(rec.get("video_id") or ""), rec.get("frame_idx")
+        ) in in_context_keys
+
+    payload = {
+        "llm": {
+            "provider": cfg.provider,
+            "model": cfg.model,
+            "base_url": cfg.base_url,
+            "profile": normalize_llm_profile(),
+            "local": cfg.local,
+        },
+        "user_text": user_text,
+        "system_prompt": system_prompt,
+        "retrieved_project_json": overview,
+        "events": events,
+        "llm_turns": llm_turns,
+        "inspect_jpegs_seen": jpeg_files,
+        "inspect_jpegs_in_final_context": final_in_context,
+        "messages": _messages_without_jpegs(messages),
+        "keep_inspect_images": KEEP_INSPECT_IMAGES,
+        "max_tokens": AGENT_MAX_TOKENS,
+        "dump_dir": str(dump_dir),
+    }
+    (dump_dir / "context.json").write_text(json.dumps(payload, indent=2, default=str))
+
+    lines: list[str] = [
+        "# Agent context dump",
+        "",
+        f"- Provider: `{cfg.provider}`  model: `{cfg.model}`  profile: `{normalize_llm_profile()}`",
+        f"- Base URL: `{cfg.base_url}`",
+        f"- User: {user_text}",
+        f"- KEEP_INSPECT_IMAGES={KEEP_INSPECT_IMAGES}  AGENT_MAX_TOKENS={AGENT_MAX_TOKENS}",
+        "",
+        "## System prompt",
+        "",
+        "```",
+        system_prompt.strip(),
+        "```",
+        "",
+        "## Retrieved project JSON",
+        "",
+        "```json",
+        json.dumps(overview, indent=2, default=str)[:12000],
+        "```",
+        "",
+        "## Inspect JPEGs",
+        "",
+    ]
+    if not jpeg_files:
+        lines.append("_No inspect_frame JPEGs were attached._")
+    else:
+        lines.append("| File | video_id | frame | in final LLM context |")
+        lines.append("|---|---|---|---|")
+        for rec in jpeg_files:
+            lines.append(
+                f"| `{rec['file']}` | `{rec.get('video_id')}` | {rec.get('frame_idx')} | "
+                f"{'yes' if rec.get('in_final_llm_context') else 'no (pruned)'} |"
+            )
+        lines.append("")
+        for rec in jpeg_files:
+            lines.append(f"### {rec['file']}")
+            lines.append("")
+            lines.append(f"![inspect frame {rec.get('frame_idx')}]({rec['file']})")
+            lines.append("")
+
+    lines += [
+        "## LLM turns (which inspect JPEGs were in context)",
+        "",
+    ]
+    for turn in llm_turns:
+        kept = turn.get("inspect_jpegs_in_context") or []
+        desc = ", ".join(
+            f"video `{x.get('video_id')}` frame {x.get('frame_idx')}" for x in kept
+        ) or "none"
+        lines.append(f"- Step {turn.get('step')}: {desc}")
+    lines += ["", "## Tool calls and results", ""]
+    for ev in events:
+        kind = ev.get("event")
+        data = ev.get("data") or {}
+        if kind == "tool_call":
+            lines.append(f"### `{data.get('name')}` (step {data.get('step')})")
+            lines.append("")
+            lines.append("Arguments:")
+            lines.append("")
+            lines.append("```json")
+            lines.append(json.dumps(data.get("arguments") or {}, indent=2, default=str))
+            lines.append("```")
+            lines.append("")
+        elif kind == "tool_result":
+            lines.append(f"Result (`ok={data.get('ok')}`, {data.get('elapsed_ms')} ms):")
+            lines.append("")
+            lines.append("```json")
+            lines.append(json.dumps(data.get("result") or {}, indent=2, default=str)[:8000])
+            lines.append("```")
+            lines.append("")
+        elif kind in ("reasoning", "message", "error"):
+            text = (data.get("text") or data.get("message") or "").strip()
+            if text:
+                lines.append(f"**{kind}:** {text}")
+                lines.append("")
+    (dump_dir / "context.md").write_text("\n".join(lines))
+
+    latest = dump_dir.parent / "latest.json"
+    latest.write_text(json.dumps({"dump_dir": str(dump_dir), "context_md": str(dump_dir / "context.md")}, indent=2))
+
+    summary = {
+        "dump_dir": str(dump_dir),
+        "context_md": str(dump_dir / "context.md"),
+        "context_json": str(dump_dir / "context.json"),
+        "inspect_jpegs_seen": jpeg_files,
+        "inspect_jpegs_in_final_context": final_in_context,
+        "llm": payload["llm"],
+        "tool_call_count": sum(1 for e in events if e.get("event") == "tool_call"),
+    }
+    global _LAST_AGENT_DUMP
+    _LAST_AGENT_DUMP = summary
+    return summary
+
+
 def _tool_result_for_llm(result: dict) -> str:
     slim = dict(result)
     slim.pop("masks", None)
@@ -1767,12 +1977,47 @@ def run_agent_sync(
 
     messages = build_initial_messages(user_text, overview, history)
     pending_images: list[dict] = []
+    recorded_events: list[dict] = [{"event": "status", "data": {
+        "phase": "started",
+        "provider": cfg.provider,
+        "model": cfg.model,
+        "video_id": session.video_id,
+        "frame_idx": session.frame_idx,
+        "project_name": overview.get("project_name"),
+        "video_count": overview.get("video_count"),
+    }}]
+    llm_turns: list[dict] = []
+    inspect_images: list[dict] = []
+
+    def emit_and_record(event: str, payload: dict) -> None:
+        recorded_events.append({"event": event, "data": payload})
+        emit(event, payload)
+
+    def flush_dump() -> None:
+        try:
+            dump_dir = default_agent_dump_dir()
+            summary = write_agent_context_dump(
+                dump_dir,
+                system_prompt=SYSTEM_PROMPT,
+                overview=overview,
+                user_text=user_text,
+                messages=messages,
+                events=recorded_events,
+                llm_turns=llm_turns,
+                cfg=cfg,
+                inspect_images=inspect_images,
+            )
+            emit("context_dump", summary)
+        except Exception:
+            logger.exception("Failed to write agent context dump")
 
     for step in range(MAX_AGENT_STEPS):
         if session.cancel.is_set():
-            emit("error", {"message": "Cancelled"})
+            emit_and_record("error", {"message": "Cancelled"})
+            flush_dump()
             return
         if pending_images:
+            inspect_images.extend(pending_images)
             messages.append({
                 "role": "user",
                 "content": "Visual: JPEG(s) of the inspected frame(s) are attached.",
@@ -1780,24 +2025,30 @@ def run_agent_sync(
             })
             pending_images = []
         prune_stale_inspect_images(messages)
-        emit("status", {"phase": "thinking", "step": step + 1, "max_steps": MAX_AGENT_STEPS})
+        llm_turns.append({
+            "step": step + 1,
+            "inspect_jpegs_in_context": inspect_jpegs_in_messages(messages),
+        })
+        emit_and_record("status", {"phase": "thinking", "step": step + 1, "max_steps": MAX_AGENT_STEPS})
         try:
             llm = call_llm(cfg, messages)
         except Exception as e:
             logger.exception("LLM call failed")
-            emit("error", {"message": f"LLM request failed: {e}"})
+            emit_and_record("error", {"message": f"LLM request failed: {e}"})
+            flush_dump()
             return
         content = (llm.get("content") or "").strip()
         tool_calls = [tc for tc in (llm.get("tool_calls") or []) if tc.get("name")]
         if content:
             kind = "reasoning" if tool_calls else "message"
-            emit(kind, {"text": content, "step": step + 1})
+            emit_and_record(kind, {"text": content, "step": step + 1})
 
         if not tool_calls:
             if content:
-                emit("done", {"text": content, "steps": step + 1})
+                emit_and_record("done", {"text": content, "steps": step + 1})
             else:
-                emit("done", {"text": "Done.", "steps": step + 1})
+                emit_and_record("done", {"text": "Done.", "steps": step + 1})
+            flush_dump()
             return
 
         messages.append({
@@ -1808,27 +2059,28 @@ def run_agent_sync(
 
         for tc in tool_calls:
             if session.cancel.is_set():
-                emit("error", {"message": "Cancelled"})
+                emit_and_record("error", {"message": "Cancelled"})
+                flush_dump()
                 return
             tname = tc["name"]
             targs = tc.get("arguments") or {}
             if not isinstance(targs, dict):
                 targs = {}
-            emit("tool_call", {
+            emit_and_record("tool_call", {
                 "id": tc.get("id"),
                 "name": tname,
                 "arguments": targs,
                 "step": step + 1,
             })
             if tname == "think":
-                emit("reasoning", {"text": targs.get("thought") or "", "step": step + 1})
+                emit_and_record("reasoning", {"text": targs.get("thought") or "", "step": step + 1})
 
             t0 = time.time()
             result, ui_events = execute_tool(tname, targs, session)
             dt = int((time.time() - t0) * 1000)
             for ui in ui_events:
-                emit("ui", ui)
-            emit("tool_result", {
+                emit_and_record("ui", ui)
+            emit_and_record("tool_result", {
                 "id": tc.get("id"),
                 "name": tname,
                 "ok": bool(result.get("ok", True)),
@@ -1846,8 +2098,9 @@ def run_agent_sync(
                 "content": _tool_result_for_llm(result),
             })
 
-    emit("message", {"text": "Stopped after the step limit. Ask me to continue from here if needed."})
-    emit("done", {"text": "Step limit reached.", "steps": MAX_AGENT_STEPS})
+    emit_and_record("message", {"text": "Stopped after the step limit. Ask me to continue from here if needed."})
+    emit_and_record("done", {"text": "Step limit reached.", "steps": MAX_AGENT_STEPS})
+    flush_dump()
 
 
 async def run_agent_sse(

@@ -52,6 +52,14 @@ cd e2e
 
 Or: `bash e2e/run-tests.sh mask-clear.spec.ts` (uses Node 22 npx directly).
 
+Agent UI (needs vLLM on :8001 and SAM loaded):
+
+```
+bash e2e/run-tests.sh agent-e2e.spec.ts
+```
+
+API-only verification (disk + config + session):
+
 API-only verification (disk + config + session):
 
 ```bash

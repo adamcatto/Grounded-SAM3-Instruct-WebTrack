@@ -146,3 +146,31 @@ export async function waitForBackend(): Promise<void> {
   }
   throw new Error('Backend/SAM not ready after 120s')
 }
+
+export async function getSandboxProject(): Promise<{
+  videos: Record<string, { objects?: Record<string, { id?: string; name?: string }> }>
+}> {
+  return apiJson(`/projects/${SANDBOX.pid}`)
+}
+
+export async function listSandboxObjectIds(): Promise<string[]> {
+  const p = await getSandboxProject()
+  return Object.keys(p.videos?.[SANDBOX.vid]?.objects ?? {})
+}
+
+export async function deleteSandboxObject(oid: string): Promise<void> {
+  await apiJson(`/projects/${SANDBOX.pid}/videos/${SANDBOX.vid}/objects/${oid}`, { method: 'DELETE' })
+}
+
+export async function getAgentLlmStatus(): Promise<{
+  configured?: boolean
+  provider?: string
+  model?: string
+  reachable?: boolean
+}> {
+  return apiJson('/agent/status')
+}
+
+export async function getLastAgentDump(): Promise<Record<string, unknown>> {
+  return apiJson('/agent/last_dump')
+}

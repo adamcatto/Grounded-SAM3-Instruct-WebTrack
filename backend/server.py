@@ -4451,6 +4451,12 @@ def agent_status():
     return st
 
 
+@app.get("/api/agent/last_dump")
+def agent_last_dump():
+    from agent import get_last_agent_dump
+    return get_last_agent_dump()
+
+
 @app.get("/api/projects/{pid}/agent/status")
 def project_agent_status(pid: str):
     from agent import get_agent_run_state, llm_status_dict

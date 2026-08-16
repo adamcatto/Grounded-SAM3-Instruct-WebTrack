@@ -1,6 +1,7 @@
 """Unit tests for agentic prompting helpers (no GPU / LLM required)."""
 
 import os
+import base64
 import tempfile
 import unittest
 from pathlib import Path
@@ -266,6 +267,66 @@ class TestContextPruning(unittest.TestCase):
         self.assertEqual(with_images[0]["images"][0]["frame_idx"], 2)
         self.assertEqual(with_images[1]["images"][0]["frame_idx"], 3)
         self.assertIn("dropped", msgs[1]["content"])
+
+    def test_inspect_jpegs_in_messages_lists_kept_frames(self):
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {
+                "role": "user",
+                "content": "Visual",
+                "images": [{"jpeg_b64": "abc", "frame_idx": 160, "video_id": "vid1"}],
+            },
+        ]
+        kept = agent.inspect_jpegs_in_messages(msgs)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0]["frame_idx"], 160)
+        self.assertEqual(kept[0]["video_id"], "vid1")
+
+    def test_write_agent_context_dump_saves_markdown_and_jpeg(self):
+        dump = Path(tempfile.mkdtemp(prefix="sam3wt_agent_dump_"))
+        jpeg = base64.b64encode(b"\xff\xd8fakejpeg").decode()
+        cfg = agent.LLMConfig(
+            provider="vllm",
+            api_key="DUMMY_API_KEY",
+            model="Qwen/Qwen3-VL-8B-Instruct",
+            base_url="http://127.0.0.1:8001/v1",
+            configured=True,
+            local=True,
+        )
+        messages = [
+            {"role": "system", "content": agent.SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": "Visual",
+                "images": [{"jpeg_b64": jpeg, "frame_idx": 7, "video_id": "v1"}],
+            },
+        ]
+        summary = agent.write_agent_context_dump(
+            dump,
+            system_prompt=agent.SYSTEM_PROMPT,
+            overview={"project_name": "demo", "videos": []},
+            user_text="inspect and segment two mice",
+            messages=messages,
+            events=[
+                {"event": "tool_call", "data": {"name": "inspect_frame", "arguments": {"frame_idx": 7}, "step": 1}},
+                {"event": "tool_result", "data": {"name": "inspect_frame", "ok": True, "result": {"frame_idx": 7}, "elapsed_ms": 12, "step": 1}},
+            ],
+            llm_turns=[{"step": 1, "inspect_jpegs_in_context": agent.inspect_jpegs_in_messages(messages)}],
+            cfg=cfg,
+            inspect_images=[{"jpeg_b64": jpeg, "frame_idx": 7, "video_id": "v1"}],
+        )
+        self.assertTrue((dump / "context.md").is_file())
+        self.assertTrue((dump / "context.json").is_file())
+        self.assertTrue(summary["inspect_jpegs_seen"])
+        jpeg_path = dump / summary["inspect_jpegs_seen"][0]["file"]
+        self.assertTrue(jpeg_path.is_file())
+        md = (dump / "context.md").read_text()
+        self.assertIn("System prompt", md)
+        self.assertIn("Retrieved project JSON", md)
+        self.assertIn("inspect_frame", md)
+        self.assertIn("in final LLM context", md)
+        last = agent.get_last_agent_dump()
+        self.assertEqual(last["dump_dir"], str(dump))
 
     def test_agent_max_tokens_is_below_8k_window(self):
         self.assertLessEqual(agent.AGENT_MAX_TOKENS, 2048)
