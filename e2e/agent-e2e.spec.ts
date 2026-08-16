@@ -20,15 +20,13 @@ const SHOTS = join(REPORT, 'screenshots')
 const ARTIFACTS = '/opt/cursor/artifacts/screenshots'
 
 const PROMPT = [
-  'This home-cage frame has exactly two mice: one with a shaved/clipped patch (HeadShave, object 1) and one without (NoShave, object 2).',
-  'Inspect the frame first.',
-  'SAM3 text grounding often misses the far-right mouse and lights up empty bedding around x=0.60–0.67 instead — do not trust that as HeadShave.',
-  'Segment both animals with add_point_prompt (reuse the existing objects, do not create new ones):',
-  '1) NoShave object_id="2": one positive click on the LEFT mouse torso at about (0.32, 0.50).',
-  '2) HeadShave object_id="1": one positive click on the FAR RIGHT mouse next to the round water-bottle port at about (0.80, 0.42).',
-  'Never click x=0.50–0.70 (empty bedding). Never put both objects on the same mouse.',
-  'Then evaluate_segmentation. If HeadShave is missing or not on the far-right animal, click (0.80, 0.42) again.',
-  'Do not finish until both objects have their own compact mask. Do not start propagation.',
+  'This home-cage frame has exactly two mice: one shaved (HeadShave, object 1) and one unshaved (NoShave, object 2). Inspect first.',
+  'Do not click the circular water-bottle port (~0.85, 0.42) or empty bedding (x=0.50–0.70) — those make SAM fill the whole cage.',
+  'Reuse the existing objects. Call add_point_prompt twice:',
+  '1) object_id="2" points=[[0.32,0.50],[0.78,0.50]] labels=[1,0]  // + left mouse torso, − right mouse',
+  '2) object_id="1" points=[[0.78,0.50],[0.32,0.50]] labels=[1,0]  // + right mouse torso, − left mouse',
+  'The right mouse torso is at about (0.78, 0.50), not (0.80, 0.42).',
+  'Then evaluate_segmentation. Do not finish until both objects have compact masks on opposite sides of the cage. Do not start propagation.',
 ].join(' ')
 
 let baseline: ProjectSnapshot

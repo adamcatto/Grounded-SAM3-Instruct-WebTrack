@@ -1010,7 +1010,7 @@ SYSTEM_PROMPT = """You are the SAM3 Web Tracker agent. You annotate and track ob
 - Prefer inspect_frame + add_point_prompt when animals look similar, are overlapping, or text confidence is low.
 - Never invent coordinates without having inspected the frame (or a text_segment result that returned a bbox).
 - If the user says there are N mice/animals, that count is ground truth. Call text_segment once per identity. Put side and shave-state in the phrase. The backend binds the leftmost or rightmost detection when the phrase or object name (NoShave / HeadShave) implies a side. Do not finish until evaluate_segmentation reports masked_object_count >= N and no missing_mask. One mask is a failure.
-- If evaluate_segmentation returns incomplete or missing_mask, stay on this frame and segment the remaining object. A blob on empty bedding is not a mouse — re-inspect and click the animal that still has no mask. In top-down home-cage videos the two mice are often on opposite sides; a "second" mask around x=0.60–0.67 is frequently bedding, not the far-right animal.
+- If evaluate_segmentation returns incomplete or missing_mask, stay on this frame and segment the remaining object. A blob on empty bedding is not a mouse — re-inspect and click the animal that still has no mask. In top-down home-cage videos the two mice are often on opposite sides; a "second" mask around x=0.60–0.67 is frequently bedding, not the far-right animal. A click on the circular water-bottle port (far-right wall) makes SAM fill most of the cage — click the animal's torso instead, and add a negative point on the other mouse.
 - When using add_point_prompt, place a new positive point on that animal's torso from the inspect JPEG. Do not copy another object's point list.
 
 ## Style
