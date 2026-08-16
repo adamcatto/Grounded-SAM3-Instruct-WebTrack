@@ -140,7 +140,21 @@ class TestLLMConfig(unittest.TestCase):
         }
         if extra:
             env.update(extra)
-        return mock.patch.dict(os.environ, env, clear=False)
+        ctx = mock.patch.dict(os.environ, env, clear=False)
+
+        class _Cleared:
+            def __enter__(self):
+                self._cm = ctx
+                inner = self._cm.__enter__()
+                for k in ("AGENT_LLM_THINKING", "AGENT_LLM_PROFILE"):
+                    if extra is None or k not in extra:
+                        os.environ.pop(k, None)
+                return inner
+
+            def __exit__(self, *args):
+                return self._cm.__exit__(*args)
+
+        return _Cleared()
 
     def test_missing_local_and_cloud(self):
         with self._clear_llm_env({"AGENT_LLM_PROVIDER": "openai", "AGENT_LLM_MODEL": "gpt-4o"}):
@@ -183,6 +197,31 @@ class TestLLMConfig(unittest.TestCase):
         self.assertEqual(cfg.api_key, "DUMMY_API_KEY")
         self.assertEqual(cfg.base_url, "http://127.0.0.1:8001/v1")
         self.assertEqual(cfg.model, "Qwen/Qwen3-VL-8B-Thinking")
+
+    def test_vllm_profile_a100_defaults_to_32b_instruct(self):
+        with self._clear_llm_env({"AGENT_LLM_PROVIDER": "vllm", "AGENT_LLM_PROFILE": "a100"}):
+            for k in ("AGENT_LLM_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+                os.environ.pop(k, None)
+            with mock.patch.object(agent, "discover_local_llm", return_value=None):
+                cfg = agent.load_llm_config(probe=False)
+        self.assertEqual(cfg.model, "Qwen/Qwen3-VL-32B-Instruct")
+        self.assertEqual(agent.default_vllm_model("a100"), "Qwen/Qwen3-VL-32B-Instruct")
+        self.assertEqual(
+            agent.default_vllm_model("a100", thinking=True),
+            "Qwen/Qwen3-VL-32B-Thinking",
+        )
+
+    def test_vllm_profile_h100x4_defaults_to_72b(self):
+        with self._clear_llm_env({"AGENT_LLM_PROVIDER": "vllm", "AGENT_LLM_PROFILE": "h100x4"}):
+            with mock.patch.object(agent, "discover_local_llm", return_value=None):
+                cfg = agent.load_llm_config(probe=False)
+        self.assertEqual(cfg.model, "Qwen/Qwen2.5-VL-72B-Instruct")
+        self.assertEqual(agent.normalize_llm_profile("cluster"), "h100x4")
+        self.assertEqual(agent.normalize_llm_profile("workstation"), "a100")
+
+    def test_vllm_profile_shared_stays_8b(self):
+        self.assertEqual(agent.default_vllm_model("a100-shared"), "Qwen/Qwen3-VL-8B-Instruct")
+        self.assertEqual(agent.default_vllm_model("demo"), "Qwen/Qwen3-VL-8B-Thinking")
 
     def test_ollama_autodetect(self):
         found = {

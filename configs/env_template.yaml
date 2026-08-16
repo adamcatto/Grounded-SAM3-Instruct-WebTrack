@@ -110,8 +110,21 @@ lsf_parallel_tracking:
 
 # Local vision LLM for the Agent chat pane (same idea as SAM 3 Agent + vLLM).
 # The backend auto-detects a running server; these are the defaults it probes.
+#
+# Hardware (do not co-locate 32B/72B with SAM3 on one 80GB GPU):
+#   1× 80GB A100 dedicated to the LLM:
+#     bash scripts/serve_agent_llm.sh vllm --profile a100
+#     → Qwen/Qwen3-VL-32B-Instruct
+#   4× 80GB H100 NVL (typical: SAM on workstation A100, LLM here):
+#     bash scripts/serve_agent_llm.sh vllm --profile h100x4
+#     → Qwen/Qwen2.5-VL-72B-Instruct  (tensor-parallel 4)
+#     AGENT_LLM_BASE_URL: "http://<h100-host>:8001/v1"
+#   Same GPU as SAM3:
+#     bash scripts/serve_agent_llm.sh vllm --profile a100-shared   # 8B Instruct
+#     bash scripts/serve_agent_llm.sh vllm --profile demo          # 8B Thinking (SAM 3 Agent)
 agent_llm:
   provider: auto          # auto | ollama | vllm | openai | anthropic
-  # Ollama:  http://127.0.0.1:11434/v1   (ollama pull qwen2.5vl && ollama serve)
-  # vLLM:    http://127.0.0.1:8001/v1    (vllm serve Qwen/Qwen3-VL-8B-Thinking --port 8001 --allowed-local-media-path /)
+  profile: a100           # a100 | h100x4 | a100-shared | demo  (AGENT_LLM_PROFILE)
+  # Ollama:  http://127.0.0.1:11434/v1   (ollama pull qwen2.5vl:32b && ollama serve)
+  # vLLM:    http://127.0.0.1:8001/v1    (see profiles above; dummy API key)
   # Cloud keys are optional. Local servers use API key DUMMY_API_KEY.

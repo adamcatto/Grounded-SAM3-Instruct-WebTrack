@@ -612,6 +612,9 @@ export interface AgentLlmStatus {
   available_models?: string[]
   running?: boolean
   run_id?: string | null
+  profile?: string
+  recommended_model?: string
+  profile_blurb?: string
 }
 
 export const getAgentStatus = (pid?: string) =>
