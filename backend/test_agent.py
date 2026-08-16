@@ -89,6 +89,9 @@ class TestProjectOverview(unittest.TestCase):
         current = next(r for r in ov["videos"] if r["is_current"])
         self.assertEqual(current["object_count"], 1)
         self.assertEqual(current["prompted_frame_count"], 1)
+        other = next(r for r in ov["videos"] if not r["is_current"])
+        self.assertNotIn("prompted_frame_count", other)
+        self.assertIn("name", other)
 
 
 class TestToolSurface(unittest.TestCase):

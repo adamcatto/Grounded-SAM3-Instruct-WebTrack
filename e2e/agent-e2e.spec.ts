@@ -108,7 +108,12 @@ test('agent inspect + segment two mice from the UI', async ({ page }) => {
   await box.fill(PROMPT)
   await page.getByTitle('Send').click()
 
-  await expect(page.getByText(/Inspect frame|inspect_frame/i).first()).toBeVisible({ timeout: 240_000 })
+  const inspect = page.getByText(/Inspect frame|inspect_frame/i)
+  const agentError = page.locator('.text-red-300')
+  await expect(inspect.or(agentError).first()).toBeVisible({ timeout: 240_000 })
+  if (await agentError.first().isVisible().catch(() => false) && !(await inspect.first().isVisible().catch(() => false))) {
+    throw new Error(`agent error: ${await agentError.first().innerText()}`)
+  }
   await screenshot(page, '04-after-inspect')
 
   const segmented = page.getByText(/Text segment|Point prompt|Create object|Evaluate masks/i).first()

@@ -119,8 +119,8 @@ case "$PROFILE" in
     VLLM_THINKING_MODEL="Qwen/Qwen3-VL-8B-Thinking"
     OLLAMA_MODEL="qwen2.5vl"
     TP_DEFAULT=1
-    MAX_LEN_DEFAULT=8192
-    GPU_UTIL=0.40
+    MAX_LEN_DEFAULT=16384
+    GPU_UTIL=0.50
     REASONING=0
     TOOLS=1
     ENFORCE_EAGER=0
@@ -184,7 +184,7 @@ case "$MODE" in
       echo "Note: 32B bf16 needs a dedicated 80GB GPU. Do not share it with SAM3."
     fi
     if [[ "$PROFILE" == "a100-shared" ]]; then
-      echo "Note: 8B at gpu_mem=${GPU_UTIL} so SAM3 can stay on the same 80GB card."
+      echo "Note: 8B at gpu_mem=${GPU_UTIL} / max_model_len=${MAX_LEN} so SAM3 can stay on the same 80GB card."
     fi
     ARGS=(
       serve "$MODEL"
@@ -212,7 +212,7 @@ case "$MODE" in
     echo
     echo "  a100         Qwen3-VL-32B-Instruct on 1× 80GB A100 (dedicated GPU)"
     echo "  h100x4       Qwen2.5-VL-72B-Instruct TP=4 on 4× 80GB H100 NVL"
-    echo "  a100-shared  Qwen3-VL-8B-Instruct, ~40% of an 80GB card (rest for SAM3)"
+    echo "  a100-shared  Qwen3-VL-8B-Instruct, ~50% of an 80GB card, 16k ctx (rest for SAM3)"
     echo "  demo         Qwen3-VL-8B-Thinking (SAM 3 Agent notebook)"
     echo
     echo "  --thinking   Use the Qwen3-VL *Thinking* checkpoint (32B on a100; 32B not 72B on h100x4)"

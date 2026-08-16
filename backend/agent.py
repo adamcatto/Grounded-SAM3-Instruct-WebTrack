@@ -557,6 +557,12 @@ def project_overview(project: dict, current_video_id: Optional[str], current_fra
             "id": vid,
             "name": v.get("name"),
             "num_frames": v.get("num_frames"),
+            "object_count": len(objects),
+            "is_current": vid == current_video_id,
+        } if vid != current_video_id else {
+            "id": vid,
+            "name": v.get("name"),
+            "num_frames": v.get("num_frames"),
             "fps": v.get("fps"),
             "width": v.get("width"),
             "height": v.get("height"),
@@ -578,7 +584,7 @@ def project_overview(project: dict, current_video_id: Optional[str], current_fra
             "anchor_labeling_complete": bool(v.get("anchor_labeling_complete")),
             "propagation_complete": bool(v.get("propagation_complete")),
             "propagated_frame_count": len(v.get("propagated_frames") or []),
-            "is_current": vid == current_video_id,
+            "is_current": True,
         })
     return {
         "project_id": project.get("id"),
