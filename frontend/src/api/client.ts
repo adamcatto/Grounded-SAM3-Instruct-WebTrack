@@ -1,5 +1,6 @@
 import axios from 'axios'
 import type { Project, VideoMeta, ObjectDef, MaskData } from '../types'
+import { parseSseChunk, SSE_EVENT_SPLIT } from './sseParse'
 
 const api = axios.create({ baseURL: '/api' })
 
@@ -647,15 +648,15 @@ export const textSegment = (
     min_score: opts?.minScore ?? 0,
   }).then(r => r.data)
 
-function parseSseChunk(chunk: string): { event: string; data: string } | null {
-  let event = 'message'
-  const dataLines: string[] = []
-  for (const line of chunk.split('\n')) {
-    if (line.startsWith('event:')) event = line.slice(6).trim()
-    else if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart())
-  }
-  if (dataLines.length === 0) return null
-  return { event, data: dataLines.join('\n') }
+function emitParsedSse(
+  chunk: string,
+  onEvent: (event: string, data: Record<string, unknown>) => void,
+) {
+  const parsed = parseSseChunk(chunk)
+  if (!parsed) return
+  let data: Record<string, unknown> = {}
+  try { data = JSON.parse(parsed.data) as Record<string, unknown> } catch { data = { raw: parsed.data } }
+  onEvent(parsed.event, data)
 }
 
 export async function startAgentRun(
@@ -686,22 +687,9 @@ export async function startAgentRun(
     const { value, done } = await reader.read()
     if (done) break
     buf += decoder.decode(value, { stream: true })
-    const parts = buf.split('\n\n')
+    const parts = buf.split(SSE_EVENT_SPLIT)
     buf = parts.pop() ?? ''
-    for (const chunk of parts) {
-      const parsed = parseSseChunk(chunk)
-      if (!parsed) continue
-      let data: Record<string, unknown> = {}
-      try { data = JSON.parse(parsed.data) as Record<string, unknown> } catch { data = { raw: parsed.data } }
-      onEvent(parsed.event, data)
-    }
+    for (const chunk of parts) emitParsedSse(chunk, onEvent)
   }
-  if (buf.trim()) {
-    const parsed = parseSseChunk(buf)
-    if (parsed) {
-      let data: Record<string, unknown> = {}
-      try { data = JSON.parse(parsed.data) as Record<string, unknown> } catch { data = { raw: parsed.data } }
-      onEvent(parsed.event, data)
-    }
-  }
+  if (buf.trim()) emitParsedSse(buf, onEvent)
 }

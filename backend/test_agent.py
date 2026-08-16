@@ -204,6 +204,8 @@ class TestToolSurface(unittest.TestCase):
         p = agent.SYSTEM_PROMPT.lower()
         for needle in ("every nth", "nearby", "text", "point", "propagation", "inspect", "n mice"):
             self.assertIn(needle, p)
+        self.assertIn("reuse existing", p)
+        self.assertNotIn("0.78", p)
 
     def test_initial_messages_include_context(self):
         msgs = agent.build_initial_messages(

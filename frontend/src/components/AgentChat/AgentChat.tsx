@@ -5,7 +5,7 @@ import {
 } from 'lucide-react'
 import { useStore, currentVideo as selectCurrentVideo } from '../../store/useStore'
 import {
-  cancelAgentRun, getAgentStatus, getProject, startAgentRun, type AgentLlmStatus,
+  cancelAgentRun, getAgentStatus, getProject, getSavedMask, startAgentRun, type AgentLlmStatus,
 } from '../../api/client'
 import type { MaskData } from '../../types'
 
@@ -22,7 +22,7 @@ interface TraceItem {
 }
 
 const EXAMPLES = [
-  'Exactly two mice. Each is one connected mask (head+body+tail). NoShave left torso ~(0.32,0.50); HeadShave right torso ~(0.78,0.50). Inspect, then one positive click per object. Do not click the water port, empty bedding, or the same mouse\'s tail as a negative. Do not finish until both have masks.',
+  'There are two dark blob looking mice, one with a small lighter shave on its head, the other with no shave. Segment them.',
   'Every 1000th frame, segment each mouse with those names. If a frame is unclear, try about 20 frames away.',
   'Plan anchors for the current video, inspect the first one, and tell me what you see before segmenting.',
 ]
@@ -94,6 +94,20 @@ function asBool(v: unknown): boolean | undefined {
   return typeof v === 'boolean' ? v : undefined
 }
 
+async function hydrateSavedMasks(pid: string, videoId: string | undefined, frameIdx: number | undefined) {
+  if (!videoId || frameIdx == null) return
+  try {
+    const data = await getSavedMask(pid, videoId, frameIdx)
+    const masks = data.masks ?? {}
+    if (Object.keys(masks).length === 0) return
+    const s = useStore.getState()
+    if (s.currentVideoId !== videoId) return
+    const liveEmpty = Object.keys(s.currentFrameMasks).length === 0 || s.currentFrameMasksFrame !== frameIdx
+    if (liveEmpty) s.setCurrentFrameMasks(masks, frameIdx)
+    s.setSavedMask(frameIdx, { ...(s.savedMaskCache[frameIdx] ?? {}), ...masks })
+  } catch { /* ignore */ }
+}
+
 async function applyUiEvent(ev: Record<string, unknown>) {
   const store = useStore.getState()
   const pid = store.project?.id
@@ -107,25 +121,29 @@ async function applyUiEvent(ev: Record<string, unknown>) {
     case 'goto_frame': {
       const frameIdx = asNumber(ev.frame_idx)
       if (videoId && videoId !== store.currentVideoId) store.setCurrentVideo(videoId)
-      if (frameIdx != null) store.setCurrentFrame(frameIdx)
-      store.setViewerTab('annotate')
+      if (frameIdx != null) useStore.getState().setCurrentFrame(frameIdx)
+      useStore.getState().setViewerTab('annotate')
       break
     }
     case 'refresh_project':
       if (!pid) break
       try {
         const p = await getProject(pid)
-        store.setProject(p)
+        const s = useStore.getState()
+        s.setProject(p)
+        await hydrateSavedMasks(pid, s.currentVideoId ?? undefined, s.currentFrame)
       } catch { /* ignore */ }
       break
     case 'set_masks': {
       const frameIdx = asNumber(ev.frame_idx)
-      if (videoId && videoId !== store.currentVideoId) break
+      const s = useStore.getState()
+      if (videoId && videoId !== s.currentVideoId) s.setCurrentVideo(videoId)
       if (frameIdx == null) break
       const masks = (ev.masks || {}) as MaskData
-      store.setCurrentFrame(frameIdx)
-      store.setCurrentFrameMasks(masks, frameIdx)
-      store.setSavedMask(frameIdx, masks)
+      const s2 = useStore.getState()
+      s2.setCurrentFrame(frameIdx)
+      s2.setCurrentFrameMasks(masks, frameIdx)
+      s2.setSavedMask(frameIdx, { ...(s2.savedMaskCache[frameIdx] ?? {}), ...masks })
       break
     }
     case 'select_object': {
@@ -143,7 +161,7 @@ async function applyUiEvent(ev: Record<string, unknown>) {
         const pair = Array.isArray(pt) ? pt : [0, 0]
         return { x: Number(pair[0]), y: Number(pair[1]), label: (Number(rawLabs[i] ?? 1) ? 1 : 0) as 0 | 1 }
       })
-      const local = { ...store.localAnnotations }
+      const local = { ...useStore.getState().localAnnotations }
       local[oid] = { ...(local[oid] ?? {}), [String(frameIdx)]: { points: pts } }
       useStore.setState({ localAnnotations: local })
       break
@@ -236,6 +254,10 @@ export default function AgentChat() {
         return next
       })
     }
+    let uiTail = Promise.resolve()
+    const queueUi = (ev: Record<string, unknown>) => {
+      uiTail = uiTail.then(() => applyUiEvent(ev)).catch(() => {})
+    }
     try {
       await startAgentRun(
         pid,
@@ -305,7 +327,7 @@ export default function AgentChat() {
             return
           }
           if (event === 'ui') {
-            void applyUiEvent(data)
+            queueUi(data)
             return
           }
           if (event === 'error') {
@@ -322,6 +344,8 @@ export default function AgentChat() {
               assistantParts.push(textVal)
               setItems(prev => [...prev, { id: `d-${Date.now()}`, kind: 'assistant', text: textVal }])
             }
+            const s = useStore.getState()
+            uiTail = uiTail.then(() => hydrateSavedMasks(pid, s.currentVideoId ?? undefined, s.currentFrame))
           }
         },
         ac.signal,
@@ -335,6 +359,9 @@ export default function AgentChat() {
         }])
       }
     } finally {
+      try { await uiTail } catch { /* ignore */ }
+      const s = useStore.getState()
+      await hydrateSavedMasks(pid, s.currentVideoId ?? undefined, s.currentFrame)
       const joined = assistantParts.join('\n').trim()
       if (joined) historyRef.current = [...historyRef.current, { role: 'assistant', content: joined }]
       abortRef.current = null

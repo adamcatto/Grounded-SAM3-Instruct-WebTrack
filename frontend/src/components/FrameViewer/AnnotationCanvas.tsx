@@ -491,6 +491,9 @@ export default function AnnotationCanvas({ width, height, scrubbing = false }: P
         ref={canvasRef}
         width={width}
         height={height}
+        data-mask-count={Object.keys(masksToShow).length}
+        data-mask-ids={Object.keys(masksToShow).sort().join(',')}
+        data-mask-frame={currentFrame}
         onClick={handleClick}
         onMouseMove={handleMouseMove}
         onMouseLeave={() => { setHoverLabel(null); setHoverPos(null) }}

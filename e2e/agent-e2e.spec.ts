@@ -14,20 +14,14 @@ import {
   getPointPrompts,
   waitForBackend,
 } from './helpers/maskOps'
+import { parseSseChunk } from '../frontend/src/api/sseParse'
 
 const REPO = '/opt/software/Grounded-SAM3-Instruct-WebTrack'
 const REPORT = join(REPO, 'reports', 'agent-e2e-a100-shared')
 const SHOTS = join(REPORT, 'screenshots')
 const ARTIFACTS = '/opt/cursor/artifacts/screenshots'
 
-const PROMPT = [
-  'This home-cage frame has exactly two mice. Each mouse is ONE object: head, body, AND tail in a single connected mask. Do not split body and tail. Do not create extra objects.',
-  'Shaved HeadShave is on the FAR RIGHT (torso about 0.78, 0.50). Unshaved NoShave is on the LEFT (torso about 0.32, 0.50).',
-  'Inspect first. The canvas should be empty of old points. Then add_point_prompt once per existing object:',
-  '1) NoShave: one positive click on the left mouse torso. Include the tail in that same mask — never put a negative click on its tail.',
-  '2) HeadShave: one positive click on the right mouse torso. Do not click the circular water-bottle port (~0.85, 0.42) or empty bedding (x=0.50–0.70).',
-  'evaluate_segmentation. If split_components, add another positive point on the missing tail/body, still on the same object id. Do not finish until both mice have compact connected masks on opposite sides. Do not start propagation.',
-].join(' ')
+const PROMPT = 'There are two dark blob looking mice, one with a small lighter shave on its head, the other with no shave. Segment them.'
 
 let objHead = SANDBOX.objA
 let objNo = SANDBOX.objB
@@ -113,6 +107,23 @@ test.afterAll(async () => {
   }
 }, { timeout: 180_000 })
 
+test('parses CRLF SSE agent events', () => {
+  const crlf = 'event: ui\r\ndata: {"action":"set_masks","frame_idx":160,"masks":{"1":"abc"}}\r\n'
+  const parsed = parseSseChunk(crlf)
+  expect(parsed?.event).toBe('ui')
+  expect(JSON.parse(parsed!.data)).toEqual({ action: 'set_masks', frame_idx: 160, masks: { '1': 'abc' } })
+  const lf = 'event: tool_call\ndata: {"name":"inspect_frame"}\n'
+  expect(parseSseChunk(lf)?.event).toBe('tool_call')
+})
+
+async function waitForCanvasMasks(page: Page, minCount: number, timeoutMs: number) {
+  const canvas = page.locator('canvas[data-mask-count]')
+  await expect.poll(async () => {
+    const raw = await canvas.getAttribute('data-mask-count')
+    return Number(raw || '0')
+  }, { timeout: timeoutMs }).toBeGreaterThanOrEqual(minCount)
+}
+
 test('agent inspect + segment two mice from the UI', async ({ page }) => {
   await page.setViewportSize({ width: 1600, height: 960 })
   await page.goto('/')
@@ -130,13 +141,10 @@ test('agent inspect + segment two mice from the UI', async ({ page }) => {
   await screenshot(page, '03-agent-pane')
 
   const box = page.getByPlaceholder('Prompt the agent…')
-  const prompt = PROMPT.replace('NoShave:', `NoShave (object ${objNo}):`).replace('HeadShave:', `HeadShave (object ${objHead}):`)
-  await box.fill(prompt)
-  const dumpBefore = await getLastAgentDump().catch(() => ({}))
-  const dumpDirBefore = typeof dumpBefore.dump_dir === 'string' ? dumpBefore.dump_dir : ''
+  await box.fill(PROMPT)
   await page.getByTitle('Send').click()
 
-  const inspect = page.getByText(/Inspect frame|inspect_frame/i)
+  const inspect = page.getByText(/Inspect frame \d+/i)
   const agentError = page.locator('.text-red-300')
   const deadline = Date.now() + 240_000
   while (Date.now() < deadline) {
@@ -144,27 +152,36 @@ test('agent inspect + segment two mice from the UI', async ({ page }) => {
     if (await agentError.first().isVisible().catch(() => false)) {
       throw new Error(`agent error: ${await agentError.first().innerText()}`)
     }
-    const dump = await getLastAgentDump().catch(() => ({}))
-    const seen = Array.isArray(dump.inspect_jpegs_seen) ? dump.inspect_jpegs_seen : []
-    if (dump.dump_dir && dump.dump_dir !== dumpDirBefore && seen.length > 0) break
     await page.waitForTimeout(1000)
   }
+  await expect(inspect.first()).toBeVisible({ timeout: 5_000 })
   await scrollAgentPane(page)
   await screenshot(page, '04-after-inspect')
 
-  const segmented = page.getByText(/Text segment|Point prompt|Create object|Evaluate masks/i)
-  const segDeadline = Date.now() + 360_000
-  while (Date.now() < segDeadline) {
-    if (await segmented.first().isVisible().catch(() => false)) break
-    const dump = await getLastAgentDump().catch(() => ({}))
-    const n = typeof dump.tool_call_count === 'number' ? dump.tool_call_count : 0
-    if (dump.dump_dir && dump.dump_dir !== dumpDirBefore && n >= 2) break
+  const segmented = page.getByText(/Point prompt on obj|Text segment:|Evaluate masks on frame/i)
+  await expect(segmented.first()).toBeVisible({ timeout: 360_000 })
+  await scrollAgentPane(page)
+
+  const maskDeadline = Date.now() + 360_000
+  while (Date.now() < maskDeadline) {
+    const saved = await getSavedMasks(SANDBOX.pid, SANDBOX.vid, SANDBOX.anchorFrame)
+    if (saved.masks[objHead] && saved.masks[objNo]) break
+    if (await agentError.first().isVisible().catch(() => false)) {
+      throw new Error(`agent error: ${await agentError.first().innerText()}`)
+    }
     await page.waitForTimeout(1000)
   }
-  await scrollAgentPane(page)
+  const savedBeforeShot = await getSavedMasks(SANDBOX.pid, SANDBOX.vid, SANDBOX.anchorFrame)
+  expect(savedBeforeShot.masks[objHead], 'HeadShave mask missing before screenshot').toBeTruthy()
+  expect(savedBeforeShot.masks[objNo], 'NoShave mask missing before screenshot').toBeTruthy()
+
+  await jumpToFrame(page, SANDBOX.anchorFrame)
+  await waitForCanvasMasks(page, 2, 30_000)
   await screenshot(page, '05-after-segment')
 
   await expect(page.getByTitle('Send')).toBeVisible({ timeout: 360_000 })
+  await jumpToFrame(page, SANDBOX.anchorFrame)
+  await waitForCanvasMasks(page, 2, 30_000)
   await scrollAgentPane(page)
   await screenshot(page, '06-final')
 
@@ -187,9 +204,13 @@ test('agent inspect + segment two mice from the UI', async ({ page }) => {
     '',
     `Project: \`${SANDBOX.projectName}\`  video: \`${SANDBOX.videoName}\`  frame: ${SANDBOX.anchorFrame}`,
     '',
+    `Prompt: ${PROMPT}`,
+    '',
     `LLM: \`${JSON.stringify(dump.llm ?? {})}\``,
     '',
     `Tool calls: ${dump.tool_call_count ?? 'n/a'}`,
+    '',
+    'Backend saved masks on disk; the canvas overlay comes from agent SSE `set_masks` (CRLF-parsed) plus a refetch after refresh/done so screenshots are not taken on a cleared overlay.',
     '',
     '## Screenshots',
     '',
@@ -226,6 +247,10 @@ test('agent inspect + segment two mice from the UI', async ({ page }) => {
   const masks = await getSavedMasks(SANDBOX.pid, SANDBOX.vid, SANDBOX.anchorFrame)
   expect(masks.masks[objHead], 'HeadShave mask missing after agent run').toBeTruthy()
   expect(masks.masks[objNo], 'NoShave mask missing after agent run').toBeTruthy()
+  const canvasIds = await page.locator('canvas[data-mask-ids]').getAttribute('data-mask-ids')
+  expect(canvasIds, 'canvas mask ids missing').toBeTruthy()
+  expect(canvasIds?.split(','), 'HeadShave not on canvas').toContain(objHead)
+  expect(canvasIds?.split(','), 'NoShave not on canvas').toContain(objNo)
 
   const ev = lastEvaluateResult(dumpDir)
   if (!ev) {
