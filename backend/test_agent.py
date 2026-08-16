@@ -52,6 +52,14 @@ class TestMaskQuality(unittest.TestCase):
         q = agent.evaluate_mask_quality(m, score=0.99)
         self.assertIn("mask_covers_most_of_frame", q["reason"])
 
+    def test_split_body_and_tail_is_not_ok(self):
+        m = np.zeros((200, 200), dtype=np.uint8)
+        m[20:70, 20:80] = 1
+        m[140:185, 90:150] = 1
+        q = agent.evaluate_mask_quality(m, score=0.9)
+        self.assertIn("split_components", q["reason"])
+        self.assertFalse(q["ok"])
+
 
 class TestTwoMouseAssignment(unittest.TestCase):
     def _det(self, cx: float, score: float = 0.9) -> dict:

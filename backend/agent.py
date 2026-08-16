@@ -460,6 +460,23 @@ def nearby_frames(
     return out
 
 
+def _count_large_mask_components(binary, min_frac: float = 0.12) -> int:
+    """How many sizable connected components a mask has (body+tail split → 2)."""
+    b = np.squeeze(np.asarray(binary)).astype(bool)
+    if b.ndim != 2:
+        return 0
+    area = int(b.sum())
+    if area == 0:
+        return 0
+    try:
+        import cv2
+        n, _, stats, _ = cv2.connectedComponentsWithStats(b.astype(np.uint8), connectivity=8)
+    except Exception:
+        return 1
+    thresh = max(250, int(min_frac * area))
+    return sum(1 for i in range(1, n) if int(stats[i, cv2.CC_STAT_AREA]) >= thresh)
+
+
 def evaluate_mask_quality(
     mask,
     score: Optional[float] = None,
@@ -522,6 +539,10 @@ def evaluate_mask_quality(
     if bbox[2] < 0.01 or bbox[3] < 0.01:
         conf *= 0.4
         reasons.append("tiny_bbox")
+    n_comp = _count_large_mask_components(binary)
+    if n_comp >= 2:
+        conf *= 0.4
+        reasons.append("split_components")
 
     conf = float(np.clip(conf, 0.0, 1.0))
     ok = conf >= CONFIDENCE_RETRY_THRESHOLD and "empty_mask" not in reasons
@@ -998,9 +1019,9 @@ SYSTEM_PROMPT = """You are the SAM3 Web Tracker agent. You annotate and track ob
 3. For each planned frame:
    a. goto_frame then inspect_frame so you can see animals, occlusion, blur, and identity cues.
    b. create_object once per identity (reuse existing objects with the same name).
-              c. text_segment once per identity with a phrase that includes count/side/shave-state (e.g. "unshaved mouse on the left" vs "shaved mouse on the right near the water port"). Reuse existing object ids.
+   c. text_segment once per identity with a phrase that includes count/side/shave-state (e.g. "unshaved mouse on the left" vs "shaved mouse on the right near the water port"). Reuse existing object ids.
    d. evaluate_segmentation. If confidence is low, the frame is empty, identities are swapped, or animals overlap badly: think, then try nearby frames (±20, then ±40) via plan_frames(around_frame=..., nearby_offset=20). If the result is incomplete / missing_mask, stay on this frame and segment the remaining animals.
-   e. If text segmentation is weak but you can see the animal, add_point_prompt at a chest/back point (positive=1). Use a negative point (0) on the other animal if they touch.
+   e. If text segmentation is weak but you can see the animal, add_point_prompt at a chest/back point (positive=1). Use a negative point (0) on the *other* animal if they touch — never on the same animal's tail.
    f. commit_anchor when the frame is a planned grid/anchor frame and the masks look right.
 4. Adapt. Do not blindly march the grid if a frame is unusable. Skip to a clearer neighbor, then continue the plan.
 5. After the requested frames are labeled, start_propagation if the user wants tracking. Do not start it for a single-frame-only request.
@@ -1012,6 +1033,7 @@ SYSTEM_PROMPT = """You are the SAM3 Web Tracker agent. You annotate and track ob
 - If the user says there are N mice/animals, that count is ground truth. Call text_segment once per identity. Put side and shave-state in the phrase. The backend binds the leftmost or rightmost detection when the phrase or object name (NoShave / HeadShave) implies a side. Do not finish until evaluate_segmentation reports masked_object_count >= N and no missing_mask. One mask is a failure.
 - If evaluate_segmentation returns incomplete or missing_mask, stay on this frame and segment the remaining object. A blob on empty bedding is not a mouse — re-inspect and click the animal that still has no mask. In top-down home-cage videos the two mice are often on opposite sides; a "second" mask around x=0.60–0.67 is frequently bedding, not the far-right animal. A click on the circular water-bottle port (far-right wall) makes SAM fill most of the cage — click the animal's torso instead, and add a negative point on the other mouse.
 - When using add_point_prompt, place a new positive point on that animal's torso from the inspect JPEG. Do not copy another object's point list.
+- One animal = one connected mask that includes head, body, and tail. Never put a negative click on the same mouse's tail (that splits body and tail into two blobs). If evaluate_segmentation reports split_components, add another positive point on the missing part (usually the tail), do not create a new object.
 
 ## Style
 - Call think before multi-step plans and after failures.

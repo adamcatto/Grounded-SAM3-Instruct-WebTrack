@@ -174,3 +174,44 @@ export async function getAgentLlmStatus(): Promise<{
 export async function getLastAgentDump(): Promise<Record<string, unknown>> {
   return apiJson('/agent/last_dump')
 }
+
+export async function resetSandboxVideo(keepObjects = true): Promise<{ status?: string; kept_object_ids?: string[] }> {
+  const qs = keepObjects ? '?keep_objects=true' : ''
+  return apiJson(`/projects/${SANDBOX.pid}/videos/${SANDBOX.vid}/reset${qs}`, { method: 'POST' })
+}
+
+export async function ensureSandboxObjects(): Promise<void> {
+  const p = await getSandboxProject()
+  const objs = p.videos?.[SANDBOX.vid]?.objects ?? {}
+  const names = new Set(
+    Object.values(objs).map(o => (o.name || '').toLowerCase()),
+  )
+  if (!names.has('headshave')) {
+    await apiJson(`/projects/${SANDBOX.pid}/videos/${SANDBOX.vid}/objects`, {
+      method: 'POST',
+      body: JSON.stringify({ name: 'HeadShave', color: '#5B8DD9', description: 'shaved mouse' }),
+    })
+  }
+  const p2 = await getSandboxProject()
+  const names2 = new Set(
+    Object.values(p2.videos?.[SANDBOX.vid]?.objects ?? {}).map(o => (o.name || '').toLowerCase()),
+  )
+  if (!names2.has('noshave')) {
+    await apiJson(`/projects/${SANDBOX.pid}/videos/${SANDBOX.vid}/objects`, {
+      method: 'POST',
+      body: JSON.stringify({ name: 'NoShave', color: '#E8A445', description: 'unshaved mouse' }),
+    })
+  }
+}
+
+export async function sandboxObjectIdsByName(): Promise<{ headshave?: string; noshave?: string }> {
+  const p = await getSandboxProject()
+  const objs = p.videos?.[SANDBOX.vid]?.objects ?? {}
+  const out: { headshave?: string; noshave?: string } = {}
+  for (const [oid, obj] of Object.entries(objs)) {
+    const n = (obj.name || '').toLowerCase()
+    if (n === 'headshave') out.headshave = oid
+    if (n === 'noshave') out.noshave = oid
+  }
+  return out
+}

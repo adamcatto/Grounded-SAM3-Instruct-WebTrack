@@ -289,8 +289,10 @@ export const updateVideoMeta = (
 export const removeVideo = (pid: string, vid: string) =>
   api.delete(`/projects/${pid}/videos/${vid}`)
 
-export const resetVideo = (pid: string, vid: string) =>
-  api.post(`/projects/${pid}/videos/${vid}/reset`).then(r => r.data)
+export const resetVideo = (pid: string, vid: string, opts?: { keepObjects?: boolean }) =>
+  api.post(`/projects/${pid}/videos/${vid}/reset`, null, {
+    params: opts?.keepObjects ? { keep_objects: true } : {},
+  }).then(r => r.data)
 
 export const clearFramePrompts = (pid: string, vid: string, frameIdx: number) =>
   api.delete(`/projects/${pid}/videos/${vid}/frames/${frameIdx}/prompts`).then(r => r.data)

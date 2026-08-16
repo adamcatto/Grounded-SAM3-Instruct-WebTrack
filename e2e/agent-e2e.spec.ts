@@ -3,15 +3,16 @@ import { mkdirSync, writeFileSync, copyFileSync, existsSync, readFileSync, readd
 import { join } from 'node:path'
 import {
   SANDBOX,
-  snapshotFrames,
-  restoreSnapshot,
+  resetSandboxVideo,
+  ensureSandboxObjects,
+  sandboxObjectIdsByName,
   listSandboxObjectIds,
   deleteSandboxObject,
   getAgentLlmStatus,
   getLastAgentDump,
   getSavedMasks,
+  getPointPrompts,
   waitForBackend,
-  type ProjectSnapshot,
 } from './helpers/maskOps'
 
 const REPO = '/opt/software/Grounded-SAM3-Instruct-WebTrack'
@@ -20,16 +21,16 @@ const SHOTS = join(REPORT, 'screenshots')
 const ARTIFACTS = '/opt/cursor/artifacts/screenshots'
 
 const PROMPT = [
-  'This home-cage frame has exactly two mice: shaved HeadShave (object 1) on the far right, unshaved NoShave (object 2) on the left.',
-  'Inspect first, then add_point_prompt once per object (reuse ids, do not create objects):',
-  '1) object_id="2" points=[[0.32,0.50]] labels=[1]',
-  '2) object_id="1" points=[[0.78,0.50]] labels=[1]',
-  'Click the mouse bodies only. Do not click the circular water-bottle port or empty bedding (x=0.50–0.70).',
-  'evaluate_segmentation. Do not finish until both objects have compact masks on opposite sides. Do not start propagation.',
+  'This home-cage frame has exactly two mice. Each mouse is ONE object: head, body, AND tail in a single connected mask. Do not split body and tail. Do not create extra objects.',
+  'Shaved HeadShave is on the FAR RIGHT (torso about 0.78, 0.50). Unshaved NoShave is on the LEFT (torso about 0.32, 0.50).',
+  'Inspect first. The canvas should be empty of old points. Then add_point_prompt once per existing object:',
+  '1) NoShave: one positive click on the left mouse torso. Include the tail in that same mask — never put a negative click on its tail.',
+  '2) HeadShave: one positive click on the right mouse torso. Do not click the circular water-bottle port (~0.85, 0.42) or empty bedding (x=0.50–0.70).',
+  'evaluate_segmentation. If split_components, add another positive point on the missing tail/body, still on the same object id. Do not finish until both mice have compact connected masks on opposite sides. Do not start propagation.',
 ].join(' ')
 
-let baseline: ProjectSnapshot
-let objectIdsBefore: string[] = []
+let objHead = SANDBOX.objA
+let objNo = SANDBOX.objB
 
 test.describe.configure({ mode: 'serial' })
 test.setTimeout(15 * 60_000)
@@ -84,21 +85,33 @@ test.beforeAll(async () => {
   const status = await getAgentLlmStatus()
   expect(status.configured, `LLM not configured: ${JSON.stringify(status)}`).toBeTruthy()
   expect(status.provider, `expected vLLM, got ${JSON.stringify(status)}`).toBe('vllm')
-  baseline = await snapshotFrames([SANDBOX.anchorFrame])
-  objectIdsBefore = await listSandboxObjectIds()
-})
+  await resetSandboxVideo(true)
+  await ensureSandboxObjects()
+  const ids = await sandboxObjectIdsByName()
+  expect(ids.headshave, 'HeadShave object missing after reset').toBeTruthy()
+  expect(ids.noshave, 'NoShave object missing after reset').toBeTruthy()
+  objHead = ids.headshave as string
+  objNo = ids.noshave as string
+  const prompts = await getPointPrompts()
+  expect(prompts, 'point prompts should be empty after reset').toEqual({})
+  const masks = await getSavedMasks(SANDBOX.pid, SANDBOX.vid, SANDBOX.anchorFrame)
+  expect(masks.hasMasks, 'saved masks should be empty after reset').toBeFalsy()
+}, { timeout: 180_000 })
 
 test.afterAll(async () => {
   try {
-    if (baseline) await restoreSnapshot(baseline, [SANDBOX.anchorFrame])
+    const named = await sandboxObjectIdsByName()
+    const keep = new Set([named.headshave, named.noshave].filter(Boolean) as string[])
     const after = await listSandboxObjectIds()
     for (const oid of after) {
-      if (!objectIdsBefore.includes(oid)) await deleteSandboxObject(oid)
+      if (!keep.has(oid)) await deleteSandboxObject(oid)
     }
+    await resetSandboxVideo(true)
+    await ensureSandboxObjects()
   } catch (e) {
-    console.warn('sandbox restore failed', e)
+    console.warn('sandbox reset after E2E failed', e)
   }
-})
+}, { timeout: 180_000 })
 
 test('agent inspect + segment two mice from the UI', async ({ page }) => {
   await page.setViewportSize({ width: 1600, height: 960 })
@@ -117,7 +130,8 @@ test('agent inspect + segment two mice from the UI', async ({ page }) => {
   await screenshot(page, '03-agent-pane')
 
   const box = page.getByPlaceholder('Prompt the agent…')
-  await box.fill(PROMPT)
+  const prompt = PROMPT.replace('NoShave:', `NoShave (object ${objNo}):`).replace('HeadShave:', `HeadShave (object ${objHead}):`)
+  await box.fill(prompt)
   const dumpBefore = await getLastAgentDump().catch(() => ({}))
   const dumpDirBefore = typeof dumpBefore.dump_dir === 'string' ? dumpBefore.dump_dir : ''
   await page.getByTitle('Send').click()
@@ -210,8 +224,8 @@ test('agent inspect + segment two mice from the UI', async ({ page }) => {
     }
   }
   const masks = await getSavedMasks(SANDBOX.pid, SANDBOX.vid, SANDBOX.anchorFrame)
-  expect(masks.masks[SANDBOX.objA], 'HeadShave mask missing after agent run').toBeTruthy()
-  expect(masks.masks[SANDBOX.objB], 'NoShave mask missing after agent run').toBeTruthy()
+  expect(masks.masks[objHead], 'HeadShave mask missing after agent run').toBeTruthy()
+  expect(masks.masks[objNo], 'NoShave mask missing after agent run').toBeTruthy()
 
   const ev = lastEvaluateResult(dumpDir)
   if (!ev) {
@@ -223,10 +237,12 @@ test('agent inspect + segment two mice from the UI', async ({ page }) => {
   for (const row of ev.objects || []) {
     if (row.object_id) byId[String(row.object_id)] = row
   }
-  const hs = byId[SANDBOX.objA]
-  const ns = byId[SANDBOX.objB]
+  const hs = byId[objHead]
+  const ns = byId[objNo]
   expect(hs?.ok, `HeadShave not ok: ${hs?.reason}`).toBeTruthy()
   expect(ns?.ok, `NoShave not ok: ${ns?.reason}`).toBeTruthy()
+  expect(hs?.reason || '', 'HeadShave mask split').not.toMatch(/split_components/)
+  expect(ns?.reason || '', 'NoShave mask split').not.toMatch(/split_components/)
   const hscx = bboxCenterX(hs?.bbox_xywh_norm)
   const nscx = bboxCenterX(ns?.bbox_xywh_norm)
   expect(nscx, `NoShave should be the left mouse, cx=${nscx}`).toBeLessThan(0.50)
