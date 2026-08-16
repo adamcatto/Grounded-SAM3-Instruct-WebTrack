@@ -365,12 +365,12 @@ export default function AgentChat() {
 
       {status && !status.configured && (
         <div className="px-3 py-2 text-[11px] leading-snug text-amber-300/90 bg-amber-500/10 border-b border-amber-500/20">
-          LLM not configured. Set <span className="font-mono">AGENT_LLM_API_KEY</span> (or OPENAI_API_KEY / ANTHROPIC_API_KEY) on the backend.
+          {status.missing_reason || 'No local Ollama/vLLM server detected. Start one, then reopen Agent.'}
         </div>
       )}
       {status?.configured && (
-        <div className="px-3 py-1.5 text-[10px] text-[#555] border-b border-[#1e1e1e]">
-          {status.provider} · {status.model}
+        <div className="px-3 py-1.5 text-[10px] text-[#555] border-b border-[#1e1e1e] truncate" title={status.base_url ?? ''}>
+          {status.local ? 'local' : 'cloud'} · {status.provider} · {status.model}
         </div>
       )}
 

@@ -31,7 +31,22 @@ DEFAULT_NEARBY_OFFSET = 20
 CONFIDENCE_RETRY_THRESHOLD = 0.45
 
 
-# ─── LLM configuration ────────────────────────────────────────────────────────
+# ─── LLM configuration (local Ollama / vLLM first, same idea as SAM 3 Agent) ──
+
+# SAM 3 Agent serves Qwen-VL via vLLM at :8001 with a dummy OpenAI key.
+# Ollama exposes the same /v1/chat/completions surface on :11434.
+VLLM_DEFAULT_BASE = "http://127.0.0.1:8001/v1"
+OLLAMA_DEFAULT_BASE = "http://127.0.0.1:11434/v1"
+OLLAMA_NATIVE_BASE = "http://127.0.0.1:11434"
+VLLM_DEFAULT_MODEL = "Qwen/Qwen3-VL-8B-Thinking"
+OLLAMA_DEFAULT_MODEL = "qwen2.5vl"
+LOCAL_DUMMY_KEY = "DUMMY_API_KEY"
+VISION_MODEL_HINTS = (
+    "vl", "vision", "llava", "minicpm", "pixtral", "gemma3", "qwen2.5-vl",
+    "qwen2.5vl", "qwen3-vl", "qwen3_vl", "internvl", "phi-4-multimodal",
+)
+
+LOCAL_PROVIDERS = frozenset({"ollama", "vllm", "openai_compatible", "local", "lmstudio"})
 
 
 @dataclass
@@ -42,9 +57,147 @@ class LLMConfig:
     base_url: Optional[str]
     configured: bool
     missing_reason: str = ""
+    reachable: bool = False
+    available_models: list[str] = field(default_factory=list)
+    local: bool = False
 
 
-def load_llm_config() -> LLMConfig:
+def _env_true(name: str, default: bool = True) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _normalize_openai_base(url: str, provider: str = "") -> str:
+    u = (url or "").strip().rstrip("/")
+    if u.endswith("/chat/completions"):
+        u = u[: -len("/chat/completions")].rstrip("/")
+    if u.endswith("/v1"):
+        return u
+    if provider in ("ollama", "vllm", "openai_compatible", "local", "lmstudio") or _looks_local_url(u):
+        return u + "/v1"
+    return u
+
+
+def _looks_local_url(url: Optional[str]) -> bool:
+    if not url:
+        return False
+    low = url.lower()
+    return any(h in low for h in ("127.0.0.1", "localhost", "0.0.0.0", "::1"))
+
+
+def _is_local_provider(provider: str, base_url: Optional[str] = None) -> bool:
+    if provider in LOCAL_PROVIDERS:
+        return True
+    return _looks_local_url(base_url)
+
+
+def _prefer_vision_model(names: list[str], fallback: str = "") -> str:
+    if not names:
+        return fallback
+    lowered = [(n, n.lower()) for n in names]
+    for hint in VISION_MODEL_HINTS:
+        for orig, low in lowered:
+            if hint in low:
+                return orig
+    return names[0]
+
+
+def _http_get_json(url: str, timeout: float = 1.2) -> Optional[dict]:
+    try:
+        import httpx
+        r = httpx.get(url, timeout=timeout)
+        if r.status_code >= 400:
+            return None
+        return r.json()
+    except Exception:
+        try:
+            import urllib.request
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode())
+        except Exception:
+            return None
+
+
+def _models_from_openai_list(payload: Optional[dict]) -> list[str]:
+    if not isinstance(payload, dict):
+        return []
+    data = payload.get("data") or payload.get("models") or []
+    names: list[str] = []
+    for item in data:
+        if isinstance(item, str):
+            names.append(item)
+        elif isinstance(item, dict):
+            name = item.get("id") or item.get("name") or item.get("model")
+            if name:
+                names.append(str(name))
+    return names
+
+
+def probe_openai_compatible(base_url: str) -> list[str]:
+    base = _normalize_openai_base(base_url)
+    payload = _http_get_json(base + "/models")
+    return _models_from_openai_list(payload)
+
+
+def probe_ollama(native_base: str = OLLAMA_NATIVE_BASE) -> list[str]:
+    payload = _http_get_json(native_base.rstrip("/") + "/api/tags")
+    names: list[str] = []
+    if isinstance(payload, dict):
+        for item in payload.get("models") or []:
+            if isinstance(item, dict) and item.get("name"):
+                names.append(str(item["name"]))
+            elif isinstance(item, str):
+                names.append(item)
+    if names:
+        return names
+    return probe_openai_compatible(native_base.rstrip("/") + "/v1")
+
+
+def discover_local_llm() -> Optional[dict]:
+    """Find a running Ollama or vLLM OpenAI-compatible server (SAM 3 Agent style)."""
+    explicit = (os.environ.get("AGENT_LLM_BASE_URL") or os.environ.get("OPENAI_BASE_URL") or "").strip()
+    provider_hint = (os.environ.get("AGENT_LLM_PROVIDER") or "").strip().lower()
+
+    if explicit:
+        models = probe_openai_compatible(explicit)
+        prov = provider_hint if provider_hint in LOCAL_PROVIDERS else (
+            "ollama" if "11434" in explicit else "vllm" if "8001" in explicit else "openai_compatible"
+        )
+        if models or _looks_local_url(explicit):
+            return {
+                "provider": prov,
+                "base_url": _normalize_openai_base(explicit, prov),
+                "models": models,
+                "reachable": bool(models),
+            }
+
+    order = ["vllm", "ollama"]
+    if provider_hint == "ollama":
+        order = ["ollama", "vllm"]
+    elif provider_hint == "vllm":
+        order = ["vllm", "ollama"]
+
+    for prov in order:
+        if prov == "vllm":
+            models = probe_openai_compatible(VLLM_DEFAULT_BASE)
+            if models:
+                return {"provider": "vllm", "base_url": VLLM_DEFAULT_BASE, "models": models, "reachable": True}
+        elif prov == "ollama":
+            models = probe_ollama()
+            if models:
+                return {
+                    "provider": "ollama",
+                    "base_url": OLLAMA_DEFAULT_BASE,
+                    "models": models,
+                    "reachable": True,
+                }
+    return None
+
+
+def load_llm_config(*, probe: bool = True) -> LLMConfig:
     provider = (os.environ.get("AGENT_LLM_PROVIDER") or "").strip().lower()
     api_key = (
         os.environ.get("AGENT_LLM_API_KEY")
@@ -55,18 +208,73 @@ def load_llm_config() -> LLMConfig:
     model = (os.environ.get("AGENT_LLM_MODEL") or "").strip()
     base_url = (os.environ.get("AGENT_LLM_BASE_URL") or os.environ.get("OPENAI_BASE_URL") or "").strip() or None
 
-    if not provider:
-        if (os.environ.get("ANTHROPIC_API_KEY") or "").strip() and not (
+    if provider in ("openai-compatible", "compatible", "azure"):
+        provider = "openai_compatible"
+    if provider == "lm-studio":
+        provider = "lmstudio"
+
+    discovered = None
+    if probe and _env_true("AGENT_LLM_AUTODETECT", True) and provider not in ("anthropic",):
+        if provider in ("", "auto", "local") or _is_local_provider(provider, base_url):
+            discovered = discover_local_llm()
+
+    if not provider or provider in ("auto", "local"):
+        if discovered:
+            provider = discovered["provider"]
+        elif (os.environ.get("ANTHROPIC_API_KEY") or "").strip() and not (
             os.environ.get("OPENAI_API_KEY") or ""
         ).strip():
             provider = "anthropic"
-        else:
+        elif api_key and not _looks_local_url(base_url):
             provider = "openai"
+        else:
+            provider = "vllm"
 
-    if provider in ("openai-compatible", "compatible", "azure"):
-        provider = "openai_compatible"
-    if provider not in ("openai", "anthropic", "openai_compatible"):
-        provider = "openai"
+    if provider not in ("openai", "anthropic", "openai_compatible", "ollama", "vllm", "lmstudio"):
+        provider = "openai_compatible" if base_url else "openai"
+
+    local = _is_local_provider(provider, base_url)
+    available: list[str] = list((discovered or {}).get("models") or [])
+    reachable = bool((discovered or {}).get("reachable"))
+
+    if local:
+        if not base_url:
+            base_url = (discovered or {}).get("base_url") or (
+                OLLAMA_DEFAULT_BASE if provider == "ollama" else VLLM_DEFAULT_BASE
+            )
+        else:
+            base_url = _normalize_openai_base(base_url, provider)
+        if not model:
+            default_model = OLLAMA_DEFAULT_MODEL if provider == "ollama" else VLLM_DEFAULT_MODEL
+            model = _prefer_vision_model(available, default_model)
+        if not api_key:
+            api_key = LOCAL_DUMMY_KEY
+        if not reachable and probe:
+            available = probe_openai_compatible(base_url) if provider != "ollama" else (
+                probe_ollama() or probe_openai_compatible(base_url)
+            )
+            reachable = bool(available)
+        configured = True
+        missing = ""
+        if probe and not reachable:
+            missing = (
+                f"No {provider} server answered at {base_url}. "
+                "Start Ollama (`ollama serve` + `ollama pull qwen2.5vl`) or vLLM "
+                f"(`vllm serve {VLLM_DEFAULT_MODEL} --port 8001 --allowed-local-media-path /`), "
+                "same pattern as SAM 3 Agent."
+            )
+            configured = False
+        return LLMConfig(
+            provider=provider,
+            api_key=api_key,
+            model=model,
+            base_url=base_url,
+            configured=configured,
+            missing_reason=missing,
+            reachable=reachable,
+            available_models=available,
+            local=True,
+        )
 
     if not model:
         model = "claude-sonnet-4-20250514" if provider == "anthropic" else "gpt-4o"
@@ -79,10 +287,14 @@ def load_llm_config() -> LLMConfig:
             base_url=base_url,
             configured=False,
             missing_reason=(
-                "No LLM API key. Set AGENT_LLM_API_KEY, or OPENAI_API_KEY / ANTHROPIC_API_KEY. "
-                "Optional: AGENT_LLM_PROVIDER (openai|anthropic|openai_compatible), "
-                "AGENT_LLM_MODEL, AGENT_LLM_BASE_URL."
+                "No local Ollama/vLLM server detected and no cloud API key. "
+                "Start Ollama (`ollama pull qwen2.5vl && ollama serve`) or vLLM on :8001 "
+                f"(`vllm serve {VLLM_DEFAULT_MODEL} --port 8001 --allowed-local-media-path /`), "
+                "or set AGENT_LLM_BASE_URL / AGENT_LLM_PROVIDER=ollama|vllm. "
+                "Cloud fallback: AGENT_LLM_API_KEY or OPENAI_API_KEY / ANTHROPIC_API_KEY."
             ),
+            reachable=False,
+            local=False,
         )
     return LLMConfig(
         provider=provider,
@@ -90,6 +302,8 @@ def load_llm_config() -> LLMConfig:
         model=model,
         base_url=base_url,
         configured=True,
+        reachable=True,
+        local=False,
     )
 
 
@@ -101,6 +315,9 @@ def llm_status_dict() -> dict:
         "model": cfg.model,
         "base_url": cfg.base_url,
         "missing_reason": cfg.missing_reason,
+        "reachable": cfg.reachable,
+        "local": cfg.local,
+        "available_models": cfg.available_models,
     }
 
 
@@ -1248,15 +1465,21 @@ def _call_openai(cfg: LLMConfig, messages: list[dict]) -> dict:
             else:
                 oai_messages.append({"role": role, "content": text})
 
-    payload = {
+    payload: dict[str, Any] = {
         "model": cfg.model,
         "messages": oai_messages,
         "tools": _openai_tools(),
         "tool_choice": "auto",
         "temperature": 0.2,
     }
-    headers = {"Authorization": f"Bearer {cfg.api_key}"}
-    data = _http_json("POST", url, headers, payload)
+    # SAM 3 Agent / vLLM use max_tokens; newer OpenAI prefers max_completion_tokens.
+    if cfg.local or cfg.provider in LOCAL_PROVIDERS:
+        payload["max_tokens"] = 4096
+    else:
+        payload["max_completion_tokens"] = 4096
+    headers = {"Authorization": f"Bearer {cfg.api_key or LOCAL_DUMMY_KEY}"}
+    timeout = 300.0 if cfg.local else 120.0
+    data = _http_json("POST", url, headers, payload, timeout=timeout)
     choice = (data.get("choices") or [{}])[0]
     msg = choice.get("message") or {}
     tool_calls = []
@@ -1268,7 +1491,11 @@ def _call_openai(cfg: LLMConfig, messages: list[dict]) -> dict:
         except json.JSONDecodeError:
             parsed = {}
         tool_calls.append({"id": tc.get("id") or str(uuid.uuid4()), "name": fn.get("name"), "arguments": parsed})
-    return {"content": msg.get("content") or "", "tool_calls": tool_calls}
+    content = msg.get("content") or ""
+    reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
+    if reasoning and reasoning not in content:
+        content = f"{reasoning}\n{content}".strip()
+    return {"content": content, "tool_calls": tool_calls}
 
 
 def _call_anthropic(cfg: LLMConfig, messages: list[dict]) -> dict:

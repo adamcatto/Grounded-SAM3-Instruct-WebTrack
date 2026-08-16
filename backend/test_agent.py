@@ -127,31 +127,88 @@ class TestToolSurface(unittest.TestCase):
 
 
 class TestLLMConfig(unittest.TestCase):
-    def test_missing_key(self):
+    def _clear_llm_env(self, extra=None):
         env = {
-            "AGENT_LLM_PROVIDER": "openai",
-            "AGENT_LLM_MODEL": "gpt-4o",
+            "AGENT_LLM_PROVIDER": "",
+            "AGENT_LLM_MODEL": "",
+            "AGENT_LLM_BASE_URL": "",
             "AGENT_LLM_API_KEY": "",
             "OPENAI_API_KEY": "",
             "ANTHROPIC_API_KEY": "",
+            "OPENAI_BASE_URL": "",
+            "AGENT_LLM_AUTODETECT": "1",
         }
-        with mock.patch.dict(os.environ, env, clear=False):
-            for k in ("AGENT_LLM_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+        if extra:
+            env.update(extra)
+        return mock.patch.dict(os.environ, env, clear=False)
+
+    def test_missing_local_and_cloud(self):
+        with self._clear_llm_env({"AGENT_LLM_PROVIDER": "openai", "AGENT_LLM_MODEL": "gpt-4o"}):
+            for k in ("AGENT_LLM_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "AGENT_LLM_BASE_URL"):
                 os.environ.pop(k, None)
-            cfg = agent.load_llm_config()
+            with mock.patch.object(agent, "discover_local_llm", return_value=None):
+                cfg = agent.load_llm_config(probe=True)
         self.assertFalse(cfg.configured)
-        self.assertIn("API key", cfg.missing_reason)
+        self.assertIn("Ollama", cfg.missing_reason)
 
     def test_openai_key(self):
-        with mock.patch.dict(os.environ, {
+        with self._clear_llm_env({
             "AGENT_LLM_API_KEY": "sk-test",
             "AGENT_LLM_PROVIDER": "openai",
             "AGENT_LLM_MODEL": "gpt-4o",
-        }, clear=False):
-            cfg = agent.load_llm_config()
+        }):
+            with mock.patch.object(agent, "discover_local_llm", return_value=None):
+                cfg = agent.load_llm_config(probe=False)
         self.assertTrue(cfg.configured)
         self.assertEqual(cfg.provider, "openai")
         self.assertEqual(cfg.model, "gpt-4o")
+        self.assertFalse(cfg.local)
+
+    def test_vllm_uses_dummy_key_like_sam3(self):
+        found = {
+            "provider": "vllm",
+            "base_url": "http://127.0.0.1:8001/v1",
+            "models": ["Qwen/Qwen3-VL-8B-Thinking"],
+            "reachable": True,
+        }
+        with self._clear_llm_env({"AGENT_LLM_PROVIDER": "vllm"}):
+            for k in ("AGENT_LLM_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+                os.environ.pop(k, None)
+            with mock.patch.object(agent, "discover_local_llm", return_value=found):
+                with mock.patch.object(agent, "probe_openai_compatible", return_value=found["models"]):
+                    cfg = agent.load_llm_config()
+        self.assertTrue(cfg.configured)
+        self.assertTrue(cfg.local)
+        self.assertEqual(cfg.provider, "vllm")
+        self.assertEqual(cfg.api_key, "DUMMY_API_KEY")
+        self.assertEqual(cfg.base_url, "http://127.0.0.1:8001/v1")
+        self.assertEqual(cfg.model, "Qwen/Qwen3-VL-8B-Thinking")
+
+    def test_ollama_autodetect(self):
+        found = {
+            "provider": "ollama",
+            "base_url": "http://127.0.0.1:11434/v1",
+            "models": ["llama3.2:latest", "qwen2.5vl:7b"],
+            "reachable": True,
+        }
+        with self._clear_llm_env():
+            with mock.patch.object(agent, "discover_local_llm", return_value=found):
+                cfg = agent.load_llm_config()
+        self.assertTrue(cfg.configured)
+        self.assertEqual(cfg.provider, "ollama")
+        self.assertEqual(cfg.model, "qwen2.5vl:7b")
+
+    def test_prefer_vision_model(self):
+        self.assertEqual(
+            agent._prefer_vision_model(["llama3.2", "qwen2.5vl:7b", "mistral"]),
+            "qwen2.5vl:7b",
+        )
+
+    def test_normalize_ollama_base(self):
+        self.assertEqual(
+            agent._normalize_openai_base("http://127.0.0.1:11434", "ollama"),
+            "http://127.0.0.1:11434/v1",
+        )
 
 
 class TestSyntheticVideoFixture(unittest.TestCase):

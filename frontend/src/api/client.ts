@@ -607,6 +607,9 @@ export interface AgentLlmStatus {
   model: string
   base_url: string | null
   missing_reason: string
+  reachable?: boolean
+  local?: boolean
+  available_models?: string[]
   running?: boolean
   run_id?: string | null
 }

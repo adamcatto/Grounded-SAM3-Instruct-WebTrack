@@ -519,19 +519,20 @@ export default function ConfigPanel() {
           <div className="py-3">
             <p className="text-sm text-[#ddd] font-medium">LLM backend</p>
             <p className="text-xs text-[#666] mt-0.5 leading-relaxed">
-              The Agent pane uses a vision-capable chat model to inspect frames, run SAM3 text
-              prompts, place point prompts, and start tracking. Configure via environment variables
-              on the backend: <span className="font-mono text-[#888]">AGENT_LLM_API_KEY</span> (or
-              OPENAI_API_KEY / ANTHROPIC_API_KEY), optional{' '}
-              <span className="font-mono text-[#888]">AGENT_LLM_PROVIDER</span>,{' '}
-              <span className="font-mono text-[#888]">AGENT_LLM_MODEL</span>,{' '}
-              <span className="font-mono text-[#888]">AGENT_LLM_BASE_URL</span>.
+              Same pattern as SAM 3 Agent: a vision model served locally over an OpenAI-compatible
+              API. The backend auto-detects <span className="font-mono text-[#888]">Ollama</span> on
+              :11434 or <span className="font-mono text-[#888]">vLLM</span> on :8001 (dummy API key).
+              Optional env: <span className="font-mono text-[#888]">AGENT_LLM_PROVIDER</span>
+              (ollama|vllm), <span className="font-mono text-[#888]">AGENT_LLM_MODEL</span>,{' '}
+              <span className="font-mono text-[#888]">AGENT_LLM_BASE_URL</span>. Cloud keys are a
+              fallback, not required.
             </p>
-            <p className="text-xs mt-2 text-[#999]">
+            <p className="text-xs mt-2 text-[#999] whitespace-pre-wrap">
               {agentInfo == null
                 ? 'Checking…'
                 : agentInfo.configured
-                  ? `Ready · ${agentInfo.provider} · ${agentInfo.model}`
+                  ? `Ready · ${agentInfo.local ? 'local' : 'cloud'} · ${agentInfo.provider} · ${agentInfo.model}`
+                    + (agentInfo.base_url ? `\n${agentInfo.base_url}` : '')
                   : agentInfo.missing_reason}
             </p>
           </div>
