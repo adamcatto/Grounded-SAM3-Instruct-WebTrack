@@ -21,7 +21,7 @@ const REPORT = join(REPO, 'reports', 'agent-e2e-a100-shared')
 const SHOTS = join(REPORT, 'screenshots')
 const ARTIFACTS = '/opt/cursor/artifacts/screenshots'
 
-const PROMPT = 'There are two dark blob looking mice, one with a small lighter shave on its head, the other with no shave. Segment them.'
+const PROMPT = 'Segment the two dark mice.'
 
 let objHead = SANDBOX.objA
 let objNo = SANDBOX.objB
@@ -259,7 +259,13 @@ test('agent inspect + segment two mice from the UI', async ({ page }) => {
   }
   expect(ev.masked_object_count ?? 0, 'both mice must have masks').toBeGreaterThanOrEqual(2)
   expect(ev.incomplete, 'evaluate_segmentation still incomplete').toBeFalsy()
-  const byId: Record<string, { bbox_xywh_norm?: number[]; ok?: boolean; reason?: string }> = {}
+  const byId: Record<string, {
+    bbox_xywh_norm?: number[]
+    ok?: boolean
+    reason?: string
+    dark_iou_left?: number
+    dark_iou_right?: number
+  }> = {}
   for (const row of ev.objects || []) {
     if (row.object_id) byId[String(row.object_id)] = row
   }
@@ -271,15 +277,25 @@ test('agent inspect + segment two mice from the UI', async ({ page }) => {
   expect(ns?.reason || '', 'NoShave mask split').not.toMatch(/split_components/)
   const hscx = bboxCenterX(hs?.bbox_xywh_norm)
   const nscx = bboxCenterX(ns?.bbox_xywh_norm)
-  expect(nscx, `NoShave should be the left mouse, cx=${nscx}`).toBeLessThan(0.50)
-  expect(hscx, `HeadShave should be the far-right mouse, cx=${hscx}`).toBeGreaterThan(0.70)
+  expect(nscx, `NoShave should be the left mouse, cx=${nscx}`).toBeLessThan(0.45)
+  expect(hscx, `HeadShave should be the right-of-center mouse, cx=${hscx}`).toBeGreaterThan(0.55)
+  expect(hscx, `HeadShave must not be the water-bottle port, cx=${hscx}`).toBeLessThan(0.74)
+  expect(Number(hs?.dark_iou_right ?? 0), `HeadShave dark-blob IoU ${hs?.dark_iou_right}`).toBeGreaterThan(0.20)
+  expect(Number(ns?.dark_iou_left ?? 0), `NoShave dark-blob IoU ${ns?.dark_iou_left}`).toBeGreaterThan(0.20)
 })
 
 function lastEvaluateResult(dumpDir: string, frameIdx?: number): {
   frame_idx?: number
   masked_object_count?: number
   incomplete?: boolean
-  objects?: Array<{ object_id?: string; bbox_xywh_norm?: number[]; ok?: boolean; reason?: string }>
+  objects?: Array<{
+    object_id?: string
+    bbox_xywh_norm?: number[]
+    ok?: boolean
+    reason?: string
+    dark_iou_left?: number
+    dark_iou_right?: number
+  }>
 } | null {
   const p = join(dumpDir, 'context.json')
   if (!existsSync(p)) return null

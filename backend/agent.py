@@ -30,6 +30,16 @@ MAX_HISTORY_TURNS = 16
 INSPECT_MAX_EDGE = 640
 DEFAULT_NEARBY_OFFSET = 20
 CONFIDENCE_RETRY_THRESHOLD = 0.45
+# Home-cage red-light layout on frame 160 (and similar): mice are the two
+# darkest interior blobs (~cx 0.32 left, ~cx 0.66 right). The circular
+# water-bottle port sits on the far-right wall (~cx 0.76+). Empty bedding
+# is the gap between the animals, not the right-hand mouse.
+WATER_PORT_MIN_CX = 0.74
+BEDDING_GAP_CX = (0.42, 0.56)
+RIGHT_ANIMAL_MIN_CX = 0.55
+DARK_LUM_THR = 50
+DARK_MIN_AREA = 2000
+DARK_MATCH_IOU = 0.20
 # Inspect JPEGs stay in the chat until pruned. Keep the last two so the model can
 # compare the current frame with the previous one without blowing the context.
 KEEP_INSPECT_IMAGES = 2
@@ -477,6 +487,50 @@ def _count_large_mask_components(binary, min_frac: float = 0.12) -> int:
     return sum(1 for i in range(1, n) if int(stats[i, cv2.CC_STAT_AREA]) >= thresh)
 
 
+def _mask_iou(a, b) -> float:
+    aa = np.squeeze(np.asarray(a)).astype(bool)
+    bb = np.squeeze(np.asarray(b)).astype(bool)
+    if aa.ndim != 2 or bb.ndim != 2 or aa.shape != bb.shape:
+        return 0.0
+    inter = int(np.logical_and(aa, bb).sum())
+    union = int(np.logical_or(aa, bb).sum())
+    return float(inter / union) if union else 0.0
+
+
+def dark_animal_blobs(frame_path, lum_thr: float = DARK_LUM_THR, min_area: int = DARK_MIN_AREA) -> list[dict]:
+    """Two (or more) dark interior connected components — the mice, not the cage wall."""
+    try:
+        from PIL import Image
+        import cv2
+    except Exception:
+        return []
+    try:
+        arr = np.asarray(Image.open(frame_path).convert("RGB"))
+    except Exception:
+        return []
+    h, w = arr.shape[:2]
+    lum = (0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2]).astype(np.float32)
+    yy, xx = np.mgrid[0:h, 0:w]
+    inset = (xx > 0.12 * w) & (xx < 0.92 * w) & (yy > 0.18 * h) & (yy < 0.88 * h)
+    binary = ((lum < lum_thr) & inset).astype(np.uint8)
+    n, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    blobs: list[dict] = []
+    for i in range(1, n):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if area < min_area:
+            continue
+        blobs.append({
+            "mask": labels == i,
+            "cx": float(centroids[i, 0]) / w,
+            "cy": float(centroids[i, 1]) / h,
+            "area": area,
+        })
+    blobs.sort(key=lambda b: -b["area"])
+    blobs = blobs[:4]
+    blobs.sort(key=lambda b: b["cx"])
+    return blobs
+
+
 def evaluate_mask_quality(
     mask,
     score: Optional[float] = None,
@@ -625,9 +679,17 @@ def _pick_detection(detections: list[dict], text: str, obj: Optional[dict]) -> d
     side = _prefer_side_from_text_and_object(text, obj)
     ranked = sorted(detections, key=lambda d: _bbox_center_xy(d)[0])
     if side == "left":
-        return ranked[0]
+        leftish = [d for d in ranked if _bbox_center_xy(d)[0] < RIGHT_ANIMAL_MIN_CX]
+        return (leftish or ranked)[0]
     if side == "right":
-        return ranked[-1]
+        on_mouse = [
+            d for d in ranked
+            if RIGHT_ANIMAL_MIN_CX <= _bbox_center_xy(d)[0] < WATER_PORT_MIN_CX
+        ]
+        if on_mouse:
+            return on_mouse[-1]
+        not_port = [d for d in ranked if _bbox_center_xy(d)[0] < WATER_PORT_MIN_CX]
+        return (not_port or ranked)[-1]
     return detections[0]
 
 
@@ -700,10 +762,15 @@ def finalize_segmentation_eval(objects: dict, per_obj: list[dict]) -> dict:
                 for p in (a, b):
                     _append_eval_reason(p, extra)
     if expected >= 2:
+        gap_lo, gap_hi = BEDDING_GAP_CX
         for p in with_bbox:
             cx = _row_center_x(p)
-            if cx is not None and 0.50 <= cx <= 0.70:
+            if cx is None:
+                continue
+            if gap_lo <= cx <= gap_hi:
                 _append_eval_reason(p, "likely_bedding")
+            if cx >= WATER_PORT_MIN_CX:
+                _append_eval_reason(p, "likely_water_port")
         named = []
         for p in with_bbox:
             side = _prefer_side_from_text_and_object("", {"name": p.get("name") or ""})
@@ -1057,19 +1124,20 @@ SYSTEM_PROMPT = """You are the SAM3 Web Tracker agent. You annotate and track ob
 3. For each planned frame:
    a. goto_frame then inspect_frame so you can see animals, occlusion, blur, and identity cues.
    b. create_object once per identity (reuse existing objects with the same name).
-   c. text_segment once per identity with a phrase that includes count/side/shave-state (e.g. "unshaved mouse on the left" vs "shaved mouse on the right near the water port"). Reuse existing object ids.
+   c. Prefer text_segment with a simple visual phrase like "dark mouse" once per identity (reuse HeadShave / NoShave ids). SAM3 often returns both dark animals; pick the left detection for NoShave and the right-of-center detection for HeadShave.
    d. evaluate_segmentation. If confidence is low, the frame is empty, identities are swapped, or animals overlap badly: think, then try nearby frames (±20, then ±40) via plan_frames(around_frame=..., nearby_offset=20). If the result is incomplete / missing_mask, stay on this frame and segment the remaining animals.
-   e. If text segmentation is weak but you can see the animal, add_point_prompt at a chest/back point (positive=1). Use a negative point (0) on the *other* animal if they touch — never on the same animal's tail.
+   e. If text segmentation is weak but you can see the animal, add_point_prompt at a chest/back point (positive=1) on the dark blob itself. Use a negative point (0) on the *other* animal if they touch — never on the same animal's tail.
    f. commit_anchor when the frame is a planned grid/anchor frame and the masks look right.
 4. Adapt. Do not blindly march the grid if a frame is unusable. Skip to a clearer neighbor, then continue the plan.
 5. After the requested frames are labeled, start_propagation if the user wants tracking. Do not start it for a single-frame-only request.
 
 ## Text vs points
-- Prefer text_segment when the description is visually distinctive (shaved patch, color, size).
+- Prefer text_segment when the animals are the darkest blobs in the cage. A short prompt ("dark mouse") is enough — do not invent coordinates.
 - Prefer inspect_frame + add_point_prompt when animals look similar, are overlapping, or text confidence is low.
-- Inspect the frame before clicking. Choose points from what you see in the JPEG — do not invent coordinates from the user's words, and do not write pixel locations into the user-facing reply.
-- If the user says there are N mice/animals, that count is ground truth. Reuse existing objects with matching names (HeadShave / NoShave, etc.) instead of creating extras. Call text_segment or add_point_prompt once per identity. Do not finish until evaluate_segmentation reports ok=true, masked_object_count >= N, and no missing_mask / identity_swap / likely_bedding. One mask is a failure.
-- If evaluate_segmentation returns incomplete, missing_mask, identity_swap, or likely_bedding, stay on this frame and re-click. Do not jump to a nearby frame unless the current frame is empty or unusable. Bedding blobs and water-bottle ports are not mice. In top-down red-light home cages the shaved mouse is usually the dark blob by the water bottle; the unshaved mouse is the other dark blob.
+- Inspect the frame before clicking. Choose points from the dark animal bodies you see in the JPEG — do not invent coordinates from the user's words, and do not write pixel locations into the user-facing reply.
+- If the user says there are N mice/animals, that count is ground truth. Reuse existing objects with matching names (HeadShave / NoShave, etc.) instead of creating extras. Call text_segment or add_point_prompt once per identity. Do not finish until evaluate_segmentation reports ok=true, masked_object_count >= N, and no missing_mask / identity_swap / likely_bedding / likely_water_port / not_on_animal. One mask is a failure.
+- If evaluate_segmentation returns incomplete, missing_mask, identity_swap, likely_bedding, likely_water_port, or not_on_animal, stay on this frame and re-click the dark blob. Do not jump to a nearby frame unless the current frame is empty or unusable.
+- In top-down red-light home cages the two mice are dark blobs on the bedding: unshaved on the left, shaved to the right of center. The circular water-bottle port on the far-right WALL is not a mouse — never click it. Empty bedding is the gap between the two animals, not the right-hand mouse.
 - When using add_point_prompt, place a new positive point on that animal's torso from the inspect JPEG. Do not copy another object's point list.
 - One animal = one connected mask that includes head, body, and tail. Never put a negative click on the same mouse's tail (that splits body and tail into two blobs). If evaluate_segmentation reports split_components, add another positive point on the missing part (usually the tail), do not create a new object.
 
@@ -1364,29 +1432,28 @@ def _text_segment_impl(session: AgentSession, vid: str, frame_idx: int, text: st
     picked_side = _prefer_side_from_text_and_object(text, obj)
     picked_xy = _bbox_center_xy(best)
     quality = evaluate_mask_quality(best["mask"], score=best.get("score"))
-    far_right_miss = bool(
-        picked_side == "right"
-        and picked_xy[0] < 0.70
-    )
     suggestion = None
-    if far_right_miss:
+    cx = picked_xy[0]
+    if picked_side == "right" and cx >= WATER_PORT_MIN_CX:
         quality = {
             **quality,
             "ok": False,
             "reason": (
-                "detection_not_on_far_right"
+                "likely_water_port"
                 if quality.get("reason") in (None, "", "ok")
-                else f"{quality.get('reason')},detection_not_on_far_right"
+                else f"{quality.get('reason')},likely_water_port"
             ),
             "retry_nearby": False,
         }
         suggestion = (
-            "Text grounding's rightmost hit is still mid-cage (often empty bedding around x=0.60–0.67). "
-            "add_point_prompt on the far-right mouse torso from the inspect JPEG (about 0.80, 0.42)."
+            "That hit is the circular water-bottle port on the far-right wall, not a mouse. "
+            "text_segment again with 'dark mouse' or add_point_prompt on the dark blob "
+            "to the left of the port (right-of-center on the bedding)."
         )
 
+    bind_ok = obj is not None and suggestion is None
     bound = None
-    if obj is not None and not far_right_miss:
+    if bind_ok:
         points = sample_points_from_mask(best["mask"], n_total=8)
         if not points:
             return {**quality, "ok": False, "error": "empty_best_mask", "frame_idx": frame_idx}
@@ -1400,7 +1467,7 @@ def _text_segment_impl(session: AgentSession, vid: str, frame_idx: int, text: st
     extra = [_detection_summary(d) for d in detections]
 
     return {
-        "ok": quality["ok"],
+        "ok": quality["ok"] and suggestion is None,
         "method": method,
         "text": text,
         "frame_idx": frame_idx,
@@ -1412,7 +1479,7 @@ def _text_segment_impl(session: AgentSession, vid: str, frame_idx: int, text: st
         "detection_count": len(detections),
         "all_detections": extra,
         "seed_points": bool(bound and bound.get("masks")),
-        "masks": (bound or {}).get("masks") or ({str(obj["id"]): mask_b64} if obj and not far_right_miss else {"det": mask_b64}),
+        "masks": (bound or {}).get("masks") or ({str(obj["id"]): mask_b64} if bind_ok else {"det": mask_b64}),
         "retry_nearby": quality.get("retry_nearby"),
         "suggestion": suggestion,
     }
@@ -1632,12 +1699,17 @@ def _execute_tool_inner(name: str, args: dict, session: AgentSession) -> dict:
                 cx = (quality.get("bbox_xywh_norm") or [None])
                 cx = (cx[0] + cx[2] / 2.0) if len(cx) >= 4 else None
                 side = _prefer_side_from_text_and_object("", obj)
-                if side == "right" and cx is not None and cx < 0.70:
+                if side == "right" and cx is not None and cx >= WATER_PORT_MIN_CX:
                     warning = (
-                        "This click did not land on the far-side (shaved) mouse; "
-                        "x≈0.50–0.70 is often empty bedding. Re-inspect and click that mouse's torso."
+                        "This click landed on the circular water-bottle port (far-right wall), "
+                        "not the mouse. Click the dark blob on the bedding to the left of that port."
                     )
-                elif side == "left" and cx is not None and cx > 0.50:
+                elif side == "right" and cx is not None and cx < RIGHT_ANIMAL_MIN_CX:
+                    warning = (
+                        "This click did not land on the right-hand (shaved) mouse. "
+                        "Re-inspect and click that dark blob's torso."
+                    )
+                elif side == "left" and cx is not None and cx > 0.45:
                     warning = (
                         "This click did not land on the unshaved mouse. "
                         "Re-inspect and click that mouse's torso, not the other animal or bedding."
@@ -1682,6 +1754,32 @@ def _execute_tool_inner(name: str, args: dict, session: AgentSession) -> dict:
                 q["retry_nearby"] = True
                 q["reason"] = (q.get("reason") or "") + ",high_overlap"
             per_obj.append(q)
+        jpg = s.pm.annotated_frames_dir(session.pid, vid) / f"{fidx:06d}.jpg"
+        if not jpg.exists():
+            jpg = s.pm.frames_dir(session.pid, vid) / f"{fidx:06d}.jpg"
+        blobs = dark_animal_blobs(jpg) if jpg.exists() else []
+        if len(blobs) >= 2:
+            by_area = sorted(blobs, key=lambda b: -b["area"])[:2]
+            left_b, right_b = sorted(by_area, key=lambda b: b["cx"])
+            dense_by_id = {str(k): v for k, v in (dense or {}).items()}
+            for q in per_obj:
+                mask = dense_by_id.get(str(q.get("object_id")))
+                if mask is None:
+                    continue
+                i_l = _mask_iou(mask, left_b["mask"])
+                i_r = _mask_iou(mask, right_b["mask"])
+                q["dark_iou_left"] = round(i_l, 4)
+                q["dark_iou_right"] = round(i_r, 4)
+                best = max(i_l, i_r)
+                if best < DARK_MATCH_IOU:
+                    _append_eval_reason(q, "not_on_animal")
+                    continue
+                side = _prefer_side_from_text_and_object("", {"name": q.get("name") or ""})
+                matched_right = i_r > i_l
+                if side == "right" and not matched_right:
+                    _append_eval_reason(q, "identity_swap")
+                if side == "left" and matched_right:
+                    _append_eval_reason(q, "identity_swap")
         summary = finalize_segmentation_eval(objects, per_obj)
         return {
             "ok": summary["ok"],

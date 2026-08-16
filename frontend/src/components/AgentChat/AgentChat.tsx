@@ -22,7 +22,7 @@ interface TraceItem {
 }
 
 const EXAMPLES = [
-  'There are two dark blob looking mice, one with a small lighter shave on its head, the other with no shave. Segment them.',
+  'Segment the two dark mice.',
   'Every 1000th frame, segment each mouse with those names. If a frame is unclear, try about 20 frames away.',
   'Plan anchors for the current video, inspect the first one, and tell me what you see before segmenting.',
 ]

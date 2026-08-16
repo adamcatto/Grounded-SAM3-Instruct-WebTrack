@@ -71,9 +71,19 @@ class TestTwoMouseAssignment(unittest.TestCase):
         self.assertAlmostEqual(agent._bbox_center_xy(picked)[0], 0.3)
 
     def test_headshave_picks_rightmost(self):
-        dets = [self._det(0.8, 0.4), self._det(0.3, 0.99)]
+        dets = [self._det(0.66, 0.4), self._det(0.3, 0.99)]
         picked = agent._pick_detection(dets, "mouse", {"name": "HeadShave"})
-        self.assertAlmostEqual(agent._bbox_center_xy(picked)[0], 0.8)
+        self.assertAlmostEqual(agent._bbox_center_xy(picked)[0], 0.66)
+
+    def test_headshave_skips_water_port(self):
+        dets = [self._det(0.32), self._det(0.66, 0.8), self._det(0.80, 0.99)]
+        picked = agent._pick_detection(dets, "dark mouse", {"name": "HeadShave"})
+        self.assertAlmostEqual(agent._bbox_center_xy(picked)[0], 0.66)
+
+    def test_noshave_skips_right_mouse(self):
+        dets = [self._det(0.66, 0.99), self._det(0.32, 0.7)]
+        picked = agent._pick_detection(dets, "dark mouse", {"name": "NoShave"})
+        self.assertAlmostEqual(agent._bbox_center_xy(picked)[0], 0.32)
 
     def test_text_left_overrides_score(self):
         dets = [self._det(0.8, 0.99), self._det(0.25, 0.2)]
@@ -127,23 +137,40 @@ class TestTwoMouseAssignment(unittest.TestCase):
             "bbox_xywh_norm": [0.17, 0.42, 0.20, 0.28],
             "object_id": "1", "name": "HeadShave", "retry_nearby": False,
         }
-        bedding = {
-            "ok": True, "reason": "ok", "area_px": 29000,
-            "bbox_xywh_norm": [0.61, 0.36, 0.10, 0.22],
+        gap_bedding = {
+            "ok": True, "reason": "ok", "area_px": 8000,
+            "bbox_xywh_norm": [0.43, 0.40, 0.10, 0.16],
             "object_id": "2", "name": "NoShave", "retry_nearby": False,
         }
-        summary = agent.finalize_segmentation_eval(objects, [swapped_left, bedding])
+        summary = agent.finalize_segmentation_eval(objects, [swapped_left, gap_bedding])
         self.assertFalse(summary["ok"])
         self.assertFalse(summary["incomplete"])
         by_id = {p["object_id"]: p["reason"] for p in summary["objects"]}
         self.assertIn("identity_swap", by_id["1"])
         self.assertIn("likely_bedding", by_id["2"])
 
+    def test_evaluate_flags_water_port(self):
+        objects = {"1": {"name": "HeadShave"}, "2": {"name": "NoShave"}}
+        port = {
+            "ok": True, "reason": "ok", "area_px": 16000,
+            "bbox_xywh_norm": [0.73, 0.39, 0.10, 0.22],
+            "object_id": "1", "name": "HeadShave", "retry_nearby": False,
+        }
+        left = {
+            "ok": True, "reason": "ok", "area_px": 22000,
+            "bbox_xywh_norm": [0.17, 0.42, 0.20, 0.28],
+            "object_id": "2", "name": "NoShave", "retry_nearby": False,
+        }
+        summary = agent.finalize_segmentation_eval(objects, [port, left])
+        self.assertFalse(summary["ok"])
+        by_id = {p["object_id"]: p["reason"] for p in summary["objects"]}
+        self.assertIn("likely_water_port", by_id["1"])
+
     def test_evaluate_accepts_opposite_sides(self):
         objects = {"1": {"name": "HeadShave"}, "2": {"name": "NoShave"}}
         right = {
             "ok": True, "reason": "ok", "area_px": 26000,
-            "bbox_xywh_norm": [0.73, 0.39, 0.10, 0.22],
+            "bbox_xywh_norm": [0.61, 0.36, 0.10, 0.23],
             "object_id": "1", "name": "HeadShave", "retry_nearby": False,
         }
         left = {
