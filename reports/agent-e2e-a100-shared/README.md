@@ -8,16 +8,16 @@ Tool calls: 4
 
 ## Outcome
 
-Both mice were masked on frame 160 (`evaluate_segmentation` ok, `masked_object_count=2`):
+Sandbox video was **reset** before the run (no leftover prompts/masks). Agent inspected, then one positive click per object.
 
-| Object | Name | Mask bbox xywh (norm) | Center x |
-|---|---|---|---|
-| 2 | NoShave (left, unshaved) | `[0.179, 0.429, 0.198, 0.285]` | 0.278 |
-| 1 | HeadShave (far right, shaved) | `[0.737, 0.398, 0.046, 0.182]` | 0.760 |
+| Object | Name | Mask bbox xywh (norm) | Center x | Area px | reason |
+|---|---|---|---|---|---|
+| 2 | NoShave (left) | `[0.175, 0.428, 0.202, 0.289]` | 0.276 | 22836 | ok |
+| 1 | HeadShave (far right) | `[0.737, 0.398, 0.092, 0.214]` | 0.783 | 26728 | ok |
 
-The agent inspected, then `add_point_prompt` on object 2 at `(0.32, 0.50)` and object 1 at `(0.78, 0.50)`. A click on the water port (~0.80, 0.42) fills most of the cage; the torso click at 0.78 is on the right mouse.
+No `split_components`. Screenshot `02-project-open` is the blank canvas after reset. After the test the video is reset again (source + objects only).
 
-Context dump: `reports/agent-runs/20260816-162842/`
+Context dump: `reports/agent-runs/20260816-165553/`
 
 
 ## Screenshots
@@ -48,7 +48,7 @@ Context dump: `reports/agent-runs/20260816-162842/`
 
 ## Context trace
 
-Full dump: `/opt/software/Grounded-SAM3-Instruct-WebTrack/reports/agent-runs/20260816-162842`  ([context.md](../../reports/agent-runs/20260816-162842/context.md))
+Full dump: `/opt/software/Grounded-SAM3-Instruct-WebTrack/reports/agent-runs/20260816-165553`  ([context.md](../../reports/agent-runs/20260816-165553/context.md))
 
 Inspect JPEGs in final LLM context:
 
