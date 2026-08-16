@@ -44,18 +44,17 @@ async function screenshot(page: Page, name: string) {
 
 async function openSandbox(page: Page) {
   const jump = page.getByTitle('Jump to frame')
-  const onProject = page.locator('header').getByText(SANDBOX.projectName)
-  if (await onProject.isVisible().catch(() => false) && await jump.isVisible().catch(() => false)) {
-    return
-  }
   await page.getByTitle('Switch video / project').click()
   await page.getByRole('button', { name: SANDBOX.projectName }).click()
-  const vid = page.getByText(SANDBOX.videoName, { exact: true }).first()
-  await vid.waitFor({ timeout: 20_000 })
-  await vid.click({ force: true, timeout: 10_000 })
-  await page.getByText('Projects', { exact: true }).locator('xpath=..').getByRole('button').click().catch(async () => {
+  // Selecting a project auto-closes the drawer and picks an arbitrary video.
+  // Re-open and click the sandbox clip via DOM (the list is taller than the viewport).
+  await page.waitForTimeout(400)
+  const vidBtn = page.locator('button').filter({ hasText: SANDBOX.videoName }).first()
+  if (!(await vidBtn.isVisible().catch(() => false))) {
     await page.getByTitle('Switch video / project').click()
-  })
+  }
+  await vidBtn.waitFor({ state: 'attached', timeout: 20_000 })
+  await vidBtn.evaluate((el: HTMLElement) => el.click())
   await jump.waitFor({ timeout: 30_000 })
 }
 
