@@ -137,14 +137,16 @@ export function promptsUnchanged(
 }
 
 export async function waitForBackend(): Promise<void> {
-  for (let i = 0; i < 90; i++) {
+  const attempts = 90
+  const delayMs = 2000
+  for (let i = 0; i < attempts; i++) {
     try {
       const h = await apiJson<{ sam_loaded?: boolean }>('/health')
       if (h.sam_loaded) return
     } catch { /* retry */ }
-    await new Promise(r => setTimeout(r, 2000))
+    await new Promise(r => setTimeout(r, delayMs))
   }
-  throw new Error('Backend/SAM not ready after 120s')
+  throw new Error(`Backend/SAM not ready after ${(attempts * delayMs) / 1000}s`)
 }
 
 export async function getSandboxProject(): Promise<{

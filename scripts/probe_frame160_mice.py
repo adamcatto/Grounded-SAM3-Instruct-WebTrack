@@ -1,10 +1,23 @@
 #!/usr/bin/env python3
-"""Locate the two dark mice on sandbox frame 160 and probe SAM3 text vs points."""
+"""Locate the two dark mice on sandbox frame 160 and probe SAM3 text vs points.
+
+Environment overrides (all optional):
+
+  SAM3_API_URL           backend API root (default http://127.0.0.1:8000/api)
+  SAM3_PROBE_PID         project id
+  SAM3_PROBE_VID         video id
+  SAM3_PROBE_FRAME       frame index
+  SAM3_PROBE_HEAD_ID     HeadShave object id
+  SAM3_PROBE_NO_ID       NoShave object id
+  SAM3_PROBE_OUT         GT/report directory (default: <repo>/reports/agent-e2e-a100-shared/gt)
+  SAM3_PROBE_ARTIFACTS   extra screenshot directory (used when set, or if /opt/cursor/artifacts exists)
+"""
 from __future__ import annotations
 
 import base64
 import io
 import json
+import os
 import urllib.error
 import urllib.request
 from collections import deque
@@ -13,16 +26,38 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-API = "http://127.0.0.1:8000/api"
-PID = "9f8a7b6c"
-VID = "f09434ac"
-FRAME = 160
-HEAD = "1"
-NO = "2"
-OUT = Path("/opt/cursor/artifacts/screenshots")
-REPO = Path("/opt/software/Grounded-SAM3-Instruct-WebTrack/reports/agent-e2e-a100-shared/gt")
-OUT.mkdir(parents=True, exist_ok=True)
-REPO.mkdir(parents=True, exist_ok=True)
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _env_path(name: str, default: Path) -> Path:
+    return Path(os.environ.get(name, str(default)))
+
+
+def _mkdir(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _write_json(path: Path, payload) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+
+
+API = os.environ.get("SAM3_API_URL", "http://127.0.0.1:8000/api").rstrip("/")
+PID = os.environ.get("SAM3_PROBE_PID", "9f8a7b6c")
+VID = os.environ.get("SAM3_PROBE_VID", "f09434ac")
+FRAME = int(os.environ.get("SAM3_PROBE_FRAME", "160"))
+HEAD = os.environ.get("SAM3_PROBE_HEAD_ID", "1")
+NO = os.environ.get("SAM3_PROBE_NO_ID", "2")
+REPO = _mkdir(_env_path("SAM3_PROBE_OUT", REPO_ROOT / "reports" / "agent-e2e-a100-shared" / "gt"))
+_art_default = Path("/opt/cursor/artifacts/screenshots")
+if os.environ.get("SAM3_PROBE_ARTIFACTS"):
+    OUT = _mkdir(Path(os.environ["SAM3_PROBE_ARTIFACTS"]))
+elif _art_default.parent.exists():
+    OUT = _mkdir(_art_default)
+else:
+    OUT = REPO
 
 
 def api(method: str, path: str, body=None, timeout=180):
@@ -173,13 +208,12 @@ def build_gt(frame_path: Path):
     )
     overlay(img, {"left": left, "right": right}, {"left": (232, 164, 69), "right": (91, 141, 217)}, REPO / "gt-two-mice.png")
     np.savez_compressed(REPO / "gt_masks.npz", left=left.astype(np.uint8), right=right.astype(np.uint8))
-    json.dump(
+    _write_json(
+        REPO / "gt.json",
         {
             "left_noshave": {"cx": a["cx"], "cy": a["cy"], "area": a["area"]},
             "right_headshave": {"cx": b["cx"], "cy": b["cy"], "area": b["area"]},
         },
-        open(REPO / "gt.json", "w"),
-        indent=2,
     )
     return img, gt
 
@@ -326,8 +360,9 @@ def main():
         "points_torso": point_scores,
         "points_torso_neg": extra,
     }
-    json.dump(summary, open(OUT / "probe-summary.json", "w"), indent=2)
-    json.dump(summary, open(REPO / "probe-summary.json", "w"), indent=2)
+    _write_json(OUT / "probe-summary.json", summary)
+    if OUT.resolve() != REPO.resolve():
+        _write_json(REPO / "probe-summary.json", summary)
     print("\nSUMMARY")
     print(json.dumps(summary, indent=2))
 

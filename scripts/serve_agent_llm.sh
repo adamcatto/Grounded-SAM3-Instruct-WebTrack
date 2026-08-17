@@ -32,9 +32,18 @@ EXTRA=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --profile)
-      PROFILE="${2:-}"; shift 2 ;;
+      if [[ $# -lt 2 || -z "${2}" || "${2}" == --* ]]; then
+        echo "error: --profile requires a value (a100 | h100x4 | a100-shared | demo)" >&2
+        exit 1
+      fi
+      PROFILE="$2"; shift 2 ;;
     --profile=*)
-      PROFILE="${1#*=}"; shift ;;
+      PROFILE="${1#*=}"
+      if [[ -z "$PROFILE" ]]; then
+        echo "error: --profile requires a value (a100 | h100x4 | a100-shared | demo)" >&2
+        exit 1
+      fi
+      shift ;;
     --thinking)
       THINKING=1; shift ;;
     --)

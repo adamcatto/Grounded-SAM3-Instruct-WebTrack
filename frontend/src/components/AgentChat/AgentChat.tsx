@@ -104,8 +104,11 @@ async function hydrateSavedMasks(pid: string, videoId: string | undefined, frame
     if (s.currentVideoId !== videoId) return
     const live = s.currentFrameMasksFrame === frameIdx ? s.currentFrameMasks : {}
     const merged = { ...(s.savedMaskCache[frameIdx] ?? {}), ...live, ...masks }
-    s.setCurrentFrameMasks(merged, frameIdx)
     s.setSavedMask(frameIdx, merged)
+    const now = useStore.getState()
+    if (now.currentVideoId === videoId && now.currentFrame === frameIdx) {
+      now.setCurrentFrameMasks(merged, frameIdx)
+    }
   } catch { /* ignore */ }
 }
 
