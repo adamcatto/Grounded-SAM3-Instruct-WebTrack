@@ -621,6 +621,20 @@ def _invalidate_mask_cache(pid: str, vid: str) -> None:
         del _mask_encode_cache[k]
 
 
+def _drop_session_after_prompt_clear(pid: str, vid: str) -> None:
+    """Close the in-memory SAM session after point prompts were cleared.
+
+    Point prompts are replayed from config when a session is (re)initialized, so
+    an open session still holds the just-cleared prompts and would regenerate
+    masks. Closing it forces a clean rebuild from the updated config on next use.
+    """
+    try:
+        if sam.get_session_id(pid, vid) is not None:
+            sam.close_session(pid, vid)
+    except Exception as e:
+        logger.warning(f"Failed to drop SAM session after prompt clear: {e}")
+
+
 def _mask_storage_etag(pid: str, vid: str, fidx: int) -> str:
     """Stable ETag from on-disk mask storage revision (invalidates on edit)."""
     ms = VideoMaskStorage(pm.video_dir(pid, vid))
@@ -3503,11 +3517,18 @@ def delete_frame_masks(pid: str, vid: str, fidx: int):
     if had_bbox:
         deleted.append("bboxes")
 
+    # Clearing masks must also clear the point prompts that generated them.
+    try:
+        pm.clear_frame_prompts(pid, vid, fidx)
+    except Exception as e:
+        logger.warning(f"Point prompt clear failed for frame {fidx}: {e}")
+
     session_frames_cleared = 0
     try:
         session_frames_cleared = sam.clear_frame_masks_in_session(pid, vid, fidx, fidx)
     except Exception as e:
         logger.warning(f"SAM session mask clear failed for frame {fidx}: {e}")
+    _drop_session_after_prompt_clear(pid, vid)
 
     _invalidate_mask_cache(pid, vid)
     _refresh_scrub_manifest(pid, vid)
@@ -3556,6 +3577,15 @@ def bulk_delete_masks(
     else:
         raise HTTPException(422, f"Unknown mode: {mode}")
 
+    # Clearing masks must also clear the point prompts that generated them,
+    # otherwise the masks are regenerated from the surviving prompts.
+    prompt_from = from_frame if mode in ("from_frame", "range") else None
+    prompt_to = to_frame if mode in ("to_frame", "range") else None
+    try:
+        pm.clear_prompts_in_range(pid, vid, from_frame=prompt_from, to_frame=prompt_to)
+    except Exception as e:
+        logger.warning(f"Point prompt bulk clear failed: {e}")
+
     session_frames_cleared = 0
     try:
         ff = from_frame if mode in ("from_frame", "range") else -1
@@ -3565,6 +3595,7 @@ def bulk_delete_masks(
         session_frames_cleared = sam.clear_frame_masks_in_session(pid, vid, ff, tf)
     except Exception as e:
         logger.warning(f"SAM session bulk mask clear failed: {e}")
+    _drop_session_after_prompt_clear(pid, vid)
 
     _invalidate_mask_cache(pid, vid)
     video_dir = pm.video_dir(pid, vid)
@@ -4450,6 +4481,71 @@ def agent_last_dump():
     return get_last_agent_dump()
 
 
+class RLSampleRequest(BaseModel):
+    reward: Optional[float] = None
+    label: Optional[str] = None
+    notes: Optional[str] = None
+
+
+@app.get("/api/agent/rl_dataset/stats")
+def agent_rl_dataset_stats():
+    import rl_store
+    return rl_store.get_store().stats()
+
+
+@app.post("/api/projects/{pid}/agent/rl_sample")
+def save_agent_rl_sample(pid: str, req: RLSampleRequest):
+    """Persist the most recent agent run as an RL sample (trace + state + images)."""
+    import rl_store
+    from agent import get_last_agent_dump
+    if pm.get_project(pid) is None:
+        raise HTTPException(404, "Project not found")
+    dump = get_last_agent_dump()
+    context_json = (dump or {}).get("context_json")
+    if not context_json or not Path(context_json).is_file():
+        raise HTTPException(400, "No completed agent run to save yet. Run the agent first.")
+    try:
+        ctx = json.loads(Path(context_json).read_text())
+    except Exception as e:
+        raise HTTPException(500, f"Could not read agent context dump: {e}")
+
+    dump_dir = Path(ctx.get("dump_dir") or Path(context_json).parent)
+    images = []
+    for im in ctx.get("inspect_jpegs_seen") or []:
+        fname = im.get("file")
+        if not fname:
+            continue
+        images.append({
+            "file": fname,
+            "path": str(dump_dir / fname),
+            "frame_idx": im.get("frame_idx"),
+            "video_id": im.get("video_id"),
+            "in_final_llm_context": im.get("in_final_llm_context"),
+        })
+
+    overview = ctx.get("retrieved_project_json") or {}
+    sample = {
+        "project_id": pid,
+        "video_id": overview.get("current_video_id"),
+        "frame_idx": overview.get("current_frame"),
+        "provider": (ctx.get("llm") or {}).get("provider"),
+        "model": (ctx.get("llm") or {}).get("model"),
+        "system_prompt": ctx.get("system_prompt"),
+        "user_text": ctx.get("user_text"),
+        "state_json": overview,
+        "trace_json": ctx.get("events") or [],
+        "messages_json": ctx.get("messages") or [],
+        "images_json": images,
+        "dump_dir": str(dump_dir),
+        "reward": req.reward,
+        "label": req.label,
+        "notes": req.notes,
+    }
+    store = rl_store.get_store()
+    sample_id = store.insert_sample(sample)
+    return {"id": sample_id, "count": store.count(), "db_path": str(store.db_path), "images": len(images)}
+
+
 @app.get("/api/projects/{pid}/agent/status")
 def project_agent_status(pid: str):
     from agent import get_agent_run_state, llm_status_dict
@@ -4520,3 +4616,42 @@ async def agent_run(pid: str, req: AgentRunRequest):
         ping=15,
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+class AgentSystemPromptRequest(BaseModel):
+    # None or "" resets the project back to the built-in default prompt.
+    prompt: Optional[str] = None
+
+
+@app.get("/api/agent/system_prompt/templates")
+def agent_system_prompt_templates():
+    """Built-in, read-only system-prompt starting points."""
+    from agent import SYSTEM_PROMPT_TEMPLATES, DEFAULT_TEMPLATE_ID
+    return {"default_template_id": DEFAULT_TEMPLATE_ID, "templates": SYSTEM_PROMPT_TEMPLATES}
+
+
+@app.get("/api/projects/{pid}/agent/system_prompt")
+def get_agent_system_prompt(pid: str):
+    """Return the project's editable agent system prompt and whether it's been set.
+
+    `context` is the user-editable text only; the always-on project metadata and
+    the model's own default prompt are hidden and composed in at run time.
+    """
+    project = pm.get_project(pid)
+    if project is None:
+        raise HTTPException(404, "Project not found")
+    is_set = "agent_system_prompt" in project
+    return {
+        "context": (project.get("agent_system_prompt") or "") if is_set else "",
+        "is_set": is_set,
+    }
+
+
+@app.put("/api/projects/{pid}/agent/system_prompt")
+def set_agent_system_prompt(pid: str, req: AgentSystemPromptRequest):
+    """Set (or blank) the project's editable agent system prompt."""
+    if pm.get_project(pid) is None:
+        raise HTTPException(404, "Project not found")
+    value = (req.prompt or "").strip()
+    pm.update_project(pid, {"agent_system_prompt": value})
+    return {"context": value, "is_set": True}

@@ -760,6 +760,37 @@ class ProjectManager:
         if changed:
             self._save_config(pid, config)
 
+    def clear_prompts_in_range(
+        self, pid: str, vid: str,
+        from_frame: Optional[int] = None,
+        to_frame: Optional[int] = None,
+    ) -> bool:
+        """Remove point prompts for all objects on frames in [from_frame, to_frame]
+        (both inclusive, None = unbounded). Object entries left empty are dropped.
+        Returns True if anything changed."""
+        config = self.get_project(pid)
+        if config is None or vid not in config["videos"]:
+            raise ValueError(f"Video {vid} not found")
+        prompts = config["videos"][vid].get("point_prompts", {})
+        lo = from_frame if from_frame is not None else -(10 ** 18)
+        hi = to_frame if to_frame is not None else 10 ** 18
+        changed = False
+        for obj_id in list(prompts.keys()):
+            frame_map = prompts[obj_id]
+            for frame_key in list(frame_map.keys()):
+                try:
+                    fi = int(frame_key)
+                except (TypeError, ValueError):
+                    continue
+                if lo <= fi <= hi:
+                    del frame_map[frame_key]
+                    changed = True
+            if not frame_map:
+                del prompts[obj_id]
+        if changed:
+            self._save_config(pid, config)
+        return changed
+
     def get_all_point_prompts(self, pid: str, vid: str) -> dict:
         """Return {obj_id: {frame_idx: {points, labels}}}"""
         video = self.get_video(pid, vid)

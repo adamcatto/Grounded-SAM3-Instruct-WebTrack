@@ -25,7 +25,10 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-MAX_AGENT_STEPS = 36
+# A long anchor-labeling request can require several tool turns per frame.  Keep
+# this configurable, but do not silently stop a normal every-N-frames job after
+# a handful of anchors.
+MAX_AGENT_STEPS = max(36, int(os.environ.get("AGENT_MAX_STEPS", "144")))
 MAX_HISTORY_TURNS = 16
 INSPECT_MAX_EDGE = 640
 DEFAULT_NEARBY_OFFSET = 20
@@ -43,8 +46,21 @@ DARK_MATCH_IOU = 0.20
 # Inspect JPEGs stay in the chat until pruned. Keep the last two so the model can
 # compare the current frame with the previous one without blowing the context.
 KEEP_INSPECT_IMAGES = 2
-# Tool calls are short; 4096 reserved tokens would eat half of an 8k window.
-AGENT_MAX_TOKENS = 2048
+# Qwen3 Thinking uses the completion budget for its hidden reasoning *and* the
+# tool call.  At 2048 it can exhaust the entire response before producing any
+# visible content/tool call, which used to be reported as a successful "Done".
+# The server defaults to a 64k context.  Give Thinking models enough room to
+# reason through a long multi-anchor request before emitting their first tool
+# call; deployment can still lower/raise this with AGENT_MAX_TOKENS.
+AGENT_MAX_TOKENS = max(512, int(os.environ.get("AGENT_MAX_TOKENS", "32768")))
+
+TEXT_SEGMENTATION_POLICY = """## Current agent execution policy (mandatory)
+- Use text-based concept segmentation only. Do not call add_point_prompt or invent click coordinates.
+- A text segmentation persists the concept-grounded mask directly; it does not create point prompts.
+- For requests to segment every N frames, call segment_text_interval once. Do not loop over frames with separate LLM turns.
+- For anchor labeling, call set_start_frame if needed, then call anchor_frame_labeling_loop once. Do not label anchor frames one at a time.
+- Use text_segment for a one-frame request. Evaluate results when useful, but do not try point-based repairs.
+- Direct text masks are annotation-only for now; do not start propagation unless a future workflow explicitly provides tracker seeds."""
 
 
 # ─── LLM configuration (local Ollama / vLLM first, same idea as SAM 3 Agent) ──
@@ -965,6 +981,21 @@ TOOL_SCHEMAS: list[dict] = [
         },
     },
     {
+        "name": "set_start_frame",
+        "description": (
+            "Set the video's start frame for anchor-frame labeling. This recomputes "
+            "the anchor grid from that frame using the video's configured anchor interval."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "start_frame": {"type": "integer", "description": "0-indexed first anchor frame"},
+                "video_id": {"type": "string"},
+            },
+            "required": ["start_frame"],
+        },
+    },
+    {
         "name": "create_object",
         "description": "Create a tracked object with a stable id, display name, and text description.",
         "parameters": {
@@ -1019,35 +1050,50 @@ TOOL_SCHEMAS: list[dict] = [
         },
     },
     {
-        "name": "add_point_prompt",
+        "name": "segment_text_interval",
         "description": (
-            "Add positive/negative point prompts for an object on a frame (same as a "
-            "user click). Coordinates are normalized [0,1]. Use after inspect_frame "
-            "when you can see where to click, or to refine a text mask."
+            "Native batch operation for a regular frame grid. Use this whenever the user "
+            "asks to segment one text-described object every N frames. It performs "
+            "goto_frame → text_segment → evaluate_segmentation for every planned frame "
+            "inside one tool call, including the final video frame if requested. It never "
+            "uses point prompts and does not start propagation."
         ),
         "parameters": {
             "type": "object",
             "properties": {
+                "text": {"type": "string", "description": "Text concept to segment, e.g. 'dark mouse'"},
+                "start_frame": {"type": "integer"},
+                "interval": {"type": "integer", "description": "Frame spacing; must be positive"},
                 "object_id": {"type": "string"},
-                "frame_idx": {"type": "integer"},
-                "points": {
-                    "type": "array",
-                    "items": {
-                        "type": "array",
-                        "items": {"type": "number"},
-                        "minItems": 2,
-                        "maxItems": 2,
-                    },
-                    "description": "[[x, y], ...] normalized 0-1",
-                },
-                "labels": {
-                    "type": "array",
-                    "items": {"type": "integer"},
-                    "description": "1 = positive, 0 = negative; same length as points",
-                },
+                "object_name": {"type": "string", "description": "Existing/new display name if object_id is omitted"},
                 "video_id": {"type": "string"},
+                "include_last": {"type": "boolean", "default": True},
+                "evaluate": {"type": "boolean", "default": True},
+                "min_score": {"type": "number", "default": 0.0},
             },
-            "required": ["object_id", "points", "labels"],
+            "required": ["text", "start_frame", "interval"],
+        },
+    },
+    {
+        "name": "anchor_frame_labeling_loop",
+        "description": (
+            "Native anchor-labeling batch operation. It uses the video's configured "
+            "start_frame and anchor interval, then for each anchor performs "
+            "goto_frame → text_segment → evaluate_segmentation → commit_anchor. "
+            "Use this after set_start_frame when the user asks to label anchor frames. "
+            "It uses text segmentation only and never creates point prompts."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "Text concept to segment at every anchor"},
+                "object_id": {"type": "string"},
+                "object_name": {"type": "string", "description": "Existing/new display name if object_id is omitted"},
+                "video_id": {"type": "string"},
+                "evaluate": {"type": "boolean", "default": True},
+                "min_score": {"type": "number", "default": 0.0},
+            },
+            "required": ["text"],
         },
     },
     {
@@ -1150,6 +1196,190 @@ SYSTEM_PROMPT = """You are the SAM3 Web Tracker agent. You annotate and track ob
 """
 
 
+# ─── System-prompt templates ──────────────────────────────────────────────────
+# The default (SYSTEM_PROMPT above) is tuned for red-light home-cage two-mouse
+# videos. That specialization is wrong for other footage, so the user can pick a
+# template and edit it. Templates are read-only starting points; the chosen /
+# edited text is persisted per project in config as `agent_system_prompt`.
+
+_CORE_WORKFLOW = """## What you know
+- The project may contain many videos. Use get_project_overview if unsure which video you are on, how many exist, or their names.
+- Each video has a frame count, fps, start_frame, objects (id, name, description), saved point prompts, and optional propagation state.
+- Frames are 0-indexed. Call goto_frame / inspect_frame so the backend extracts the frame before SAM can run.
+- Object ids are strings ("1", "2", …); names are display labels. Create them with create_object and keep using the returned id.
+- SAM3 tracker mode stores point prompts. text_segment finds a mask, converts it to points, and persists them so tracking/propagation behaves normally.
+- Propagation needs at least one point prompt. After labeling the planned frames, call start_propagation only if the user asked to track.
+
+## How to work
+1. Orient: get_project_overview (and get_video_details for the active video).
+2. Plan: if the user says "every Nth frame", call plan_frames (typical interval 1000 or the video's anchor_batch_size).
+3. For each planned frame:
+   a. goto_frame then inspect_frame so you can see the subjects, occlusion, blur, and identity cues.
+   b. create_object once per identity (reuse existing objects with the same name).
+   c. Prefer text_segment with a short visual phrase per subject; otherwise inspect_frame + add_point_prompt on the subject's body.
+   d. evaluate_segmentation. If confidence is low or the frame is unusable, think, then try nearby frames via plan_frames(around_frame=..., nearby_offset=20).
+   e. commit_anchor when a planned grid/anchor frame looks right.
+4. Adapt. Do not blindly march the grid if a frame is unusable — skip to a clearer neighbor, then continue.
+5. After the requested frames are labeled, start_propagation only if the user wants tracking. Do not start it for a single-frame-only request.
+
+## Text vs points
+- Prefer text_segment when the subject is visually distinctive with a short phrase. Do not invent coordinates from words.
+- Prefer inspect_frame + add_point_prompt when subjects look similar, overlap, or text confidence is low. Choose points from what you see in the JPEG.
+- If the user states there are N subjects, that count is ground truth. Label once per identity; do not finish until evaluate_segmentation reports ok=true and masked_object_count >= N.
+- One subject = one connected mask. If evaluate_segmentation reports split_components, add a positive point on the missing part; do not create a new object.
+
+## Style
+- Call think before multi-step plans and after failures.
+- Keep user-facing messages short; put detail in think / tool results.
+- Do not reset or delete the user's existing objects unless they ask.
+- Stay on the video the user specified; if they said "this video" use the current one.
+- If the tracking mode is pose_tracking, say you only handle segmentation/tracking objects here.
+"""
+
+_TWO_ANIMALS_PROMPT = (
+    "You are the SAM3 Web Tracker agent. You annotate and track objects in videos by calling tools. "
+    "The user watches a live chat of your reasoning while the canvas updates.\n\n"
+    "This project contains two distinct animals — one object per animal identity. Reuse the same two "
+    "object ids across every frame; never create extra objects. Use a negative point on the *other* "
+    "animal only when the two touch, never on the same animal's own body or tail.\n\n"
+    + _CORE_WORKFLOW
+)
+
+_SINGLE_ANIMAL_PROMPT = (
+    "You are the SAM3 Web Tracker agent. You annotate and track objects in videos by calling tools. "
+    "The user watches a live chat of your reasoning while the canvas updates.\n\n"
+    "This project has a single subject/animal. Use one object id across all frames. Do not create a "
+    "second object unless the user explicitly asks.\n\n"
+    + _CORE_WORKFLOW
+)
+
+_DARK_SUBJECTS_PROMPT = (
+    "You are the SAM3 Web Tracker agent. You annotate and track objects in videos by calling tools. "
+    "The user watches a live chat of your reasoning while the canvas updates.\n\n"
+    "The subjects are the darkest blobs against a lighter background. Prefer text_segment with a short "
+    "phrase like 'dark <subject>'. Place positive points on the dark body; use negative points on other "
+    "dark blobs only when they touch the target. Ignore dark fixtures on walls/edges that are not subjects.\n\n"
+    + _CORE_WORKFLOW
+)
+
+_MRI_TISSUE_PROMPT = (
+    "You are the SAM3 Web Tracker agent, segmenting medical imaging frames (e.g., MRI/CT slices) by "
+    "calling tools. Make no animal or behavior assumptions.\n\n"
+    "Segment the resected tissue / cavity region the user describes. Treat each distinct region as one "
+    "object. Prefer inspect_frame + add_point_prompt on the region interior, with negative points on "
+    "adjacent healthy tissue to tighten the boundary; use text_segment only when a clear phrase applies. "
+    "Propagate across slices/frames only if the user asks.\n\n"
+    + _CORE_WORKFLOW
+)
+
+_BLANK_PROMPT = (
+    "You are the SAM3 Web Tracker agent. You annotate and track objects in videos by calling tools; the "
+    "user watches your reasoning and the canvas updates live.\n\n"
+    "Follow the user's instructions. Useful tools: get_project_overview, get_video_details, goto_frame, "
+    "inspect_frame, create_object, text_segment, add_point_prompt, evaluate_segmentation, plan_frames, "
+    "commit_anchor, start_propagation. Frames are 0-indexed; object ids are strings. Segment only what the "
+    "user asks and start propagation only when they request tracking."
+)
+
+DEFAULT_TEMPLATE_ID = "home_cage_two_mice"
+
+SYSTEM_PROMPT_TEMPLATES: list[dict] = [
+    {
+        "id": "home_cage_two_mice",
+        "name": "Home-cage: two dark mice",
+        "description": "Top-down red-light home cage with two dark mice (shaved vs unshaved). The current default.",
+        "content": SYSTEM_PROMPT,
+    },
+    {
+        "id": "two_animals",
+        "name": "Two animals (generic)",
+        "description": "Two distinct animals, one object per identity. No cage/lighting assumptions.",
+        "content": _TWO_ANIMALS_PROMPT,
+    },
+    {
+        "id": "single_animal",
+        "name": "Single animal",
+        "description": "One subject tracked across the whole video.",
+        "content": _SINGLE_ANIMAL_PROMPT,
+    },
+    {
+        "id": "dark_subjects",
+        "name": "Dark subjects on light background",
+        "description": "Subjects are the darkest blobs; favor text_segment 'dark <subject>'.",
+        "content": _DARK_SUBJECTS_PROMPT,
+    },
+    {
+        "id": "mri_resected_tissue",
+        "name": "MRI / resected tissue",
+        "description": "Medical imaging: segment resected tissue / cavity regions, no animal language.",
+        "content": _MRI_TISSUE_PROMPT,
+    },
+    {
+        "id": "blank",
+        "name": "Blank (start from scratch)",
+        "description": "Minimal generic prompt to write your own instructions.",
+        "content": _BLANK_PROMPT,
+    },
+]
+
+
+def resolve_system_prompt(project: Optional[dict]) -> str:
+    """Resolve the agent system prompt for a project.
+
+    - Never configured (key absent): fall back to the built-in default so legacy
+      projects keep working.
+    - Configured (even to an empty string via the "Custom (blank)" option): use
+      the stored text verbatim. An empty result means no system message is sent,
+      leaving only the model's own hidden default in effect.
+    """
+    if not project or "agent_system_prompt" not in project:
+        return SYSTEM_PROMPT
+    return (project.get("agent_system_prompt") or "").strip()
+
+
+def build_video_metadata_block(project: Optional[dict]) -> str:
+    """Concise, always-on project/video metadata for the system prompt.
+
+    Hidden from the user-facing editor. Gives the agent video names and basic
+    properties (frame count, fps, resolution, objects) so it does not need to
+    inspect frame contents just to know what videos exist.
+    """
+    if not project:
+        return ""
+    videos = project.get("videos") or {}
+    lines = [
+        "## Project metadata (authoritative — do not re-derive by inspecting frames)",
+        (
+            f"Project: {project.get('name')!r} (id={project.get('id')}) · "
+            f"tracking_mode={project.get('tracking_mode') or 'segmentation_tracking'} · "
+            f"{len(videos)} video(s)"
+        ),
+    ]
+    if not videos:
+        lines.append("- (no videos yet)")
+    for vid, v in videos.items():
+        name = v.get("name") or vid
+        num_frames = v.get("num_frames")
+        fps = v.get("fps")
+        width, height = v.get("width"), v.get("height")
+        parts: list[str] = [f"{num_frames} frames" if num_frames is not None else "? frames"]
+        if fps:
+            parts.append(f"{fps} fps")
+            try:
+                if num_frames:
+                    parts.append(f"{num_frames / float(fps):.1f}s")
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
+        if width and height:
+            parts.append(f"{width}x{height}")
+        parts.append(f"start_frame={v.get('start_frame', 0)}")
+        parts.append(f"{len(v.get('objects') or {})} object(s)")
+        if v.get("propagation_complete"):
+            parts.append("propagated")
+        lines.append(f"- {name} [id={vid}]: " + ", ".join(parts))
+    return "\n".join(lines)
+
+
 # ─── Run state ────────────────────────────────────────────────────────────────
 
 
@@ -1161,6 +1391,9 @@ class AgentSession:
     cancel: threading.Event = field(default_factory=threading.Event)
     pending_images: list[dict] = field(default_factory=list)
     ui_events: list[dict] = field(default_factory=list)
+    # Set only while a native batch tool is running.  It streams child tool
+    # traces/UI events instead of buffering them until the batch completes.
+    progress: Optional[Callable[[str, dict], None]] = None
 
     def emit_ui(self, action: str, **payload: Any) -> dict:
         ev = {"action": action, **payload}
@@ -1243,6 +1476,42 @@ def _ensure_frame(session: AgentSession, vid: str, frame_idx: int) -> dict:
     session.frame_idx = fidx
     session.emit_ui("goto_frame", video_id=vid, frame_idx=fidx)
     return {"video_id": vid, "frame_idx": fidx, "num_frames": video.get("num_frames")}
+
+
+def _flush_native_ui(session: AgentSession) -> None:
+    """Immediately forward UI mutations created inside a native batch tool."""
+    if session.progress is None:
+        return
+    for ui in session.ui_events:
+        session.progress("ui", ui)
+    session.ui_events.clear()
+
+
+def _run_native_phase(
+    session: AgentSession,
+    *,
+    phase_id: str,
+    name: str,
+    arguments: dict,
+    action: Callable[[], dict],
+) -> dict:
+    """Run and visibly trace one child operation of a native batch tool."""
+    if session.cancel.is_set():
+        raise InterruptedError("Cancelled")
+    if session.progress is not None:
+        session.progress("tool_call", {"id": phase_id, "name": name, "arguments": arguments})
+    t0 = time.time()
+    result = action()
+    _flush_native_ui(session)
+    if session.progress is not None:
+        session.progress("tool_result", {
+            "id": phase_id,
+            "name": name,
+            "ok": bool(result.get("ok", True)),
+            "result": {k: v for k, v in result.items() if k != "masks"},
+            "elapsed_ms": int((time.time() - t0) * 1000),
+        })
+    return result
 
 
 def _encode_inspect_jpeg(path: str) -> str:
@@ -1350,12 +1619,16 @@ def _detections_from_sam_outputs(frame_outputs: dict) -> list[dict]:
     return dets
 
 
-def _text_segment_impl(session: AgentSession, vid: str, frame_idx: int, text: str, object_id: Optional[str], object_name: Optional[str], min_score: float) -> dict:
+def _text_segment_impl(
+    session: AgentSession, vid: str, frame_idx: int, text: str,
+    object_id: Optional[str], object_name: Optional[str], min_score: float,
+    *, ensure_frame: bool = True,
+) -> dict:
     s = _srv()
-    from sam_predictor import sample_points_from_mask
     from video_processor import encode_mask_as_png
 
-    _ensure_frame(session, vid, frame_idx)
+    if ensure_frame:
+        _ensure_frame(session, vid, frame_idx)
     obj = None
     if object_id or object_name:
         obj = _find_or_create_object(session, vid, object_id, object_name, description=text)
@@ -1452,13 +1725,27 @@ def _text_segment_impl(session: AgentSession, vid: str, frame_idx: int, text: st
         )
 
     bind_ok = obj is not None and suggestion is None
-    bound = None
+    persisted_masks: dict[str, str] = {}
     if bind_ok:
-        points = sample_points_from_mask(best["mask"], n_total=8)
-        if not points:
-            return {**quality, "ok": False, "error": "empty_best_mask", "frame_idx": frame_idx}
-        labels = [1] * len(points)
-        bound = _apply_points(session, vid, str(obj["id"]), frame_idx, points, labels)
+        # Persist the concept-grounded mask directly.  Do not sample/replay point
+        # prompts: synthetic points made the agent over-eager and can produce a
+        # materially different mask than the text segmentation that selected it.
+        try:
+            s._persist_predicted_anchor_frame(
+                session.pid,
+                vid,
+                frame_idx,
+                {s._to_sam_obj_id_from_npz_key(str(obj["id"])): np.squeeze(best["mask"]).astype(np.uint8)},
+                objects,
+            )
+            persisted_masks = s._get_encoded_masks(session.pid, vid, frame_idx, objects)
+            session.emit_ui("goto_frame", video_id=vid, frame_idx=frame_idx)
+            session.emit_ui("select_object", object_id=str(obj["id"]), video_id=vid)
+            session.emit_ui("set_masks", video_id=vid, frame_idx=frame_idx, masks=persisted_masks)
+            session.emit_ui("refresh_project")
+        except Exception as e:
+            logger.exception("Could not persist text-segmented mask")
+            return {**quality, "ok": False, "error": f"persist_text_mask_failed: {e}", "frame_idx": frame_idx}
         color = obj.get("color") or "#5B8DD9"
     else:
         color = (obj or {}).get("color") or "#5B8DD9"
@@ -1478,10 +1765,173 @@ def _text_segment_impl(session: AgentSession, vid: str, frame_idx: int, text: st
         "picked_center_xy": [round(picked_xy[0], 4), round(picked_xy[1], 4)],
         "detection_count": len(detections),
         "all_detections": extra,
-        "seed_points": bool(bound and bound.get("masks")),
-        "masks": (bound or {}).get("masks") or ({str(obj["id"]): mask_b64} if bind_ok else {"det": mask_b64}),
+        "seed_points": False,
+        "masks": persisted_masks or ({str(obj["id"]): mask_b64} if bind_ok else {"det": mask_b64}),
         "retry_nearby": quality.get("retry_nearby"),
         "suggestion": suggestion,
+    }
+
+
+def _segment_text_interval_impl(
+    session: AgentSession,
+    vid: str,
+    *,
+    text: str,
+    start_frame: int,
+    interval: int,
+    object_id: Optional[str],
+    object_name: Optional[str],
+    include_last: bool,
+    evaluate: bool,
+    min_score: float,
+) -> dict:
+    """Text-segment a regular grid without requiring an LLM turn per frame."""
+    s = _srv()
+    video = s.pm.get_video(session.pid, vid)
+    if video is None:
+        raise ValueError(f"Video {vid} not found")
+    if interval <= 0:
+        raise ValueError("interval must be positive")
+    if not object_id and not object_name:
+        raise ValueError("Provide object_id or object_name so the text masks can be saved")
+
+    frames = plan_sample_frames(start_frame, int(video.get("num_frames") or 0), interval, include_last)
+    results: list[dict] = []
+    saved_object_id = object_id
+    for frame_idx in frames:
+        prefix = f"interval-{frame_idx}"
+        _run_native_phase(
+            session, phase_id=f"{prefix}-goto", name="goto_frame",
+            arguments={"video_id": vid, "frame_idx": frame_idx},
+            action=lambda f=frame_idx: {"ok": True, **_ensure_frame(session, vid, f)},
+        )
+        segment = _run_native_phase(
+            session, phase_id=f"{prefix}-text", name="text_segment",
+            arguments={"video_id": vid, "frame_idx": frame_idx, "text": text, "object_id": saved_object_id, "object_name": object_name},
+            action=lambda f=frame_idx: _text_segment_impl(
+                session, vid, f, text, saved_object_id, object_name, min_score, ensure_frame=False,
+            ),
+        )
+        if segment.get("object"):
+            saved_object_id = str(segment["object"].get("id") or saved_object_id or "")
+        evaluation = None
+        if evaluate and segment.get("ok"):
+            evaluation = _run_native_phase(
+                session, phase_id=f"{prefix}-evaluate", name="evaluate_segmentation",
+                arguments={"video_id": vid, "frame_idx": frame_idx},
+                action=lambda f=frame_idx: _execute_tool_inner(
+                    "evaluate_segmentation", {"video_id": vid, "frame_idx": f}, session,
+                ),
+            )
+        results.append({
+            "frame_idx": frame_idx,
+            "ok": bool(segment.get("ok")) and (evaluation is None or bool(evaluation.get("ok"))),
+            "segment_ok": bool(segment.get("ok")),
+            "evaluation_ok": evaluation.get("ok") if evaluation is not None else None,
+            "reason": ((segment.get("quality") or {}).get("reason") or segment.get("error") or
+                       ((evaluation or {}).get("note")) or "ok"),
+            "method": segment.get("method"),
+        })
+
+    succeeded = sum(1 for item in results if item["ok"])
+    return {
+        "ok": succeeded == len(results),
+        "video_id": vid,
+        "object_id": saved_object_id,
+        "text": text,
+        "start_frame": frames[0] if frames else None,
+        "interval": interval,
+        "frames_processed": len(results),
+        "frames_succeeded": succeeded,
+        "frames_failed": len(results) - succeeded,
+        "results": results,
+        "note": "Text masks were persisted directly; no point prompts were created.",
+    }
+
+
+def _anchor_frame_labeling_loop_impl(
+    session: AgentSession,
+    vid: str,
+    *,
+    text: str,
+    object_id: Optional[str],
+    object_name: Optional[str],
+    evaluate: bool,
+    min_score: float,
+) -> dict:
+    """Text-label and commit every configured anchor without LLM turns between frames."""
+    s = _srv()
+    from anchor_helpers import compute_anchor_frames, video_anchor_batch_size
+
+    video = s.pm.get_video(session.pid, vid)
+    if video is None:
+        raise ValueError(f"Video {vid} not found")
+    if not object_id and not object_name:
+        raise ValueError("Provide object_id or object_name so the text masks can be saved")
+    start = int(video.get("start_frame") or 0)
+    interval = video_anchor_batch_size(video)
+    anchors = compute_anchor_frames(start, int(video.get("num_frames") or 0), interval)
+    results: list[dict] = []
+    saved_object_id = object_id
+
+    for anchor_index, frame_idx in enumerate(anchors):
+        prefix = f"anchor-{anchor_index}-{frame_idx}"
+        _run_native_phase(
+            session, phase_id=f"{prefix}-goto", name="goto_frame",
+            arguments={"video_id": vid, "frame_idx": frame_idx},
+            action=lambda f=frame_idx: {"ok": True, **_ensure_frame(session, vid, f)},
+        )
+        segment = _run_native_phase(
+            session, phase_id=f"{prefix}-text", name="text_segment",
+            arguments={"video_id": vid, "frame_idx": frame_idx, "text": text, "object_id": saved_object_id, "object_name": object_name},
+            action=lambda f=frame_idx: _text_segment_impl(
+                session, vid, f, text, saved_object_id, object_name, min_score, ensure_frame=False,
+            ),
+        )
+        if segment.get("object"):
+            saved_object_id = str(segment["object"].get("id") or saved_object_id or "")
+        evaluation = None
+        if evaluate and segment.get("ok"):
+            evaluation = _run_native_phase(
+                session, phase_id=f"{prefix}-evaluate", name="evaluate_segmentation",
+                arguments={"video_id": vid, "frame_idx": frame_idx},
+                action=lambda f=frame_idx: _execute_tool_inner(
+                    "evaluate_segmentation", {"video_id": vid, "frame_idx": f}, session,
+                ),
+            )
+        accepted = bool(segment.get("ok")) and (evaluation is None or bool(evaluation.get("ok")))
+        if accepted:
+            _run_native_phase(
+                session, phase_id=f"{prefix}-commit", name="commit_anchor",
+                arguments={"video_id": vid, "frame_idx": frame_idx, "anchor_index": anchor_index},
+                action=lambda f=frame_idx, idx=anchor_index: _execute_tool_inner(
+                    "commit_anchor", {"video_id": vid, "frame_idx": f, "anchor_index": idx}, session,
+                ),
+            )
+        results.append({
+            "frame_idx": frame_idx,
+            "anchor_index": anchor_index,
+            "ok": accepted,
+            "committed": accepted,
+            "segment_ok": bool(segment.get("ok")),
+            "evaluation_ok": evaluation.get("ok") if evaluation is not None else None,
+            "reason": ((segment.get("quality") or {}).get("reason") or segment.get("error") or
+                       ((evaluation or {}).get("note")) or "ok"),
+        })
+
+    succeeded = sum(1 for item in results if item["ok"])
+    return {
+        "ok": succeeded == len(results),
+        "video_id": vid,
+        "object_id": saved_object_id,
+        "text": text,
+        "start_frame": start,
+        "anchor_interval": interval,
+        "anchor_count": len(results),
+        "anchors_committed": succeeded,
+        "anchors_failed": len(results) - succeeded,
+        "results": results,
+        "note": "Successful anchor masks were committed directly; no point prompts were created.",
     }
 
 
@@ -1637,6 +2087,34 @@ def _execute_tool_inner(name: str, args: dict, session: AgentSession) -> dict:
             "nearby_frames": nearby,
         }
 
+    if name == "set_start_frame":
+        vid, video = _resolve_video(session, args.get("video_id"))
+        n = int(video.get("num_frames") or 0)
+        if n <= 0:
+            raise ValueError("Cannot set an anchor start frame on an empty video")
+        start = int(args["start_frame"])
+        if not 0 <= start < n:
+            raise ValueError(f"start_frame must be between 0 and {n - 1}")
+        updated = s.pm.update_video(session.pid, vid, {
+            "start_frame": start,
+            "anchor_labeling_complete": False,
+        })
+        batch = video_anchor_batch_size(updated)
+        anchors = compute_anchor_frames(start, n, batch)
+        session.video_id = vid
+        session.frame_idx = start
+        session.emit_ui("goto_frame", video_id=vid, frame_idx=start)
+        session.emit_ui("set_anchor_phase", video_id=vid, frames=anchors, current_index=0)
+        session.emit_ui("refresh_project")
+        return {
+            "ok": True,
+            "video_id": vid,
+            "start_frame": start,
+            "anchor_interval": batch,
+            "anchor_frames": anchors,
+            "anchor_count": len(anchors),
+        }
+
     if name == "create_object":
         vid, _video = _resolve_video(session, args.get("video_id"))
         existing = (_srv().pm.get_video(session.pid, vid) or {}).get("objects") or {}
@@ -1677,53 +2155,38 @@ def _execute_tool_inner(name: str, args: dict, session: AgentSession) -> dict:
             min_score=float(args.get("min_score") or 0.0),
         )
 
+    if name == "segment_text_interval":
+        vid, _video = _resolve_video(session, args.get("video_id"))
+        return _segment_text_interval_impl(
+            session,
+            vid,
+            text=str(args.get("text") or ""),
+            start_frame=int(args["start_frame"]),
+            interval=int(args["interval"]),
+            object_id=args.get("object_id"),
+            object_name=args.get("object_name"),
+            include_last=bool(args.get("include_last", True)),
+            evaluate=bool(args.get("evaluate", True)),
+            min_score=float(args.get("min_score") or 0.0),
+        )
+
+    if name == "anchor_frame_labeling_loop":
+        vid, _video = _resolve_video(session, args.get("video_id"))
+        return _anchor_frame_labeling_loop_impl(
+            session,
+            vid,
+            text=str(args.get("text") or ""),
+            object_id=args.get("object_id"),
+            object_name=args.get("object_name"),
+            evaluate=bool(args.get("evaluate", True)),
+            min_score=float(args.get("min_score") or 0.0),
+        )
+
     if name == "add_point_prompt":
-        vid, video = _resolve_video(session, args.get("video_id"))
-        fidx = int(args["frame_idx"]) if args.get("frame_idx") is not None else session.frame_idx
-        _ensure_frame(session, vid, fidx)
-        points = args.get("points") or []
-        labels = args.get("labels") or []
-        if len(points) != len(labels) or not points:
-            raise ValueError("points and labels must be non-empty and the same length")
-        oid = str(args["object_id"])
-        result = _apply_points(session, vid, oid, fidx, points, labels)
-        obj = (video.get("objects") or {}).get(oid) or {}
-        warning = None
-        quality = None
-        try:
-            ms = VideoMaskStorage(s.pm.video_dir(session.pid, vid))
-            dense = ms.load_masks_dense(fidx) if hasattr(ms, "load_masks_dense") else {}
-            mask = (dense or {}).get(oid) or (dense or {}).get(int(oid) if oid.isdigit() else oid)
-            if mask is not None:
-                quality = evaluate_mask_quality(mask)
-                cx = (quality.get("bbox_xywh_norm") or [None])
-                cx = (cx[0] + cx[2] / 2.0) if len(cx) >= 4 else None
-                side = _prefer_side_from_text_and_object("", obj)
-                if side == "right" and cx is not None and cx >= WATER_PORT_MIN_CX:
-                    warning = (
-                        "This click landed on the circular water-bottle port (far-right wall), "
-                        "not the mouse. Click the dark blob on the bedding to the left of that port."
-                    )
-                elif side == "right" and cx is not None and cx < RIGHT_ANIMAL_MIN_CX:
-                    warning = (
-                        "This click did not land on the right-hand (shaved) mouse. "
-                        "Re-inspect and click that dark blob's torso."
-                    )
-                elif side == "left" and cx is not None and cx > 0.45:
-                    warning = (
-                        "This click did not land on the unshaved mouse. "
-                        "Re-inspect and click that mouse's torso, not the other animal or bedding."
-                    )
-        except Exception:
-            pass
-        return {
-            "ok": warning is None,
-            "frame_idx": fidx,
-            "object_id": oid,
-            "mask_ids": list((result.get("masks") or {}).keys()),
-            "quality": quality,
-            "warning": warning,
-        }
+        raise ValueError(
+            "Point prompts are disabled for the agent. Use text_segment or "
+            "segment_text_interval instead."
+        )
 
     if name == "evaluate_segmentation":
         vid, video = _resolve_video(session, args.get("video_id"))
@@ -1895,11 +2358,33 @@ def _http_json(method: str, url: str, headers: dict, payload: dict, timeout: flo
             return json.loads(resp.read().decode())
 
 
-def call_llm(cfg: LLMConfig, messages: list[dict]) -> dict:
-    """One chat turn. Returns {content, tool_calls: [{id, name, arguments}]}."""
+def call_llm(cfg: LLMConfig, messages: list[dict], on_delta: Optional[Callable[[str, str], None]] = None) -> dict:
+    """One chat turn. Returns {content, tool_calls: [{id, name, arguments}], usage}.
+
+    If on_delta is given (OpenAI-compatible / vLLM only), the response is streamed
+    and on_delta(kind, text) is called for each token chunk, where kind is
+    "reasoning" or "content".
+    """
     if cfg.provider == "anthropic":
         return _call_anthropic(cfg, messages)
-    return _call_openai(cfg, messages)
+    return _call_openai(cfg, messages, on_delta=on_delta)
+
+
+def probe_max_context(cfg: LLMConfig) -> Optional[int]:
+    """Best-effort model context window (tokens) from an OpenAI-compatible /models."""
+    if cfg.provider == "anthropic":
+        return None
+    base = _normalize_openai_base(cfg.base_url or "", cfg.provider)
+    payload = _http_get_json(base + "/models", timeout=1.5)
+    for item in (payload or {}).get("data") or []:
+        if isinstance(item, dict):
+            ml = item.get("max_model_len") or item.get("max_context_length")
+            if ml:
+                try:
+                    return int(ml)
+                except (TypeError, ValueError):
+                    pass
+    return None
 
 
 def _message_image_parts_openai(images: list[dict]) -> list[dict]:
@@ -1913,7 +2398,7 @@ def _message_image_parts_openai(images: list[dict]) -> list[dict]:
     ]
 
 
-def _call_openai(cfg: LLMConfig, messages: list[dict]) -> dict:
+def _call_openai(cfg: LLMConfig, messages: list[dict], on_delta: Optional[Callable[[str, str], None]] = None) -> dict:
     url = (cfg.base_url or "https://api.openai.com/v1").rstrip("/") + "/chat/completions"
     oai_messages = []
     for m in messages:
@@ -1964,6 +2449,12 @@ def _call_openai(cfg: LLMConfig, messages: list[dict]) -> dict:
         payload["max_completion_tokens"] = AGENT_MAX_TOKENS
     headers = {"Authorization": f"Bearer {cfg.api_key or LOCAL_DUMMY_KEY}"}
     timeout = 300.0 if cfg.local else 120.0
+
+    if on_delta is not None:
+        payload["stream"] = True
+        payload["stream_options"] = {"include_usage": True}
+        return _call_openai_stream(url, headers, payload, timeout, on_delta)
+
     data = _http_json("POST", url, headers, payload, timeout=timeout)
     choice = (data.get("choices") or [{}])[0]
     msg = choice.get("message") or {}
@@ -1980,7 +2471,88 @@ def _call_openai(cfg: LLMConfig, messages: list[dict]) -> dict:
     reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
     if reasoning and reasoning not in content:
         content = f"{reasoning}\n{content}".strip()
-    return {"content": content, "tool_calls": tool_calls}
+    return {
+        "content": content,
+        "tool_calls": tool_calls,
+        "usage": data.get("usage"),
+        "finish_reason": choice.get("finish_reason"),
+    }
+
+
+def _call_openai_stream(
+    url: str, headers: dict, payload: dict, timeout: float,
+    on_delta: Callable[[str, str], None],
+) -> dict:
+    """Stream an OpenAI-compatible chat completion, invoking on_delta per chunk."""
+    import httpx
+
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    tool_by_index: dict[int, dict] = {}
+    usage: Optional[dict] = None
+    finish_reason: Optional[str] = None
+
+    with httpx.Client(timeout=timeout) as client:
+        with client.stream("POST", url, headers=headers, json=payload) as resp:
+            resp.raise_for_status()
+            for raw in resp.iter_lines():
+                if not raw:
+                    continue
+                line = raw[6:] if raw.startswith("data: ") else raw
+                line = line.strip()
+                if not line or line == "[DONE]":
+                    continue
+                try:
+                    chunk = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if chunk.get("usage"):
+                    usage = chunk["usage"]
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                if choices[0].get("finish_reason"):
+                    finish_reason = choices[0]["finish_reason"]
+                delta = choices[0].get("delta") or {}
+                rc = delta.get("reasoning_content")
+                if rc:
+                    reasoning_parts.append(rc)
+                    on_delta("reasoning", rc)
+                c = delta.get("content")
+                if c:
+                    content_parts.append(c)
+                    on_delta("content", c)
+                for tc in delta.get("tool_calls") or []:
+                    idx = tc.get("index", 0)
+                    slot = tool_by_index.setdefault(idx, {"id": None, "name": None, "args": ""})
+                    if tc.get("id"):
+                        slot["id"] = tc["id"]
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        slot["name"] = fn["name"]
+                    if fn.get("arguments"):
+                        slot["args"] += fn["arguments"]
+
+    content = "".join(content_parts)
+    reasoning = "".join(reasoning_parts)
+    if reasoning and reasoning not in content:
+        content = f"{reasoning}\n{content}".strip()
+    tool_calls = []
+    for idx in sorted(tool_by_index):
+        slot = tool_by_index[idx]
+        if not slot["name"]:
+            continue
+        try:
+            parsed = json.loads(slot["args"] or "{}")
+        except json.JSONDecodeError:
+            parsed = {}
+        tool_calls.append({"id": slot["id"] or str(uuid.uuid4()), "name": slot["name"], "arguments": parsed})
+    return {
+        "content": content,
+        "tool_calls": tool_calls,
+        "usage": usage,
+        "finish_reason": finish_reason,
+    }
 
 
 def _call_anthropic(cfg: LLMConfig, messages: list[dict]) -> dict:
@@ -2072,8 +2644,18 @@ def build_initial_messages(
     user_text: str,
     overview: dict,
     history: list[dict],
+    system_prompt: str = SYSTEM_PROMPT,
+    metadata_block: str = "",
 ) -> list[dict]:
-    msgs: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    # Effective system message = user-editable prompt + always-on hidden metadata.
+    system_content = (system_prompt or "").strip()
+    system_parts = [system_content, TEXT_SEGMENTATION_POLICY]
+    if metadata_block:
+        system_parts.append(metadata_block)
+    system_content = "\n\n".join(part for part in system_parts if part).strip()
+    msgs: list[dict] = []
+    if system_content:
+        msgs.append({"role": "system", "content": system_content})
     for turn in (history or [])[-MAX_HISTORY_TURNS:]:
         role = turn.get("role")
         content = (turn.get("content") or "").strip()
@@ -2360,6 +2942,9 @@ def run_agent_sync(
         return
 
     overview = project_overview(project, session.video_id, session.frame_idx)
+    system_prompt = resolve_system_prompt(project)
+    metadata_block = build_video_metadata_block(project)
+    max_context = probe_max_context(cfg)
     emit("status", {
         "phase": "started",
         "provider": cfg.provider,
@@ -2368,9 +2953,10 @@ def run_agent_sync(
         "frame_idx": session.frame_idx,
         "project_name": overview.get("project_name"),
         "video_count": overview.get("video_count"),
+        "max_context": max_context,
     })
 
-    messages = build_initial_messages(user_text, overview, history)
+    messages = build_initial_messages(user_text, overview, history, system_prompt, metadata_block)
     pending_images: list[dict] = []
     recorded_events: list[dict] = [{"event": "status", "data": {
         "phase": "started",
@@ -2383,6 +2969,7 @@ def run_agent_sync(
     }}]
     llm_turns: list[dict] = []
     inspect_images: list[dict] = []
+    empty_length_retries = 0
 
     def emit_and_record(event: str, payload: dict) -> None:
         recorded_events.append({"event": event, "data": payload})
@@ -2393,7 +2980,7 @@ def run_agent_sync(
             dump_dir = default_agent_dump_dir()
             summary = write_agent_context_dump(
                 dump_dir,
-                system_prompt=SYSTEM_PROMPT,
+                system_prompt=system_prompt,
                 overview=overview,
                 user_text=user_text,
                 messages=messages,
@@ -2425,13 +3012,29 @@ def run_agent_sync(
             "inspect_jpegs_in_context": inspect_jpegs_in_messages(messages),
         })
         emit_and_record("status", {"phase": "thinking", "step": step + 1, "max_steps": MAX_AGENT_STEPS})
+
+        _cur_step = step + 1
+
+        def on_delta(kind: str, text: str) -> None:
+            # Unrecorded live tokens (kept out of the context dump).
+            emit("token", {"kind": kind, "text": text, "step": _cur_step})
+
         try:
-            llm = call_llm(cfg, messages)
+            llm = call_llm(cfg, messages, on_delta=on_delta)
         except Exception as e:
             logger.exception("LLM call failed")
             emit_and_record("error", {"message": f"LLM request failed: {e}"})
             flush_dump()
             return
+        usage = llm.get("usage") or {}
+        if usage:
+            emit_and_record("usage", {
+                "prompt_tokens": usage.get("prompt_tokens"),
+                "completion_tokens": usage.get("completion_tokens"),
+                "total_tokens": usage.get("total_tokens"),
+                "max_context": max_context,
+                "step": _cur_step,
+            })
         content = (llm.get("content") or "").strip()
         tool_calls = [tc for tc in (llm.get("tool_calls") or []) if tc.get("name")]
         if content:
@@ -2439,6 +3042,42 @@ def run_agent_sync(
             emit_and_record(kind, {"text": content, "step": step + 1})
 
         if not tool_calls:
+            # Thinking models may spend all completion tokens before emitting
+            # the first tool call.  This is an interrupted response, not task
+            # completion.  Give it one explicit continuation instead of
+            # falsely showing "Done." with zero canvas changes.
+            finish_reason = str(llm.get("finish_reason") or "").lower()
+            completion_tokens = usage.get("completion_tokens")
+            try:
+                hit_token_limit = int(completion_tokens) >= AGENT_MAX_TOKENS
+            except (TypeError, ValueError):
+                hit_token_limit = False
+            truncated = finish_reason in {"length", "max_tokens"} or hit_token_limit
+            if truncated and empty_length_retries < 1:
+                empty_length_retries += 1
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Your previous response reached its token limit before making an action. "
+                        "Continue the user's request now by calling the required tools. "
+                        "Do not declare completion until the requested canvas changes are made."
+                    ),
+                })
+                emit_and_record("status", {
+                    "phase": "retrying_truncated_response",
+                    "step": step + 1,
+                    "finish_reason": finish_reason or "token_budget_exhausted",
+                })
+                continue
+            if truncated:
+                emit_and_record("error", {
+                    "message": (
+                        "The model reached its completion limit before making any tool call; "
+                        "no segmentation was applied. Increase AGENT_MAX_TOKENS or use an Instruct model."
+                    )
+                })
+                flush_dump()
+                return
             if content:
                 emit_and_record("done", {"text": content, "steps": step + 1})
             else:
@@ -2471,7 +3110,13 @@ def run_agent_sync(
                 emit_and_record("reasoning", {"text": targs.get("thought") or "", "step": step + 1})
 
             t0 = time.time()
-            result, ui_events = execute_tool(tname, targs, session)
+            # Native batch tools use this callback to stream their child
+            # goto/text/evaluate/commit work as it happens.
+            session.progress = lambda event, payload: emit_and_record(event, payload)
+            try:
+                result, ui_events = execute_tool(tname, targs, session)
+            finally:
+                session.progress = None
             dt = int((time.time() - t0) * 1000)
             for ui in ui_events:
                 emit_and_record("ui", ui)

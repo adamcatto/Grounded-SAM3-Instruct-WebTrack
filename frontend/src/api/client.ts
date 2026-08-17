@@ -628,6 +628,42 @@ export const getAgentStatus = (pid?: string) =>
 export const cancelAgentRun = (pid: string) =>
   api.post<{ status: string; cancelled: boolean }>(`/projects/${pid}/agent/cancel`).then(r => r.data)
 
+export interface AgentPromptTemplate {
+  id: string
+  name: string
+  description: string
+  content: string
+}
+
+export const getAgentPromptTemplates = () =>
+  api
+    .get<{ default_template_id: string; templates: AgentPromptTemplate[] }>('/agent/system_prompt/templates')
+    .then(r => r.data)
+
+export interface AgentSystemPromptState {
+  context: string
+  is_set: boolean
+}
+
+export const getAgentSystemPrompt = (pid: string) =>
+  api.get<AgentSystemPromptState>(`/projects/${pid}/agent/system_prompt`).then(r => r.data)
+
+export interface RLSampleResult {
+  id: number
+  count: number
+  db_path: string
+  images: number
+}
+
+export const saveAgentRlSample = (
+  pid: string,
+  body: { reward?: number | null; label?: string | null; notes?: string | null } = {},
+) =>
+  api.post<RLSampleResult>(`/projects/${pid}/agent/rl_sample`, body).then(r => r.data)
+
+export const setAgentSystemPrompt = (pid: string, prompt: string) =>
+  api.put<AgentSystemPromptState>(`/projects/${pid}/agent/system_prompt`, { prompt }).then(r => r.data)
+
 export interface AgentRunBody {
   message: string
   video_id?: string | null

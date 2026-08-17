@@ -254,13 +254,16 @@ class TestToolSurface(unittest.TestCase):
             "goto_frame",
             "inspect_frame",
             "plan_frames",
+            "set_start_frame",
             "create_object",
             "text_segment",
-            "add_point_prompt",
+            "segment_text_interval",
+            "anchor_frame_labeling_loop",
             "evaluate_segmentation",
             "start_propagation",
         ):
             self.assertIn(required, names)
+        self.assertNotIn("add_point_prompt", names)
 
     def test_system_prompt_covers_workflow(self):
         p = agent.SYSTEM_PROMPT.lower()
@@ -482,8 +485,9 @@ class TestContextPruning(unittest.TestCase):
         last = agent.get_last_agent_dump()
         self.assertEqual(last["dump_dir"], str(dump))
 
-    def test_agent_max_tokens_is_below_8k_window(self):
-        self.assertLessEqual(agent.AGENT_MAX_TOKENS, 2048)
+    def test_agent_token_budget_allows_thinking_model_tool_calls(self):
+        # Thinking tokens and the first function call share this budget.
+        self.assertGreaterEqual(agent.AGENT_MAX_TOKENS, 512)
         self.assertEqual(agent.KEEP_INSPECT_IMAGES, 2)
 
 

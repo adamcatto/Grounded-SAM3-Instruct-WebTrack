@@ -70,7 +70,7 @@ export default function App() {
 
   // ── Resizable panels ──────────────────────────────────────────────────────
   const [leftWidth, leftHandleMouseDown] = useResizable(256, { min: 180, max: 450 })
-  const [agentWidth, agentHandleMouseDown] = useResizable(380, { min: 280, max: 560 })
+  const [agentWidth, agentHandleMouseDown] = useResizable(560, { min: 340, max: 960 })
   const [timelineHeight, timelineHandleMouseDown] = useResizable(130, {
     min: 70,
     max: 280,
@@ -186,7 +186,12 @@ export default function App() {
             <ResizeHandle direction="horizontal" onMouseDown={agentHandleMouseDown} />
             <div
               className="flex-shrink-0 overflow-hidden bg-[#111111]"
-              style={{ width: agentWidth }}
+              style={{
+                width: agentWidth,
+                // Agent text/boxes are em-based; keep the entire pane at 2/3
+                // of its former scale (wider pane still scales proportionally).
+                fontSize: `${Math.round(Math.min(20, Math.max(10, agentWidth / 36)))}px`,
+              }}
             >
               <AgentChat />
             </div>

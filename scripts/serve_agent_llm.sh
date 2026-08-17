@@ -6,7 +6,13 @@
 #
 # Usage:
 #   bash scripts/serve_agent_llm.sh ollama [model]
-#   bash scripts/serve_agent_llm.sh vllm [--profile a100|h100x4|a100-shared|demo] [--thinking] [--] [vllm flags…]
+#   bash scripts/serve_agent_llm.sh vllm [--profile a100|h100x4|a100-shared|demo] [--thinking]
+#                                        [--context-size 65536] [--cpu-offload-gb 16] [--] [vllm flags…]
+#
+# Context window defaults to 2**16 (65536) tokens. Override with --context-size
+# or VLLM_MAX_MODEL_LEN. If the KV cache does not fit VRAM, add --cpu-offload-gb
+# (or VLLM_CPU_OFFLOAD_GB) to spill model weights to CPU RAM; KV swap space
+# defaults to 16 GiB (VLLM_SWAP_SPACE).
 #
 # Profiles (also AGENT_LLM_PROFILE):
 #   a100         1× 80GB A100 *dedicated to the LLM* → Qwen3-VL-32B-Instruct
@@ -27,6 +33,13 @@ fi
 
 PROFILE="${AGENT_LLM_PROFILE:-a100}"
 THINKING="${AGENT_LLM_THINKING:-0}"
+# Default context window: 2**16 = 65536 tokens. Override with --context-size,
+# VLLM_MAX_MODEL_LEN, or per-profile. Large windows may not fit VRAM at the
+# profile's gpu-memory-utilization — use --cpu-offload-gb to spill model weights
+# to CPU RAM (freeing VRAM for the KV cache) when it does not.
+CONTEXT_DEFAULT=65536
+CONTEXT_SIZE="${VLLM_MAX_MODEL_LEN:-}"
+CPU_OFFLOAD_GB="${VLLM_CPU_OFFLOAD_GB:-0}"
 EXTRA=()
 
 while [[ $# -gt 0 ]]; do
@@ -44,6 +57,27 @@ while [[ $# -gt 0 ]]; do
         exit 1
       fi
       shift ;;
+    --context-size)
+      if [[ $# -lt 2 || -z "${2}" || "${2}" == --* ]]; then
+        echo "error: --context-size requires a token count (e.g. 65536)" >&2
+        exit 1
+      fi
+      CONTEXT_SIZE="$2"; shift 2 ;;
+    --context-size=*)
+      CONTEXT_SIZE="${1#*=}"
+      if [[ -z "$CONTEXT_SIZE" ]]; then
+        echo "error: --context-size requires a token count (e.g. 65536)" >&2
+        exit 1
+      fi
+      shift ;;
+    --cpu-offload-gb)
+      if [[ $# -lt 2 || -z "${2}" || "${2}" == --* ]]; then
+        echo "error: --cpu-offload-gb requires a GiB value (e.g. 16)" >&2
+        exit 1
+      fi
+      CPU_OFFLOAD_GB="$2"; shift 2 ;;
+    --cpu-offload-gb=*)
+      CPU_OFFLOAD_GB="${1#*=}"; shift ;;
     --thinking)
       THINKING=1; shift ;;
     --)
@@ -154,7 +188,9 @@ case "$PROFILE" in
     ;;
 esac
 
-MAX_LEN="${VLLM_MAX_MODEL_LEN:-$MAX_LEN_DEFAULT}"
+# Precedence: --context-size / VLLM_MAX_MODEL_LEN, then the 64k default.
+# (Per-profile MAX_LEN_DEFAULT is retained above as the previously tuned value.)
+MAX_LEN="${CONTEXT_SIZE:-$CONTEXT_DEFAULT}"
 
 if thinking_on; then
   VLLM_MODEL="$VLLM_THINKING_MODEL"
@@ -185,10 +221,15 @@ case "$MODE" in
     MODEL="${AGENT_LLM_MODEL:-$VLLM_MODEL}"
     TP="${VLLM_TENSOR_PARALLEL_SIZE:-$TP_DEFAULT}"
     PORT="${VLLM_PORT:-8001}"
+    SWAP_SPACE="${VLLM_SWAP_SPACE:-16}"
     echo "vLLM OpenAI-compat endpoint: http://127.0.0.1:${PORT}/v1"
     echo "Profile: $PROFILE"
     echo "Model: $MODEL  tensor_parallel=${TP}  max_model_len=${MAX_LEN}  gpu_mem=${GPU_UTIL}"
+    echo "KV swap space: ${SWAP_SPACE} GiB (CPU)  cpu_offload=${CPU_OFFLOAD_GB} GiB"
     echo "API key: DUMMY_API_KEY (not used)"
+    if [[ "${CPU_OFFLOAD_GB}" == "0" ]]; then
+      echo "Tip: if 64k context OOMs the KV cache, add --cpu-offload-gb 16 to spill weights to CPU RAM."
+    fi
     if [[ "$PROFILE" == "a100" ]]; then
       echo "Note: 32B bf16 needs a dedicated 80GB GPU. Do not share it with SAM3."
     fi
@@ -203,8 +244,12 @@ case "$MODE" in
       --max-model-len "$MAX_LEN"
       --gpu-memory-utilization "$GPU_UTIL"
       --max-num-seqs "$MAX_NUM_SEQS"
+      --swap-space "$SWAP_SPACE"
       --allowed-local-media-path /
     )
+    if [[ "${CPU_OFFLOAD_GB}" != "0" && -n "${CPU_OFFLOAD_GB}" ]]; then
+      ARGS+=(--cpu-offload-gb "$CPU_OFFLOAD_GB")
+    fi
     if [[ "$TOOLS" == "1" ]]; then
       ARGS+=(--enable-auto-tool-choice --tool-call-parser hermes)
     fi
@@ -224,7 +269,9 @@ case "$MODE" in
     echo "  a100-shared  Qwen3-VL-8B-Instruct, ~50% of an 80GB card, 16k ctx (rest for SAM3)"
     echo "  demo         Qwen3-VL-8B-Thinking (SAM 3 Agent notebook)"
     echo
-    echo "  --thinking   Use the Qwen3-VL *Thinking* checkpoint (32B on a100; 32B not 72B on h100x4)"
+    echo "  --thinking          Use the Qwen3-VL *Thinking* checkpoint (32B on a100; 32B not 72B on h100x4)"
+    echo "  --context-size N    Max context window in tokens (default 65536 = 2**16)"
+    echo "  --cpu-offload-gb N  Spill N GiB of model weights to CPU RAM to fit a larger KV cache"
     exit 1
     ;;
 esac
