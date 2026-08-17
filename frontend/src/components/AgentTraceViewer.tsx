@@ -108,6 +108,10 @@ export default function AgentTraceViewer() {
 
   const visibleVideos = useMemo(() => data.videos.filter(v => !projectId || v.project_id === projectId), [data.videos, projectId])
   const events = (trace?.trace_json || []) as TraceEvent[]
+  const effectiveSystemPrompt = useMemo(() => {
+    const message = trace?.messages_json?.find(m => m.role === 'system')
+    return typeof message?.content === 'string' ? message.content : trace?.system_prompt || ''
+  }, [trace])
   return <div className="flex min-h-0 flex-1 bg-[#101010] text-[#ddd] overflow-hidden">
     <aside className="w-[320px] shrink-0 border-r border-[#292929] flex flex-col bg-[#141414]">
       <div className="p-3 border-b border-[#292929] space-y-2"><div className="flex items-center gap-2"><Database size={16} className="text-violet-400" /><h2 className="text-sm font-semibold">Agent traces</h2><button onClick={() => void load()} className="ml-auto text-[#777] hover:text-white"><RefreshCw size={14} /></button></div>
@@ -117,7 +121,8 @@ export default function AgentTraceViewer() {
       <div className="flex-1 overflow-auto">{loading && <div className="p-4 text-xs text-[#777] flex gap-2"><Loader size={14} className="animate-spin" />Loading traces…</div>}{!loading && !data.traces.length && <div className="p-4 text-xs text-[#777]">No saved traces yet. Run the agent once; completed runs are saved automatically.</div>}{data.traces.map(t => <button key={t.id} onClick={() => setSelected(t.id)} className={`w-full text-left p-3 border-b border-[#252525] hover:bg-[#1c1c1c] ${selected === t.id ? 'bg-violet-500/10 border-l-2 border-l-violet-400' : ''}`}><div className="text-xs font-medium truncate text-[#ddd]">{t.user_text || 'Untitled agent run'}</div><div className="mt-1 text-[11px] text-[#777] truncate">{t.project_name || t.project_id} · {t.video_name || t.video_id}</div><div className="mt-1 text-[10px] text-[#555]">#{t.id} · {t.created_at} · {t.model || 'model unknown'}</div></button>)}</div>
     </aside>
     <main className="flex-1 min-w-0 overflow-auto p-5">{error && <div className="mb-3 rounded bg-red-500/10 text-red-300 p-3 text-sm">{error}</div>}{!trace && !loading && <div className="h-full flex items-center justify-center text-[#666]"><Search size={18} className="mr-2" />Select a trace to inspect its execution.</div>}{trace && <div className="max-w-6xl mx-auto space-y-4"><header><div className="flex items-center gap-2 text-violet-300 text-xs uppercase tracking-widest"><Bot size={14} />Trace #{trace.id}</div><h1 className="mt-1 text-xl font-semibold text-white">{trace.user_text}</h1><p className="mt-1 text-xs text-[#777]">{trace.project_id} / {trace.video_id} · {trace.model} · {trace.created_at}</p></header>
-      <Disclosure title="System prompt" icon={<Sparkles size={13} />}><pre className="whitespace-pre-wrap text-xs leading-relaxed text-[#c8c8c8]">{trace.system_prompt || '(none)'}</pre></Disclosure>
+      <Disclosure title="Effective system prompt · policy + hidden project metadata" icon={<Sparkles size={13} />} defaultOpen><pre className="whitespace-pre-wrap text-xs leading-relaxed text-[#c8c8c8]">{effectiveSystemPrompt || '(none)'}</pre></Disclosure>
+      <Disclosure title="Project-configured prompt (editable portion)" icon={<Code2 size={13} />}><pre className="whitespace-pre-wrap text-xs leading-relaxed text-[#c8c8c8]">{trace.system_prompt || '(no project-specific prompt)'}</pre></Disclosure>
       <Disclosure title={`Full LLM transcript (${trace.messages_json?.length || 0} messages)`} icon={<MessageSquareText size={13} />}><JsonBlock value={trace.messages_json} /></Disclosure>
       <section><div className="mb-2 text-xs font-semibold uppercase tracking-wider text-[#777]">Execution timeline · {events.length} events</div><div className="space-y-3">{events.map((event, i) => <TraceEventCard key={`${i}-${event.event}`} event={event} trace={trace} />)}</div></section>
     </div>}</main>
