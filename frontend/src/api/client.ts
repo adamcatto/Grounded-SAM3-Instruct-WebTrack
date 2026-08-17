@@ -317,10 +317,12 @@ export const getCacheManifest = (pid: string, vid: string) =>
 
 export const thumbUrl = frameUrl
 
-// Video needs HTTP Range request support for seeking. In dev, bypass Vite proxy.
-const BACKEND = import.meta.env.DEV
-  ? (import.meta.env.VITE_BACKEND_URL ?? 'http://localhost:8000')
-  : ''
+// All backend traffic goes through the Vite dev proxy (relative `/api`) so the
+// UI works over SSH tunnels / remote IPs where the browser can't resolve the
+// backend's own localhost. The proxy preserves Accept-Ranges (video seeking)
+// and un-buffers text/event-stream (SSE), so a direct connection isn't needed.
+// Set VITE_BACKEND_URL only if you deliberately want to bypass the proxy.
+const BACKEND = import.meta.env.VITE_BACKEND_URL ?? ''
 
 export const videoSourceUrl = (pid: string, vid: string) =>
   `${BACKEND}/api/projects/${pid}/videos/${vid}/source`
@@ -665,7 +667,7 @@ export async function startAgentRun(
   onEvent: (event: string, data: Record<string, unknown>) => void,
   signal?: AbortSignal,
 ): Promise<void> {
-  const res = await fetch(`${BACKEND}/api/projects/${pid}/agent/run`, {
+  const res = await fetch(`/api/projects/${pid}/agent/run`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
     body: JSON.stringify(body),
