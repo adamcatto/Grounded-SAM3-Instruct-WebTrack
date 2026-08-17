@@ -1923,38 +1923,33 @@ def remove_video(pid: str, vid: str):
 
 
 @app.post("/api/projects/{pid}/videos/{vid}/reset", status_code=200)
-def reset_video(pid: str, vid: str):
+def reset_video(pid: str, vid: str, keep_objects: bool = False):
     """
     Clear all annotations and tracking data for a video while keeping the
     video file itself.  Removes:
-      - All objects and point prompts from config.json
-      - Saved masks (masks/) and bboxes (bboxes/*.json)
-      - Annotated frames (annotated_frames/)
-      - Preview frames (frames/)
-      - Active SAM session
-      - propagation_complete / propagated_frames flags
-      - In-memory mask cache
+      - Point prompts, saved masks (masks/) and bboxes (bboxes/*.json)
+      - Annotated frames (annotated_frames/) and preview frames (frames/)
+      - Active SAM session, propagation flags, in-memory mask cache
+    Objects are deleted unless keep_objects=true (E2E / re-annotate in place).
     """
-    logger.info(f"=== RESET VIDEO {vid} in project {pid} ===")
+    logger.info(f"=== RESET VIDEO {vid} in project {pid} keep_objects={keep_objects} ===")
 
     video = pm.get_video(pid, vid)
     if video is None:
         raise HTTPException(404, "Video not found")
 
-    # Log what we're about to clear
+    kept_objects = dict(video.get("objects") or {}) if keep_objects else {}
+
     logger.info(f"  Current objects: {list(video.get('objects', {}).keys())}")
     logger.info(f"  Current point_prompts: {list(video.get('point_prompts', {}).keys())}")
 
-    # Close any active SAM session
     sam.close_session(pid, vid)
 
-    # Invalidate in-memory mask cache for this video
     _invalidate_mask_cache(pid, vid)
     dc.clear_display_cache(pm.video_dir(pid, vid))
 
     VideoMaskStorage(pm.video_dir(pid, vid)).wipe_sqlite_file()
 
-    # Wipe masks, bboxes, and frame directories
     masks_dir = pm.masks_dir(pid, vid)
     bboxes_dir = pm.bboxes_dir(pid, vid)
     ann_dir = pm.annotated_frames_dir(pid, vid)
@@ -1965,10 +1960,9 @@ def reset_video(pid: str, vid: str):
             shutil.rmtree(str(d))
         d.mkdir(parents=True, exist_ok=True)
 
-    # Reset config: clear objects, prompts, propagation state
     pm.clear_propagated_frames(pid, vid)
     pm.update_video(pid, vid, {
-        "objects": {},
+        "objects": kept_objects,
         "point_prompts": {},
         "instance_groups": {},
         "sam3_session_id": None,
@@ -1982,13 +1976,12 @@ def reset_video(pid: str, vid: str):
         "whole_video_inference": {"status": "none", "updated_at": None, "host": None},
     })
 
-    # Verify reset was successful
     video_after = pm.get_video(pid, vid)
     logger.info(f"  After reset - objects: {list(video_after.get('objects', {}).keys())}")
     logger.info(f"  After reset - point_prompts: {list(video_after.get('point_prompts', {}).keys())}")
     logger.info(f"=== RESET COMPLETE for {vid} ===")
 
-    return {"status": "ok"}
+    return {"status": "ok", "kept_object_ids": list(kept_objects.keys())}
 
 
 # ─── Frames ──────────────────────────────────────────────────────────────────
@@ -4451,6 +4444,12 @@ def agent_status():
     return st
 
 
+@app.get("/api/agent/last_dump")
+def agent_last_dump():
+    from agent import get_last_agent_dump
+    return get_last_agent_dump()
+
+
 @app.get("/api/projects/{pid}/agent/status")
 def project_agent_status(pid: str):
     from agent import get_agent_run_state, llm_status_dict
@@ -4516,4 +4515,8 @@ async def agent_run(pid: str, req: AgentRunRequest):
         ):
             yield item
 
-    return EventSourceResponse(event_gen())
+    return EventSourceResponse(
+        event_gen(),
+        ping=15,
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )

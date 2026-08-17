@@ -522,8 +522,22 @@ export default function ConfigPanel() {
               Same pattern as SAM 3 Agent: a vision model served locally over an OpenAI-compatible
               API. The backend auto-detects <span className="font-mono text-[#888]">Ollama</span> on
               :11434 or <span className="font-mono text-[#888]">vLLM</span> on :8001 (dummy API key).
-              Optional env: <span className="font-mono text-[#888]">AGENT_LLM_PROVIDER</span>
-              (ollama|vllm), <span className="font-mono text-[#888]">AGENT_LLM_MODEL</span>,{' '}
+              Default profile is <span className="font-mono text-[#888]">a100</span> (Qwen3-VL-32B-Instruct
+              on a dedicated 80GB GPU, 24k context). Use <span className="font-mono text-[#888]">h100x4</span> for
+              Qwen2.5-VL-72B on 4× 80GB H100 NVL (32k context). Do not co-locate 32B/72B with SAM3 on one card —
+              run SAM on the workstation A100 and point{' '}
+              <span className="font-mono text-[#888]">AGENT_LLM_BASE_URL</span> at the H100 vLLM
+              server, or use <span className="font-mono text-[#888]">a100-shared</span> /{' '}
+              <span className="font-mono text-[#888]">demo</span> (8B) on a shared GPU.
+            </p>
+            <p className="text-xs text-[#666] mt-2 leading-relaxed">
+              <span className="font-mono text-[#888]">bash scripts/serve_agent_llm.sh vllm --profile a100</span>
+              {' '}or{' '}
+              <span className="font-mono text-[#888]">--profile h100x4</span>
+              {' '}(<span className="font-mono text-[#888]">--thinking</span> for Qwen3-VL-32B-Thinking).
+              Env: <span className="font-mono text-[#888]">AGENT_LLM_PROFILE</span>,{' '}
+              <span className="font-mono text-[#888]">AGENT_LLM_PROVIDER</span>,{' '}
+              <span className="font-mono text-[#888]">AGENT_LLM_MODEL</span>,{' '}
               <span className="font-mono text-[#888]">AGENT_LLM_BASE_URL</span>. Cloud keys are a
               fallback, not required.
             </p>
@@ -533,6 +547,8 @@ export default function ConfigPanel() {
                 : agentInfo.configured
                   ? `Ready · ${agentInfo.local ? 'local' : 'cloud'} · ${agentInfo.provider} · ${agentInfo.model}`
                     + (agentInfo.base_url ? `\n${agentInfo.base_url}` : '')
+                    + (agentInfo.profile ? `\nprofile ${agentInfo.profile}` : '')
+                    + (agentInfo.profile_blurb ? `\n${agentInfo.profile_blurb}` : '')
                   : agentInfo.missing_reason}
             </p>
           </div>

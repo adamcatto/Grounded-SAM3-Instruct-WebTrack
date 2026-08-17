@@ -73,10 +73,9 @@ export default function AnnotationCanvas({ width, height, scrubbing = false }: P
   }, [poseMode, poseTrackingStatus, pid, vid, currentFrame])
 
   const masksToShow = useMemo(() => {
-    if (currentFrameMasksFrame === currentFrame && Object.keys(currentFrameMasks).length > 0) {
-      return currentFrameMasks
-    }
-    return savedMaskCache[currentFrame] ?? {}
+    const live = (currentFrameMasksFrame === currentFrame) ? currentFrameMasks : {}
+    const saved = savedMaskCache[currentFrame] ?? {}
+    return { ...saved, ...live }
   }, [currentFrame, currentFrameMasks, currentFrameMasksFrame, savedMaskCache])
 
   // Load pre-materialized display WebP when available (optional fast path).
@@ -491,6 +490,9 @@ export default function AnnotationCanvas({ width, height, scrubbing = false }: P
         ref={canvasRef}
         width={width}
         height={height}
+        data-mask-count={Object.keys(masksToShow).length}
+        data-mask-ids={Object.keys(masksToShow).sort().join(',')}
+        data-mask-frame={currentFrame}
         onClick={handleClick}
         onMouseMove={handleMouseMove}
         onMouseLeave={() => { setHoverLabel(null); setHoverPos(null) }}

@@ -48,7 +48,7 @@ export async function getSavedMasks(pid: string, vid: string, frame: number): Pr
   return { masks, hasMasks: Object.keys(masks).length > 0 }
 }
 
-export async function getPointPrompts(pid: string): Promise<Record<string, Record<string, PromptSnapshot>>> {
+export async function getPointPrompts(pid: string = SANDBOX.pid): Promise<Record<string, Record<string, PromptSnapshot>>> {
   const proj = await apiJson<{ videos: Record<string, { point_prompts?: Record<string, Record<string, PromptSnapshot>> }> }>(
     `/projects/${pid}`,
   )
@@ -137,12 +137,83 @@ export function promptsUnchanged(
 }
 
 export async function waitForBackend(): Promise<void> {
-  for (let i = 0; i < 60; i++) {
+  const attempts = 90
+  const delayMs = 2000
+  for (let i = 0; i < attempts; i++) {
     try {
       const h = await apiJson<{ sam_loaded?: boolean }>('/health')
       if (h.sam_loaded) return
     } catch { /* retry */ }
-    await new Promise(r => setTimeout(r, 2000))
+    await new Promise(r => setTimeout(r, delayMs))
   }
-  throw new Error('Backend/SAM not ready after 120s')
+  throw new Error(`Backend/SAM not ready after ${(attempts * delayMs) / 1000}s`)
+}
+
+export async function getSandboxProject(): Promise<{
+  videos: Record<string, { objects?: Record<string, { id?: string; name?: string }> }>
+}> {
+  return apiJson(`/projects/${SANDBOX.pid}`)
+}
+
+export async function listSandboxObjectIds(): Promise<string[]> {
+  const p = await getSandboxProject()
+  return Object.keys(p.videos?.[SANDBOX.vid]?.objects ?? {})
+}
+
+export async function deleteSandboxObject(oid: string): Promise<void> {
+  await apiJson(`/projects/${SANDBOX.pid}/videos/${SANDBOX.vid}/objects/${oid}`, { method: 'DELETE' })
+}
+
+export async function getAgentLlmStatus(): Promise<{
+  configured?: boolean
+  provider?: string
+  model?: string
+  reachable?: boolean
+}> {
+  return apiJson('/agent/status')
+}
+
+export async function getLastAgentDump(): Promise<Record<string, unknown>> {
+  return apiJson('/agent/last_dump')
+}
+
+export async function resetSandboxVideo(keepObjects = true): Promise<{ status?: string; kept_object_ids?: string[] }> {
+  const qs = keepObjects ? '?keep_objects=true' : ''
+  return apiJson(`/projects/${SANDBOX.pid}/videos/${SANDBOX.vid}/reset${qs}`, { method: 'POST' })
+}
+
+export async function ensureSandboxObjects(): Promise<void> {
+  const p = await getSandboxProject()
+  const objs = p.videos?.[SANDBOX.vid]?.objects ?? {}
+  const names = new Set(
+    Object.values(objs).map(o => (o.name || '').toLowerCase()),
+  )
+  if (!names.has('headshave')) {
+    await apiJson(`/projects/${SANDBOX.pid}/videos/${SANDBOX.vid}/objects`, {
+      method: 'POST',
+      body: JSON.stringify({ name: 'HeadShave', color: '#5B8DD9', description: 'shaved mouse' }),
+    })
+  }
+  const p2 = await getSandboxProject()
+  const names2 = new Set(
+    Object.values(p2.videos?.[SANDBOX.vid]?.objects ?? {}).map(o => (o.name || '').toLowerCase()),
+  )
+  if (!names2.has('noshave')) {
+    await apiJson(`/projects/${SANDBOX.pid}/videos/${SANDBOX.vid}/objects`, {
+      method: 'POST',
+      body: JSON.stringify({ name: 'NoShave', color: '#E8A445', description: 'unshaved mouse' }),
+    })
+  }
+}
+
+export async function sandboxObjectIdsByName(): Promise<{ headshave?: string; noshave?: string }> {
+  const p = await getSandboxProject()
+  const objs = p.videos?.[SANDBOX.vid]?.objects ?? {}
+  const out: { headshave?: string; noshave?: string } = {}
+  for (const [oid, obj] of Object.entries(objs)) {
+    const n = (obj.name || '').toLowerCase()
+    if (n === 'headshave') out.headshave = oid
+    if (n === 'noshave') out.noshave = oid
+  }
+  return out
 }

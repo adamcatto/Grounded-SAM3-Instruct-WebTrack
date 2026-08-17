@@ -18,6 +18,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 import numpy as np
@@ -29,18 +30,83 @@ MAX_HISTORY_TURNS = 16
 INSPECT_MAX_EDGE = 640
 DEFAULT_NEARBY_OFFSET = 20
 CONFIDENCE_RETRY_THRESHOLD = 0.45
+# Home-cage red-light layout on frame 160 (and similar): mice are the two
+# darkest interior blobs (~cx 0.32 left, ~cx 0.66 right). The circular
+# water-bottle port sits on the far-right wall (~cx 0.76+). Empty bedding
+# is the gap between the animals, not the right-hand mouse.
+WATER_PORT_MIN_CX = 0.74
+BEDDING_GAP_CX = (0.42, 0.56)
+RIGHT_ANIMAL_MIN_CX = 0.55
+DARK_LUM_THR = 50
+DARK_MIN_AREA = 2000
+DARK_MATCH_IOU = 0.20
+# Inspect JPEGs stay in the chat until pruned. Keep the last two so the model can
+# compare the current frame with the previous one without blowing the context.
+KEEP_INSPECT_IMAGES = 2
+# Tool calls are short; 4096 reserved tokens would eat half of an 8k window.
+AGENT_MAX_TOKENS = 2048
 
 
 # ─── LLM configuration (local Ollama / vLLM first, same idea as SAM 3 Agent) ──
 
 # SAM 3 Agent serves Qwen-VL via vLLM at :8001 with a dummy OpenAI key.
 # Ollama exposes the same /v1/chat/completions surface on :11434.
+#
+# Hardware profiles (AGENT_LLM_PROFILE / `scripts/serve_agent_llm.sh --profile`):
+#   a100         1× 80GB A100 dedicated to the LLM → Qwen3-VL-32B-Instruct
+#   h100x4       4× 80GB H100 NVL → Qwen2.5-VL-72B-Instruct (tensor parallel 4)
+#   a100-shared  same 80GB GPU as SAM3 → Qwen3-VL-8B (leave VRAM for tracking)
+#   demo         SAM 3 Agent notebook default (8B Thinking)
 VLLM_DEFAULT_BASE = "http://127.0.0.1:8001/v1"
 OLLAMA_DEFAULT_BASE = "http://127.0.0.1:11434/v1"
 OLLAMA_NATIVE_BASE = "http://127.0.0.1:11434"
-VLLM_DEFAULT_MODEL = "Qwen/Qwen3-VL-8B-Thinking"
-OLLAMA_DEFAULT_MODEL = "qwen2.5vl"
+SAM3_AGENT_DEFAULT_MODEL = "Qwen/Qwen3-VL-8B-Thinking"
+VLLM_DEFAULT_MODEL = "Qwen/Qwen3-VL-32B-Instruct"
+OLLAMA_DEFAULT_MODEL = "qwen2.5vl:32b"
 LOCAL_DUMMY_KEY = "DUMMY_API_KEY"
+
+LLM_PROFILES: dict[str, dict[str, Any]] = {
+    "a100": {
+        "vllm_model": "Qwen/Qwen3-VL-32B-Instruct",
+        "vllm_thinking_model": "Qwen/Qwen3-VL-32B-Thinking",
+        "ollama_model": "qwen2.5vl:32b",
+        "tensor_parallel": 1,
+        "blurb": "1× 80GB A100 dedicated to the vision LLM (do not co-locate with SAM3)",
+    },
+    "h100x4": {
+        "vllm_model": "Qwen/Qwen2.5-VL-72B-Instruct",
+        "vllm_thinking_model": "Qwen/Qwen3-VL-32B-Thinking",
+        "ollama_model": "qwen2.5vl:72b",
+        "tensor_parallel": 4,
+        "blurb": "4× 80GB H100 NVL; 72B bf16 at TP=4. Point the tracker at this server.",
+    },
+    "a100-shared": {
+        "vllm_model": "Qwen/Qwen3-VL-8B-Instruct",
+        "vllm_thinking_model": "Qwen/Qwen3-VL-8B-Thinking",
+        "ollama_model": "qwen2.5vl",
+        "tensor_parallel": 1,
+        "blurb": "Same 80GB GPU as SAM3 — 8B VL so tracking still fits",
+    },
+    "demo": {
+        "vllm_model": SAM3_AGENT_DEFAULT_MODEL,
+        "vllm_thinking_model": SAM3_AGENT_DEFAULT_MODEL,
+        "ollama_model": "qwen2.5vl",
+        "tensor_parallel": 1,
+        "blurb": "SAM 3 Agent notebook default (Qwen3-VL-8B-Thinking)",
+    },
+}
+_PROFILE_ALIASES = {
+    "workstation": "a100",
+    "a100-80": "a100",
+    "80gb": "a100",
+    "cluster": "h100x4",
+    "h100": "h100x4",
+    "4xh100": "h100x4",
+    "h100nvl": "h100x4",
+    "shared": "a100-shared",
+    "sam3": "demo",
+    "8b": "demo",
+}
 VISION_MODEL_HINTS = (
     "vl", "vision", "llava", "minicpm", "pixtral", "gemma3", "qwen2.5-vl",
     "qwen2.5vl", "qwen3-vl", "qwen3_vl", "internvl", "phi-4-multimodal",
@@ -64,9 +130,40 @@ class LLMConfig:
 
 def _env_true(name: str, default: bool = True) -> bool:
     raw = os.environ.get(name)
-    if raw is None:
+    if raw is None or not str(raw).strip():
         return default
-    return raw.strip().lower() not in ("0", "false", "no", "off")
+    return str(raw).strip().lower() not in ("0", "false", "no", "off")
+
+
+def normalize_llm_profile(raw: Optional[str] = None) -> str:
+    name = (raw if raw is not None else os.environ.get("AGENT_LLM_PROFILE") or "").strip().lower()
+    name = _PROFILE_ALIASES.get(name, name)
+    if not name:
+        return "a100"
+    if name not in LLM_PROFILES:
+        return "a100"
+    return name
+
+
+def default_vllm_model(profile: Optional[str] = None, thinking: Optional[bool] = None) -> str:
+    spec = LLM_PROFILES[normalize_llm_profile(profile)]
+    think = _env_true("AGENT_LLM_THINKING", False) if thinking is None else bool(thinking)
+    return str(spec["vllm_thinking_model"] if think else spec["vllm_model"])
+
+
+def default_ollama_model(profile: Optional[str] = None) -> str:
+    return str(LLM_PROFILES[normalize_llm_profile(profile)]["ollama_model"])
+
+
+def _serve_hint() -> str:
+    profile = normalize_llm_profile()
+    model = default_vllm_model()
+    return (
+        f"bash scripts/serve_agent_llm.sh vllm --profile {profile}  "
+        f"(serves {model} on :8001). "
+        "Profiles: a100 (32B on dedicated 80GB), h100x4 (72B TP=4), "
+        "a100-shared / demo (8B, can share a GPU with SAM3)."
+    )
 
 
 def _normalize_openai_base(url: str, provider: str = "") -> str:
@@ -245,7 +342,7 @@ def load_llm_config(*, probe: bool = True) -> LLMConfig:
         else:
             base_url = _normalize_openai_base(base_url, provider)
         if not model:
-            default_model = OLLAMA_DEFAULT_MODEL if provider == "ollama" else VLLM_DEFAULT_MODEL
+            default_model = default_ollama_model() if provider == "ollama" else default_vllm_model()
             model = _prefer_vision_model(available, default_model)
         if not api_key:
             api_key = LOCAL_DUMMY_KEY
@@ -259,9 +356,9 @@ def load_llm_config(*, probe: bool = True) -> LLMConfig:
         if probe and not reachable:
             missing = (
                 f"No {provider} server answered at {base_url}. "
-                "Start Ollama (`ollama serve` + `ollama pull qwen2.5vl`) or vLLM "
-                f"(`vllm serve {VLLM_DEFAULT_MODEL} --port 8001 --allowed-local-media-path /`), "
-                "same pattern as SAM 3 Agent."
+                f"{_serve_hint()} "
+                "Or Ollama: `ollama pull qwen2.5vl:32b && ollama serve`. "
+                "Same OpenAI-compat pattern as SAM 3 Agent (dummy API key)."
             )
             configured = False
         return LLMConfig(
@@ -288,9 +385,8 @@ def load_llm_config(*, probe: bool = True) -> LLMConfig:
             configured=False,
             missing_reason=(
                 "No local Ollama/vLLM server detected and no cloud API key. "
-                "Start Ollama (`ollama pull qwen2.5vl && ollama serve`) or vLLM on :8001 "
-                f"(`vllm serve {VLLM_DEFAULT_MODEL} --port 8001 --allowed-local-media-path /`), "
-                "or set AGENT_LLM_BASE_URL / AGENT_LLM_PROVIDER=ollama|vllm. "
+                f"{_serve_hint()} "
+                "Or set AGENT_LLM_BASE_URL / AGENT_LLM_PROVIDER=ollama|vllm. "
                 "Cloud fallback: AGENT_LLM_API_KEY or OPENAI_API_KEY / ANTHROPIC_API_KEY."
             ),
             reachable=False,
@@ -309,6 +405,7 @@ def load_llm_config(*, probe: bool = True) -> LLMConfig:
 
 def llm_status_dict() -> dict:
     cfg = load_llm_config()
+    profile = normalize_llm_profile()
     return {
         "configured": cfg.configured,
         "provider": cfg.provider,
@@ -318,6 +415,9 @@ def llm_status_dict() -> dict:
         "reachable": cfg.reachable,
         "local": cfg.local,
         "available_models": cfg.available_models,
+        "profile": profile,
+        "recommended_model": default_vllm_model(profile),
+        "profile_blurb": LLM_PROFILES[profile]["blurb"],
     }
 
 
@@ -368,6 +468,67 @@ def nearby_frames(
             seen.add(f)
             out.append(f)
     return out
+
+
+def _count_large_mask_components(binary, min_frac: float = 0.12) -> int:
+    """How many sizable connected components a mask has (body+tail split → 2)."""
+    b = np.squeeze(np.asarray(binary)).astype(bool)
+    if b.ndim != 2:
+        return 0
+    area = int(b.sum())
+    if area == 0:
+        return 0
+    try:
+        import cv2
+        n, _, stats, _ = cv2.connectedComponentsWithStats(b.astype(np.uint8), connectivity=8)
+    except Exception:
+        return 1
+    thresh = max(250, int(min_frac * area))
+    return sum(1 for i in range(1, n) if int(stats[i, cv2.CC_STAT_AREA]) >= thresh)
+
+
+def _mask_iou(a, b) -> float:
+    aa = np.squeeze(np.asarray(a)).astype(bool)
+    bb = np.squeeze(np.asarray(b)).astype(bool)
+    if aa.ndim != 2 or bb.ndim != 2 or aa.shape != bb.shape:
+        return 0.0
+    inter = int(np.logical_and(aa, bb).sum())
+    union = int(np.logical_or(aa, bb).sum())
+    return float(inter / union) if union else 0.0
+
+
+def dark_animal_blobs(frame_path, lum_thr: float = DARK_LUM_THR, min_area: int = DARK_MIN_AREA) -> list[dict]:
+    """Two (or more) dark interior connected components — the mice, not the cage wall."""
+    try:
+        from PIL import Image
+        import cv2
+    except Exception:
+        return []
+    try:
+        arr = np.asarray(Image.open(frame_path).convert("RGB"))
+    except Exception:
+        return []
+    h, w = arr.shape[:2]
+    lum = (0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2]).astype(np.float32)
+    yy, xx = np.mgrid[0:h, 0:w]
+    inset = (xx > 0.12 * w) & (xx < 0.92 * w) & (yy > 0.18 * h) & (yy < 0.88 * h)
+    binary = ((lum < lum_thr) & inset).astype(np.uint8)
+    n, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    blobs: list[dict] = []
+    for i in range(1, n):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if area < min_area:
+            continue
+        blobs.append({
+            "mask": labels == i,
+            "cx": float(centroids[i, 0]) / w,
+            "cy": float(centroids[i, 1]) / h,
+            "area": area,
+        })
+    blobs.sort(key=lambda b: -b["area"])
+    blobs = blobs[:4]
+    blobs.sort(key=lambda b: b["cx"])
+    return blobs
 
 
 def evaluate_mask_quality(
@@ -432,6 +593,10 @@ def evaluate_mask_quality(
     if bbox[2] < 0.01 or bbox[3] < 0.01:
         conf *= 0.4
         reasons.append("tiny_bbox")
+    n_comp = _count_large_mask_components(binary)
+    if n_comp >= 2:
+        conf *= 0.4
+        reasons.append("split_components")
 
     conf = float(np.clip(conf, 0.0, 1.0))
     ok = conf >= CONFIDENCE_RETRY_THRESHOLD and "empty_mask" not in reasons
@@ -445,6 +610,201 @@ def evaluate_mask_quality(
         "bbox_fill": round(fill, 4),
         "model_score": None if score is None else round(float(score), 4),
         "retry_nearby": (not ok) or conf < CONFIDENCE_RETRY_THRESHOLD,
+    }
+
+
+SAME_LOCATION_TOL = 0.08
+
+
+def _compact_label(s: str) -> str:
+    return (s or "").lower().replace(" ", "").replace("_", "").replace("-", "")
+
+
+def _bbox_center_xy(det: dict) -> tuple[float, float]:
+    bbox = det.get("bbox") or det.get("bbox_xywh_norm")
+    if bbox is not None:
+        try:
+            x, y, w, h = [float(v) for v in list(bbox)[:4]]
+            return (x + w / 2.0, y + h / 2.0)
+        except (TypeError, ValueError):
+            pass
+    mask = det.get("mask")
+    if mask is None:
+        return (0.5, 0.5)
+    m = np.squeeze(np.asarray(mask))
+    if m.ndim != 2:
+        return (0.5, 0.5)
+    ys, xs = np.where(m > 0)
+    if xs.size == 0:
+        return (0.5, 0.5)
+    h, w = m.shape
+    return (float(xs.mean()) / w, float(ys.mean()) / h)
+
+
+def _prefer_side_from_text_and_object(text: str, obj: Optional[dict]) -> Optional[str]:
+    """Map shave-state / side language onto leftmost vs rightmost detections."""
+    name = _compact_label((obj or {}).get("name") or "")
+    desc = (obj or {}).get("description") or ""
+    blob = f"{text or ''} {desc}".lower()
+    compact_blob = _compact_label(blob)
+    if any(k in name for k in ("noshave", "unshaved", "unclipped")):
+        return "left"
+    if any(k in name for k in ("headshave", "backshave")):
+        return "right"
+    left_phrases = (
+        "on the left", "left mouse", "left side", "left of the cage",
+        "unshaved", "unclipped", "no shave", "noshave", "fully furred",
+    )
+    right_phrases = (
+        "on the right", "right mouse", "right side", "far right",
+        "water bottle", "water port", "clipped patch", "head shave", "shaved",
+    )
+    if any(p in blob or _compact_label(p) in compact_blob for p in left_phrases):
+        return "left"
+    if any(p in blob or _compact_label(p) in compact_blob for p in right_phrases):
+        return "right"
+    return None
+
+
+def _text_implies_far_right(text: str, obj: Optional[dict]) -> bool:
+    blob = f"{text or ''} {(obj or {}).get('description') or ''}".lower()
+    return any(k in blob for k in ("far right", "water bottle", "water port", "right wall", "right of the cage"))
+
+
+def _pick_detection(detections: list[dict], text: str, obj: Optional[dict]) -> dict:
+    if not detections:
+        raise ValueError("no detections")
+    if len(detections) == 1:
+        return detections[0]
+    side = _prefer_side_from_text_and_object(text, obj)
+    ranked = sorted(detections, key=lambda d: _bbox_center_xy(d)[0])
+    if side == "left":
+        leftish = [d for d in ranked if _bbox_center_xy(d)[0] < RIGHT_ANIMAL_MIN_CX]
+        return (leftish or ranked)[0]
+    if side == "right":
+        on_mouse = [
+            d for d in ranked
+            if RIGHT_ANIMAL_MIN_CX <= _bbox_center_xy(d)[0] < WATER_PORT_MIN_CX
+        ]
+        if on_mouse:
+            return on_mouse[-1]
+        not_port = [d for d in ranked if _bbox_center_xy(d)[0] < WATER_PORT_MIN_CX]
+        return (not_port or ranked)[-1]
+    return detections[0]
+
+
+def _detection_summary(det: dict) -> dict:
+    cx, cy = _bbox_center_xy(det)
+    bbox = det.get("bbox") or det.get("bbox_xywh_norm")
+    bbox_out = None
+    if bbox is not None:
+        try:
+            bbox_out = [round(float(x), 5) for x in list(bbox)[:4]]
+        except (TypeError, ValueError):
+            bbox_out = None
+    score = det.get("score")
+    try:
+        score = None if score is None else round(float(score), 4)
+    except (TypeError, ValueError):
+        score = None
+    return {
+        "score": score,
+        "bbox_xywh_norm": bbox_out,
+        "center_xy": [round(cx, 4), round(cy, 4)],
+    }
+
+
+def _row_center_x(row: dict) -> Optional[float]:
+    bbox = row.get("bbox_xywh_norm") or []
+    if len(bbox) < 4:
+        return None
+    try:
+        return float(bbox[0]) + float(bbox[2]) / 2.0
+    except (TypeError, ValueError):
+        return None
+
+
+def _append_eval_reason(row: dict, extra: str) -> None:
+    row["ok"] = False
+    reason = str(row.get("reason") or "ok")
+    if extra not in reason:
+        row["reason"] = extra if reason in ("ok", "") else f"{reason},{extra}"
+
+
+def finalize_segmentation_eval(objects: dict, per_obj: list[dict]) -> dict:
+    """Fill in missing objects and flag two masks sitting on the same spot."""
+    out = [dict(p) for p in per_obj]
+    seen = {str(p.get("object_id")) for p in out}
+    expected = len(objects or {})
+    for oid, obj in (objects or {}).items():
+        if str(oid) in seen:
+            continue
+        out.append({
+            "ok": False,
+            "confidence": 0.0,
+            "reason": "missing_mask",
+            "area_px": 0,
+            "coverage": 0.0,
+            "object_id": str(oid),
+            "name": (obj or {}).get("name"),
+            "overlap_px": 0,
+            "retry_nearby": False,
+        })
+    with_bbox = [p for p in out if p.get("area_px") and p.get("bbox_xywh_norm")]
+    for i, a in enumerate(with_bbox):
+        for b in with_bbox[i + 1:]:
+            ba = a["bbox_xywh_norm"]
+            bb = b["bbox_xywh_norm"]
+            ca = (ba[0] + ba[2] / 2.0, ba[1] + ba[3] / 2.0)
+            cb = (bb[0] + bb[2] / 2.0, bb[1] + bb[3] / 2.0)
+            if abs(ca[0] - cb[0]) < SAME_LOCATION_TOL and abs(ca[1] - cb[1]) < SAME_LOCATION_TOL:
+                extra = "same_location_as_other_object"
+                for p in (a, b):
+                    _append_eval_reason(p, extra)
+    if expected >= 2:
+        gap_lo, gap_hi = BEDDING_GAP_CX
+        for p in with_bbox:
+            cx = _row_center_x(p)
+            if cx is None:
+                continue
+            if gap_lo <= cx <= gap_hi:
+                _append_eval_reason(p, "likely_bedding")
+            if cx >= WATER_PORT_MIN_CX:
+                _append_eval_reason(p, "likely_water_port")
+        named = []
+        for p in with_bbox:
+            side = _prefer_side_from_text_and_object("", {"name": p.get("name") or ""})
+            cx = _row_center_x(p)
+            if side and cx is not None:
+                named.append((side, cx, p))
+        lefts = [r for r in named if r[0] == "left"]
+        rights = [r for r in named if r[0] == "right"]
+        if lefts and rights and lefts[0][1] > rights[0][1]:
+            _append_eval_reason(lefts[0][2], "identity_swap")
+            _append_eval_reason(rights[0][2], "identity_swap")
+    masked = sum(1 for p in out if (p.get("area_px") or 0) > 0)
+    any_bad = any(not p.get("ok") for p in out)
+    incomplete = expected > 0 and masked < expected
+    any_retry = any(p.get("retry_nearby") for p in out)
+    return {
+        "objects": out,
+        "expected_object_count": expected,
+        "masked_object_count": masked,
+        "incomplete": incomplete,
+        "ok": bool(out) and all(p.get("ok") for p in out) and not incomplete,
+        "retry_nearby": any_retry,
+        "note": (
+            f"Expected {expected} object masks on this frame, found {masked}. "
+            "Stay on this frame and segment each remaining object."
+            if expected > 0 and masked < expected
+            else (
+                "Masks failed quality checks (bedding blob, identity swap, or overlap). "
+                "Re-inspect and click each animal's torso; HeadShave/shaved is the far-side "
+                "mouse, NoShave is the other dark blob — not empty bedding."
+                if any_bad
+                else None
+            )
+        ),
     }
 
 
@@ -464,6 +824,12 @@ def project_overview(project: dict, current_video_id: Optional[str], current_fra
                     except (TypeError, ValueError):
                         pass
         video_rows.append({
+            "id": vid,
+            "name": v.get("name"),
+            "num_frames": v.get("num_frames"),
+            "object_count": len(objects),
+            "is_current": vid == current_video_id,
+        } if vid != current_video_id else {
             "id": vid,
             "name": v.get("name"),
             "num_frames": v.get("num_frames"),
@@ -488,7 +854,7 @@ def project_overview(project: dict, current_video_id: Optional[str], current_fra
             "anchor_labeling_complete": bool(v.get("anchor_labeling_complete")),
             "propagation_complete": bool(v.get("propagation_complete")),
             "propagated_frame_count": len(v.get("propagated_frames") or []),
-            "is_current": vid == current_video_id,
+            "is_current": True,
         })
     return {
         "project_id": project.get("id"),
@@ -632,9 +998,11 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "name": "text_segment",
         "description": (
-            "Run SAM3 text-based segmentation on a frame and bind the best mask to an "
-            "object id (creates the object if needed). Persists like a normal annotation "
-            "so the canvas and later propagation work as usual. If confidence is low, "
+            "Run SAM3 text-based segmentation on a frame and bind a mask to an "
+            "object id (creates the object if needed). When several mice are detected, "
+            "the leftmost or rightmost mask is chosen if the text or object name implies "
+            "a side (NoShave/unshaved/left vs HeadShave/shaved/right). Call once per "
+            "identity. Persists like a normal annotation. If confidence is low, "
             "try inspect_frame on a nearby frame (±20) and retry."
         ),
         "parameters": {
@@ -684,7 +1052,12 @@ TOOL_SCHEMAS: list[dict] = [
     },
     {
         "name": "evaluate_segmentation",
-        "description": "Score saved masks on a frame (area, coverage, overlap, confidence).",
+        "description": (
+            "Score saved masks on a frame (area, coverage, overlap, confidence). "
+            "Compares against every object in the video: missing objects are failures "
+            "(reason=missing_mask, incomplete=true). Do not finish while "
+            "masked_object_count is below the expected animal count."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -751,17 +1124,22 @@ SYSTEM_PROMPT = """You are the SAM3 Web Tracker agent. You annotate and track ob
 3. For each planned frame:
    a. goto_frame then inspect_frame so you can see animals, occlusion, blur, and identity cues.
    b. create_object once per identity (reuse existing objects with the same name).
-   c. text_segment with a specific phrase per object (e.g. "mouse with a shaved patch on its back" vs "unshaved mouse").
-   d. evaluate_segmentation. If confidence is low, the frame is empty, identities are swapped, or animals overlap badly: think, then try nearby frames (±20, then ±40) via plan_frames(around_frame=..., nearby_offset=20).
-   e. If text segmentation is weak but you can see the animal, add_point_prompt at a chest/back point (positive=1). Use a negative point (0) on the other animal if they touch.
+   c. Prefer text_segment with a simple visual phrase like "dark mouse" once per identity (reuse HeadShave / NoShave ids). SAM3 often returns both dark animals; pick the left detection for NoShave and the right-of-center detection for HeadShave.
+   d. evaluate_segmentation. If confidence is low, the frame is empty, identities are swapped, or animals overlap badly: think, then try nearby frames (±20, then ±40) via plan_frames(around_frame=..., nearby_offset=20). If the result is incomplete / missing_mask, stay on this frame and segment the remaining animals.
+   e. If text segmentation is weak but you can see the animal, add_point_prompt at a chest/back point (positive=1) on the dark blob itself. Use a negative point (0) on the *other* animal if they touch — never on the same animal's tail.
    f. commit_anchor when the frame is a planned grid/anchor frame and the masks look right.
 4. Adapt. Do not blindly march the grid if a frame is unusable. Skip to a clearer neighbor, then continue the plan.
 5. After the requested frames are labeled, start_propagation if the user wants tracking. Do not start it for a single-frame-only request.
 
 ## Text vs points
-- Prefer text_segment when the description is visually distinctive (shaved patch, color, size).
+- Prefer text_segment when the animals are the darkest blobs in the cage. A short prompt ("dark mouse") is enough — do not invent coordinates.
 - Prefer inspect_frame + add_point_prompt when animals look similar, are overlapping, or text confidence is low.
-- Never invent coordinates without having inspected the frame (or a text_segment result that returned a bbox).
+- Inspect the frame before clicking. Choose points from the dark animal bodies you see in the JPEG — do not invent coordinates from the user's words, and do not write pixel locations into the user-facing reply.
+- If the user says there are N mice/animals, that count is ground truth. Reuse existing objects with matching names (HeadShave / NoShave, etc.) instead of creating extras. Call text_segment or add_point_prompt once per identity. Do not finish until evaluate_segmentation reports ok=true, masked_object_count >= N, and no missing_mask / identity_swap / likely_bedding / likely_water_port / not_on_animal. One mask is a failure.
+- If evaluate_segmentation returns incomplete, missing_mask, identity_swap, likely_bedding, likely_water_port, or not_on_animal, stay on this frame and re-click the dark blob. Do not jump to a nearby frame unless the current frame is empty or unusable.
+- In top-down red-light home cages the two mice are dark blobs on the bedding: unshaved on the left, shaved to the right of center. The circular water-bottle port on the far-right WALL is not a mouse — never click it. Empty bedding is the gap between the two animals, not the right-hand mouse.
+- When using add_point_prompt, place a new positive point on that animal's torso from the inspect JPEG. Do not copy another object's point list.
+- One animal = one connected mask that includes head, body, and tail. Never put a negative click on the same mouse's tail (that splits body and tail into two blobs). If evaluate_segmentation reports split_components, add another positive point on the missing part (usually the tail), do not create a new object.
 
 ## Style
 - Call think before multi-step plans and after failures.
@@ -915,13 +1293,29 @@ def _apply_points(session: AgentSession, vid: str, oid: str, frame_idx: int, poi
     return result
 
 
+def _as_seq(val: Any) -> list:
+    """Numpy arrays are truthy-ambiguous; never use `arr or []`."""
+    if val is None:
+        return []
+    if isinstance(val, np.ndarray):
+        if val.size == 0:
+            return []
+        return list(val)
+    if isinstance(val, (list, tuple)):
+        return list(val)
+    try:
+        return list(val)
+    except TypeError:
+        return []
+
+
 def _detections_from_sam_outputs(frame_outputs: dict) -> list[dict]:
     if not isinstance(frame_outputs, dict):
         return []
-    obj_ids = frame_outputs.get("out_obj_ids") or []
-    masks = frame_outputs.get("out_binary_masks") or []
-    boxes = frame_outputs.get("out_boxes_xywh") or []
-    probs = frame_outputs.get("out_probs") or []
+    obj_ids = _as_seq(frame_outputs.get("out_obj_ids"))
+    masks = _as_seq(frame_outputs.get("out_binary_masks"))
+    boxes = _as_seq(frame_outputs.get("out_boxes_xywh"))
+    probs = _as_seq(frame_outputs.get("out_probs"))
     dets: list[dict] = []
     for i, oid in enumerate(obj_ids):
         mask = masks[i] if i < len(masks) else None
@@ -975,47 +1369,49 @@ def _text_segment_impl(session: AgentSession, vid: str, frame_idx: int, text: st
     method = None
     error = None
 
-    # Prefer a throwaway single-frame session so detector object ids do not pollute tracking.
-    import shutil
-    import tempfile
-    from pathlib import Path
-    tmp_ann = tempfile.mkdtemp(prefix="sam3wt_agent_txt_")
-    try:
-        if jpg.exists():
-            shutil.copy2(str(jpg), str(Path(tmp_ann) / jpg.name))
-            s.sam.init_session(session.pid, vid, tmp_ann)
-            try:
-                out = s.sam.add_text_prompt(session.pid, vid, frame_idx, text)
-                frame_out = out.get(frame_idx) or out.get(str(frame_idx)) or {}
-                if not frame_out and out:
-                    frame_out = next(iter(out.values()))
-                detections = _detections_from_sam_outputs(frame_out)
-                method = "sam3_video_text"
-            except Exception as e:
-                error = str(e)
-                logger.warning(f"SAM3 video text prompt failed: {e}")
-    except Exception as e:
-        error = str(e)
-        logger.warning(f"temp text session failed: {e}")
-    finally:
-        shutil.rmtree(tmp_ann, ignore_errors=True)
-        try:
-            s.sam.close_session(session.pid, vid)
-        except Exception:
-            pass
-
-    if not detections and jpg.exists():
+    # Image-level grounding does not touch the video tracker session.
+    if jpg.exists():
         try:
             img_dets = s.sam.detect_text_on_image(str(jpg), text)
             detections = [
                 {"sam_obj_id": None, "mask": d["mask"], "score": d.get("score"), "bbox": d.get("bbox_xywh_norm")}
                 for d in img_dets
             ]
-            method = "sam3_image_text"
-            error = None
+            if detections:
+                method = "sam3_image_text"
+        except Exception as e:
+            error = str(e)
+            logger.warning(f"SAM3 image text detect failed: {e}")
+
+    # Prefer a throwaway single-frame session so detector object ids do not pollute tracking.
+    if not detections:
+        import shutil
+        import tempfile
+        from pathlib import Path
+        tmp_ann = tempfile.mkdtemp(prefix="sam3wt_agent_txt_")
+        try:
+            if jpg.exists():
+                shutil.copy2(str(jpg), str(Path(tmp_ann) / jpg.name))
+                s.sam.init_session(session.pid, vid, tmp_ann)
+                try:
+                    out = s.sam.add_text_prompt(session.pid, vid, frame_idx, text)
+                    frame_out = out.get(frame_idx) or out.get(str(frame_idx)) or {}
+                    if not frame_out and out:
+                        frame_out = next(iter(out.values()))
+                    detections = _detections_from_sam_outputs(frame_out)
+                    method = "sam3_video_text"
+                except Exception as e:
+                    error = error or str(e)
+                    logger.warning(f"SAM3 video text prompt failed: {e}")
         except Exception as e:
             error = error or str(e)
-            logger.warning(f"SAM3 image text detect failed: {e}")
+            logger.warning(f"temp text session failed: {e}")
+        finally:
+            shutil.rmtree(tmp_ann, ignore_errors=True)
+            try:
+                s.sam.close_session(session.pid, vid)
+            except Exception:
+                pass
 
     detections = [d for d in detections if (d.get("score") is None or d["score"] >= min_score)]
     if not detections:
@@ -1032,10 +1428,32 @@ def _text_segment_impl(session: AgentSession, vid: str, frame_idx: int, text: st
             ),
         }
 
-    best = detections[0]
+    best = _pick_detection(detections, text, obj)
+    picked_side = _prefer_side_from_text_and_object(text, obj)
+    picked_xy = _bbox_center_xy(best)
     quality = evaluate_mask_quality(best["mask"], score=best.get("score"))
+    suggestion = None
+    cx = picked_xy[0]
+    if picked_side == "right" and cx >= WATER_PORT_MIN_CX:
+        quality = {
+            **quality,
+            "ok": False,
+            "reason": (
+                "likely_water_port"
+                if quality.get("reason") in (None, "", "ok")
+                else f"{quality.get('reason')},likely_water_port"
+            ),
+            "retry_nearby": False,
+        }
+        suggestion = (
+            "That hit is the circular water-bottle port on the far-right wall, not a mouse. "
+            "text_segment again with 'dark mouse' or add_point_prompt on the dark blob "
+            "to the left of the port (right-of-center on the bedding)."
+        )
+
+    bind_ok = obj is not None and suggestion is None
     bound = None
-    if obj is not None:
+    if bind_ok:
         points = sample_points_from_mask(best["mask"], n_total=8)
         if not points:
             return {**quality, "ok": False, "error": "empty_best_mask", "frame_idx": frame_idx}
@@ -1043,27 +1461,27 @@ def _text_segment_impl(session: AgentSession, vid: str, frame_idx: int, text: st
         bound = _apply_points(session, vid, str(obj["id"]), frame_idx, points, labels)
         color = obj.get("color") or "#5B8DD9"
     else:
-        color = "#5B8DD9"
+        color = (obj or {}).get("color") or "#5B8DD9"
 
     mask_b64 = encode_mask_as_png(best["mask"], color)
-    extra = []
-    for d in detections[1:5]:
-        q = evaluate_mask_quality(d["mask"], score=d.get("score"))
-        extra.append({"score": d.get("score"), "quality": q})
+    extra = [_detection_summary(d) for d in detections]
 
     return {
-        "ok": quality["ok"],
+        "ok": quality["ok"] and suggestion is None,
         "method": method,
         "text": text,
         "frame_idx": frame_idx,
         "video_id": vid,
         "object": obj,
         "quality": quality,
+        "picked_side": picked_side,
+        "picked_center_xy": [round(picked_xy[0], 4), round(picked_xy[1], 4)],
         "detection_count": len(detections),
-        "other_detections": extra,
-        "seed_points": (bound.get("masks") and True) if bound else False,
-        "masks": (bound or {}).get("masks") or {str(obj["id"]): mask_b64} if obj else {"det": mask_b64},
+        "all_detections": extra,
+        "seed_points": bool(bound and bound.get("masks")),
+        "masks": (bound or {}).get("masks") or ({str(obj["id"]): mask_b64} if bind_ok else {"det": mask_b64}),
         "retry_nearby": quality.get("retry_nearby"),
+        "suggestion": suggestion,
     }
 
 
@@ -1260,15 +1678,52 @@ def _execute_tool_inner(name: str, args: dict, session: AgentSession) -> dict:
         )
 
     if name == "add_point_prompt":
-        vid, _video = _resolve_video(session, args.get("video_id"))
+        vid, video = _resolve_video(session, args.get("video_id"))
         fidx = int(args["frame_idx"]) if args.get("frame_idx") is not None else session.frame_idx
         _ensure_frame(session, vid, fidx)
         points = args.get("points") or []
         labels = args.get("labels") or []
         if len(points) != len(labels) or not points:
             raise ValueError("points and labels must be non-empty and the same length")
-        result = _apply_points(session, vid, str(args["object_id"]), fidx, points, labels)
-        return {"ok": True, "frame_idx": fidx, "object_id": str(args["object_id"]), "mask_ids": list((result.get("masks") or {}).keys())}
+        oid = str(args["object_id"])
+        result = _apply_points(session, vid, oid, fidx, points, labels)
+        obj = (video.get("objects") or {}).get(oid) or {}
+        warning = None
+        quality = None
+        try:
+            ms = VideoMaskStorage(s.pm.video_dir(session.pid, vid))
+            dense = ms.load_masks_dense(fidx) if hasattr(ms, "load_masks_dense") else {}
+            mask = (dense or {}).get(oid) or (dense or {}).get(int(oid) if oid.isdigit() else oid)
+            if mask is not None:
+                quality = evaluate_mask_quality(mask)
+                cx = (quality.get("bbox_xywh_norm") or [None])
+                cx = (cx[0] + cx[2] / 2.0) if len(cx) >= 4 else None
+                side = _prefer_side_from_text_and_object("", obj)
+                if side == "right" and cx is not None and cx >= WATER_PORT_MIN_CX:
+                    warning = (
+                        "This click landed on the circular water-bottle port (far-right wall), "
+                        "not the mouse. Click the dark blob on the bedding to the left of that port."
+                    )
+                elif side == "right" and cx is not None and cx < RIGHT_ANIMAL_MIN_CX:
+                    warning = (
+                        "This click did not land on the right-hand (shaved) mouse. "
+                        "Re-inspect and click that dark blob's torso."
+                    )
+                elif side == "left" and cx is not None and cx > 0.45:
+                    warning = (
+                        "This click did not land on the unshaved mouse. "
+                        "Re-inspect and click that mouse's torso, not the other animal or bedding."
+                    )
+        except Exception:
+            pass
+        return {
+            "ok": warning is None,
+            "frame_idx": fidx,
+            "object_id": oid,
+            "mask_ids": list((result.get("masks") or {}).keys()),
+            "quality": quality,
+            "warning": warning,
+        }
 
     if name == "evaluate_segmentation":
         vid, video = _resolve_video(session, args.get("video_id"))
@@ -1299,14 +1754,44 @@ def _execute_tool_inner(name: str, args: dict, session: AgentSession) -> dict:
                 q["retry_nearby"] = True
                 q["reason"] = (q.get("reason") or "") + ",high_overlap"
             per_obj.append(q)
-        any_retry = any(p.get("retry_nearby") for p in per_obj) or not per_obj
+        jpg = s.pm.annotated_frames_dir(session.pid, vid) / f"{fidx:06d}.jpg"
+        if not jpg.exists():
+            jpg = s.pm.frames_dir(session.pid, vid) / f"{fidx:06d}.jpg"
+        blobs = dark_animal_blobs(jpg) if jpg.exists() else []
+        if len(blobs) >= 2:
+            by_area = sorted(blobs, key=lambda b: -b["area"])[:2]
+            left_b, right_b = sorted(by_area, key=lambda b: b["cx"])
+            dense_by_id = {str(k): v for k, v in (dense or {}).items()}
+            for q in per_obj:
+                mask = dense_by_id.get(str(q.get("object_id")))
+                if mask is None:
+                    continue
+                i_l = _mask_iou(mask, left_b["mask"])
+                i_r = _mask_iou(mask, right_b["mask"])
+                q["dark_iou_left"] = round(i_l, 4)
+                q["dark_iou_right"] = round(i_r, 4)
+                best = max(i_l, i_r)
+                if best < DARK_MATCH_IOU:
+                    _append_eval_reason(q, "not_on_animal")
+                    continue
+                side = _prefer_side_from_text_and_object("", {"name": q.get("name") or ""})
+                matched_right = i_r > i_l
+                if side == "right" and not matched_right:
+                    _append_eval_reason(q, "identity_swap")
+                if side == "left" and matched_right:
+                    _append_eval_reason(q, "identity_swap")
+        summary = finalize_segmentation_eval(objects, per_obj)
         return {
-            "ok": bool(per_obj) and not any_retry,
+            "ok": summary["ok"],
             "frame_idx": fidx,
             "video_id": vid,
-            "objects": per_obj,
-            "object_count": len(per_obj),
-            "retry_nearby": any_retry,
+            "objects": summary["objects"],
+            "object_count": len(summary["objects"]),
+            "expected_object_count": summary["expected_object_count"],
+            "masked_object_count": summary["masked_object_count"],
+            "incomplete": summary["incomplete"],
+            "note": summary["note"],
+            "retry_nearby": summary["retry_nearby"],
             "nearby_suggestion": nearby_frames(fidx, int(video.get("num_frames") or 1)),
         }
 
@@ -1474,9 +1959,9 @@ def _call_openai(cfg: LLMConfig, messages: list[dict]) -> dict:
     }
     # SAM 3 Agent / vLLM use max_tokens; newer OpenAI prefers max_completion_tokens.
     if cfg.local or cfg.provider in LOCAL_PROVIDERS:
-        payload["max_tokens"] = 4096
+        payload["max_tokens"] = AGENT_MAX_TOKENS
     else:
-        payload["max_completion_tokens"] = 4096
+        payload["max_completion_tokens"] = AGENT_MAX_TOKENS
     headers = {"Authorization": f"Bearer {cfg.api_key or LOCAL_DUMMY_KEY}"}
     timeout = 300.0 if cfg.local else 120.0
     data = _http_json("POST", url, headers, payload, timeout=timeout)
@@ -1554,7 +2039,7 @@ def _call_anthropic(cfg: LLMConfig, messages: list[dict]) -> dict:
 
     payload = {
         "model": cfg.model,
-        "max_tokens": 4096,
+        "max_tokens": AGENT_MAX_TOKENS,
         "system": sys_text.strip() or SYSTEM_PROMPT,
         "messages": merged,
         "tools": _anthropic_tools(),
@@ -1603,6 +2088,239 @@ def build_initial_messages(
         ),
     })
     return msgs
+
+
+def prune_stale_inspect_images(messages: list[dict], keep: int = KEEP_INSPECT_IMAGES) -> int:
+    """Drop all but the last `keep` inspect JPEGs from the in-flight transcript.
+
+    The agent loop appends every inspect_frame image and never expires them.
+    Qwen-VL charges ~400 tokens per 640×480 JPEG; a 36-step run with 4 inspects
+    already overflows an 8k window, and a full every-1000th pass would not fit
+    even 32k if every image were kept.
+    """
+    idxs = [i for i, m in enumerate(messages) if m.get("images")]
+    if keep < 0:
+        keep = 0
+    drop = idxs if keep == 0 else idxs[:-keep]
+    removed = 0
+    for i in drop:
+        n = len(messages[i].get("images") or [])
+        messages[i].pop("images", None)
+        removed += n
+        prev = (messages[i].get("content") or "").strip()
+        stub = f"[dropped {n} inspect JPEG(s) to save context; frame was already described in the tool result]"
+        if stub not in prev:
+            messages[i]["content"] = f"{prev}\n{stub}".strip() if prev else stub
+    return removed
+
+
+_LAST_AGENT_DUMP: dict[str, Any] = {}
+
+
+def get_last_agent_dump() -> dict[str, Any]:
+    return dict(_LAST_AGENT_DUMP)
+
+
+def inspect_jpegs_in_messages(messages: list[dict]) -> list[dict]:
+    """Metadata for inspect JPEGs currently attached to the in-flight transcript."""
+    out: list[dict] = []
+    for mi, m in enumerate(messages):
+        for ii, im in enumerate(m.get("images") or []):
+            out.append({
+                "message_index": mi,
+                "image_index": ii,
+                "role": m.get("role"),
+                "frame_idx": im.get("frame_idx"),
+                "video_id": im.get("video_id"),
+                "has_jpeg": bool(im.get("jpeg_b64")),
+            })
+    return out
+
+
+def default_agent_dump_dir() -> Path:
+    env = (os.environ.get("AGENT_LLM_DUMP_DIR") or "").strip()
+    if env:
+        return Path(env)
+    root = Path(__file__).resolve().parents[1]
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    return root / "reports" / "agent-runs" / stamp
+
+
+def _messages_without_jpegs(messages: list[dict]) -> list[dict]:
+    slim: list[dict] = []
+    for m in messages:
+        item = {k: v for k, v in m.items() if k != "images"}
+        images = m.get("images") or []
+        if images:
+            item["images"] = [
+                {
+                    "frame_idx": im.get("frame_idx"),
+                    "video_id": im.get("video_id"),
+                    "jpeg_chars": len(im.get("jpeg_b64") or ""),
+                }
+                for im in images
+            ]
+        slim.append(item)
+    return slim
+
+
+def write_agent_context_dump(
+    dump_dir: Path,
+    *,
+    system_prompt: str,
+    overview: dict,
+    user_text: str,
+    messages: list[dict],
+    events: list[dict],
+    llm_turns: list[dict],
+    cfg: LLMConfig,
+    inspect_images: list[dict],
+) -> dict:
+    """Write a readable agent-context report (markdown + JSON + inspect JPEGs)."""
+    dump_dir.mkdir(parents=True, exist_ok=True)
+    jpeg_files: list[dict] = []
+    seen: set[tuple] = set()
+    for im in inspect_images:
+        key = (str(im.get("video_id") or ""), im.get("frame_idx"))
+        b64 = im.get("jpeg_b64") or ""
+        if not b64 or key in seen:
+            continue
+        seen.add(key)
+        name = f"inspect_vid-{key[0]}_frame-{im.get('frame_idx')}.jpg"
+        try:
+            (dump_dir / name).write_bytes(base64.b64decode(b64))
+        except Exception:
+            continue
+        jpeg_files.append({
+            "file": name,
+            "frame_idx": im.get("frame_idx"),
+            "video_id": im.get("video_id"),
+        })
+
+    final_in_context = inspect_jpegs_in_messages(messages)
+    in_context_keys = {
+        (str(x.get("video_id") or ""), x.get("frame_idx"))
+        for x in final_in_context
+    }
+    for rec in jpeg_files:
+        rec["in_final_llm_context"] = (
+            str(rec.get("video_id") or ""), rec.get("frame_idx")
+        ) in in_context_keys
+
+    payload = {
+        "llm": {
+            "provider": cfg.provider,
+            "model": cfg.model,
+            "base_url": cfg.base_url,
+            "profile": normalize_llm_profile(),
+            "local": cfg.local,
+        },
+        "user_text": user_text,
+        "system_prompt": system_prompt,
+        "retrieved_project_json": overview,
+        "events": events,
+        "llm_turns": llm_turns,
+        "inspect_jpegs_seen": jpeg_files,
+        "inspect_jpegs_in_final_context": final_in_context,
+        "messages": _messages_without_jpegs(messages),
+        "keep_inspect_images": KEEP_INSPECT_IMAGES,
+        "max_tokens": AGENT_MAX_TOKENS,
+        "dump_dir": str(dump_dir),
+    }
+    (dump_dir / "context.json").write_text(json.dumps(payload, indent=2, default=str))
+
+    lines: list[str] = [
+        "# Agent context dump",
+        "",
+        f"- Provider: `{cfg.provider}`  model: `{cfg.model}`  profile: `{normalize_llm_profile()}`",
+        f"- Base URL: `{cfg.base_url}`",
+        f"- User: {user_text}",
+        f"- KEEP_INSPECT_IMAGES={KEEP_INSPECT_IMAGES}  AGENT_MAX_TOKENS={AGENT_MAX_TOKENS}",
+        "",
+        "## System prompt",
+        "",
+        "```",
+        system_prompt.strip(),
+        "```",
+        "",
+        "## Retrieved project JSON",
+        "",
+        "```json",
+        json.dumps(overview, indent=2, default=str)[:12000],
+        "```",
+        "",
+        "## Inspect JPEGs",
+        "",
+    ]
+    if not jpeg_files:
+        lines.append("_No inspect_frame JPEGs were attached._")
+    else:
+        lines.append("| File | video_id | frame | in final LLM context |")
+        lines.append("|---|---|---|---|")
+        for rec in jpeg_files:
+            lines.append(
+                f"| `{rec['file']}` | `{rec.get('video_id')}` | {rec.get('frame_idx')} | "
+                f"{'yes' if rec.get('in_final_llm_context') else 'no (pruned)'} |"
+            )
+        lines.append("")
+        for rec in jpeg_files:
+            lines.append(f"### {rec['file']}")
+            lines.append("")
+            lines.append(f"![inspect frame {rec.get('frame_idx')}]({rec['file']})")
+            lines.append("")
+
+    lines += [
+        "## LLM turns (which inspect JPEGs were in context)",
+        "",
+    ]
+    for turn in llm_turns:
+        kept = turn.get("inspect_jpegs_in_context") or []
+        desc = ", ".join(
+            f"video `{x.get('video_id')}` frame {x.get('frame_idx')}" for x in kept
+        ) or "none"
+        lines.append(f"- Step {turn.get('step')}: {desc}")
+    lines += ["", "## Tool calls and results", ""]
+    for ev in events:
+        kind = ev.get("event")
+        data = ev.get("data") or {}
+        if kind == "tool_call":
+            lines.append(f"### `{data.get('name')}` (step {data.get('step')})")
+            lines.append("")
+            lines.append("Arguments:")
+            lines.append("")
+            lines.append("```json")
+            lines.append(json.dumps(data.get("arguments") or {}, indent=2, default=str))
+            lines.append("```")
+            lines.append("")
+        elif kind == "tool_result":
+            lines.append(f"Result (`ok={data.get('ok')}`, {data.get('elapsed_ms')} ms):")
+            lines.append("")
+            lines.append("```json")
+            lines.append(json.dumps(data.get("result") or {}, indent=2, default=str)[:8000])
+            lines.append("```")
+            lines.append("")
+        elif kind in ("reasoning", "message", "error"):
+            text = (data.get("text") or data.get("message") or "").strip()
+            if text:
+                lines.append(f"**{kind}:** {text}")
+                lines.append("")
+    (dump_dir / "context.md").write_text("\n".join(lines))
+
+    latest = dump_dir.parent / "latest.json"
+    latest.write_text(json.dumps({"dump_dir": str(dump_dir), "context_md": str(dump_dir / "context.md")}, indent=2))
+
+    summary = {
+        "dump_dir": str(dump_dir),
+        "context_md": str(dump_dir / "context.md"),
+        "context_json": str(dump_dir / "context.json"),
+        "inspect_jpegs_seen": jpeg_files,
+        "inspect_jpegs_in_final_context": final_in_context,
+        "llm": payload["llm"],
+        "tool_call_count": sum(1 for e in events if e.get("event") == "tool_call"),
+    }
+    global _LAST_AGENT_DUMP
+    _LAST_AGENT_DUMP = summary
+    return summary
 
 
 def _tool_result_for_llm(result: dict) -> str:
@@ -1654,36 +2372,78 @@ def run_agent_sync(
 
     messages = build_initial_messages(user_text, overview, history)
     pending_images: list[dict] = []
+    recorded_events: list[dict] = [{"event": "status", "data": {
+        "phase": "started",
+        "provider": cfg.provider,
+        "model": cfg.model,
+        "video_id": session.video_id,
+        "frame_idx": session.frame_idx,
+        "project_name": overview.get("project_name"),
+        "video_count": overview.get("video_count"),
+    }}]
+    llm_turns: list[dict] = []
+    inspect_images: list[dict] = []
+
+    def emit_and_record(event: str, payload: dict) -> None:
+        recorded_events.append({"event": event, "data": payload})
+        emit(event, payload)
+
+    def flush_dump() -> None:
+        try:
+            dump_dir = default_agent_dump_dir()
+            summary = write_agent_context_dump(
+                dump_dir,
+                system_prompt=SYSTEM_PROMPT,
+                overview=overview,
+                user_text=user_text,
+                messages=messages,
+                events=recorded_events,
+                llm_turns=llm_turns,
+                cfg=cfg,
+                inspect_images=inspect_images,
+            )
+            emit("context_dump", summary)
+        except Exception:
+            logger.exception("Failed to write agent context dump")
 
     for step in range(MAX_AGENT_STEPS):
         if session.cancel.is_set():
-            emit("error", {"message": "Cancelled"})
+            emit_and_record("error", {"message": "Cancelled"})
+            flush_dump()
             return
         if pending_images:
+            inspect_images.extend(pending_images)
             messages.append({
                 "role": "user",
                 "content": "Visual: JPEG(s) of the inspected frame(s) are attached.",
                 "images": list(pending_images),
             })
             pending_images = []
-        emit("status", {"phase": "thinking", "step": step + 1, "max_steps": MAX_AGENT_STEPS})
+        prune_stale_inspect_images(messages)
+        llm_turns.append({
+            "step": step + 1,
+            "inspect_jpegs_in_context": inspect_jpegs_in_messages(messages),
+        })
+        emit_and_record("status", {"phase": "thinking", "step": step + 1, "max_steps": MAX_AGENT_STEPS})
         try:
             llm = call_llm(cfg, messages)
         except Exception as e:
             logger.exception("LLM call failed")
-            emit("error", {"message": f"LLM request failed: {e}"})
+            emit_and_record("error", {"message": f"LLM request failed: {e}"})
+            flush_dump()
             return
         content = (llm.get("content") or "").strip()
         tool_calls = [tc for tc in (llm.get("tool_calls") or []) if tc.get("name")]
         if content:
             kind = "reasoning" if tool_calls else "message"
-            emit(kind, {"text": content, "step": step + 1})
+            emit_and_record(kind, {"text": content, "step": step + 1})
 
         if not tool_calls:
             if content:
-                emit("done", {"text": content, "steps": step + 1})
+                emit_and_record("done", {"text": content, "steps": step + 1})
             else:
-                emit("done", {"text": "Done.", "steps": step + 1})
+                emit_and_record("done", {"text": "Done.", "steps": step + 1})
+            flush_dump()
             return
 
         messages.append({
@@ -1694,27 +2454,28 @@ def run_agent_sync(
 
         for tc in tool_calls:
             if session.cancel.is_set():
-                emit("error", {"message": "Cancelled"})
+                emit_and_record("error", {"message": "Cancelled"})
+                flush_dump()
                 return
             tname = tc["name"]
             targs = tc.get("arguments") or {}
             if not isinstance(targs, dict):
                 targs = {}
-            emit("tool_call", {
+            emit_and_record("tool_call", {
                 "id": tc.get("id"),
                 "name": tname,
                 "arguments": targs,
                 "step": step + 1,
             })
             if tname == "think":
-                emit("reasoning", {"text": targs.get("thought") or "", "step": step + 1})
+                emit_and_record("reasoning", {"text": targs.get("thought") or "", "step": step + 1})
 
             t0 = time.time()
             result, ui_events = execute_tool(tname, targs, session)
             dt = int((time.time() - t0) * 1000)
             for ui in ui_events:
-                emit("ui", ui)
-            emit("tool_result", {
+                emit_and_record("ui", ui)
+            emit_and_record("tool_result", {
                 "id": tc.get("id"),
                 "name": tname,
                 "ok": bool(result.get("ok", True)),
@@ -1732,8 +2493,9 @@ def run_agent_sync(
                 "content": _tool_result_for_llm(result),
             })
 
-    emit("message", {"text": "Stopped after the step limit. Ask me to continue from here if needed."})
-    emit("done", {"text": "Step limit reached.", "steps": MAX_AGENT_STEPS})
+    emit_and_record("message", {"text": "Stopped after the step limit. Ask me to continue from here if needed."})
+    emit_and_record("done", {"text": "Step limit reached.", "steps": MAX_AGENT_STEPS})
+    flush_dump()
 
 
 async def run_agent_sse(

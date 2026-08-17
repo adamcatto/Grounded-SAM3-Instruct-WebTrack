@@ -1,6 +1,7 @@
 """Unit tests for agentic prompting helpers (no GPU / LLM required)."""
 
 import os
+import base64
 import tempfile
 import unittest
 from pathlib import Path
@@ -51,6 +52,136 @@ class TestMaskQuality(unittest.TestCase):
         q = agent.evaluate_mask_quality(m, score=0.99)
         self.assertIn("mask_covers_most_of_frame", q["reason"])
 
+    def test_split_body_and_tail_is_not_ok(self):
+        m = np.zeros((200, 200), dtype=np.uint8)
+        m[20:70, 20:80] = 1
+        m[140:185, 90:150] = 1
+        q = agent.evaluate_mask_quality(m, score=0.9)
+        self.assertIn("split_components", q["reason"])
+        self.assertFalse(q["ok"])
+
+
+class TestTwoMouseAssignment(unittest.TestCase):
+    def _det(self, cx: float, score: float = 0.9) -> dict:
+        return {"bbox": [cx - 0.05, 0.4, 0.1, 0.2], "score": score, "mask": np.ones((8, 8), dtype=np.uint8)}
+
+    def test_noshave_picks_leftmost(self):
+        dets = [self._det(0.8, 0.99), self._det(0.3, 0.7)]
+        picked = agent._pick_detection(dets, "mouse", {"name": "NoShave"})
+        self.assertAlmostEqual(agent._bbox_center_xy(picked)[0], 0.3)
+
+    def test_headshave_picks_rightmost(self):
+        dets = [self._det(0.66, 0.4), self._det(0.3, 0.99)]
+        picked = agent._pick_detection(dets, "mouse", {"name": "HeadShave"})
+        self.assertAlmostEqual(agent._bbox_center_xy(picked)[0], 0.66)
+
+    def test_headshave_skips_water_port(self):
+        dets = [self._det(0.32), self._det(0.66, 0.8), self._det(0.80, 0.99)]
+        picked = agent._pick_detection(dets, "dark mouse", {"name": "HeadShave"})
+        self.assertAlmostEqual(agent._bbox_center_xy(picked)[0], 0.66)
+
+    def test_noshave_skips_right_mouse(self):
+        dets = [self._det(0.66, 0.99), self._det(0.32, 0.7)]
+        picked = agent._pick_detection(dets, "dark mouse", {"name": "NoShave"})
+        self.assertAlmostEqual(agent._bbox_center_xy(picked)[0], 0.32)
+
+    def test_text_left_overrides_score(self):
+        dets = [self._det(0.8, 0.99), self._det(0.25, 0.2)]
+        picked = agent._pick_detection(dets, "unshaved mouse on the left", None)
+        self.assertAlmostEqual(agent._bbox_center_xy(picked)[0], 0.25)
+
+    def test_far_right_phrase(self):
+        self.assertTrue(agent._text_implies_far_right(
+            "shaved mouse on the far right by the circular water bottle port", None
+        ))
+        self.assertFalse(agent._text_implies_far_right("mouse", {"name": "HeadShave"}))
+
+    def test_evaluate_reports_missing_object(self):
+        objects = {"1": {"name": "HeadShave"}, "2": {"name": "NoShave"}}
+        left = {
+            "ok": True,
+            "reason": "ok",
+            "area_px": 1000,
+            "bbox_xywh_norm": [0.2, 0.4, 0.15, 0.2],
+            "object_id": "2",
+            "name": "NoShave",
+            "retry_nearby": False,
+        }
+        summary = agent.finalize_segmentation_eval(objects, [left])
+        self.assertFalse(summary["ok"])
+        self.assertTrue(summary["incomplete"])
+        self.assertEqual(summary["masked_object_count"], 1)
+        reasons = {p["object_id"]: p["reason"] for p in summary["objects"]}
+        self.assertEqual(reasons["1"], "missing_mask")
+
+    def test_evaluate_flags_same_location(self):
+        objects = {"1": {"name": "HeadShave"}, "2": {"name": "NoShave"}}
+        a = {
+            "ok": True, "reason": "ok", "area_px": 2000,
+            "bbox_xywh_norm": [0.30, 0.40, 0.10, 0.10],
+            "object_id": "1", "name": "HeadShave", "retry_nearby": False,
+        }
+        b = {
+            "ok": True, "reason": "ok", "area_px": 1800,
+            "bbox_xywh_norm": [0.31, 0.41, 0.10, 0.10],
+            "object_id": "2", "name": "NoShave", "retry_nearby": False,
+        }
+        summary = agent.finalize_segmentation_eval(objects, [a, b])
+        self.assertFalse(summary["ok"])
+        self.assertTrue(all("same_location" in p["reason"] for p in summary["objects"]))
+
+    def test_evaluate_flags_bedding_and_identity_swap(self):
+        objects = {"1": {"name": "HeadShave"}, "2": {"name": "NoShave"}}
+        swapped_left = {
+            "ok": True, "reason": "ok", "area_px": 20000,
+            "bbox_xywh_norm": [0.17, 0.42, 0.20, 0.28],
+            "object_id": "1", "name": "HeadShave", "retry_nearby": False,
+        }
+        gap_bedding = {
+            "ok": True, "reason": "ok", "area_px": 8000,
+            "bbox_xywh_norm": [0.43, 0.40, 0.10, 0.16],
+            "object_id": "2", "name": "NoShave", "retry_nearby": False,
+        }
+        summary = agent.finalize_segmentation_eval(objects, [swapped_left, gap_bedding])
+        self.assertFalse(summary["ok"])
+        self.assertFalse(summary["incomplete"])
+        by_id = {p["object_id"]: p["reason"] for p in summary["objects"]}
+        self.assertIn("identity_swap", by_id["1"])
+        self.assertIn("likely_bedding", by_id["2"])
+
+    def test_evaluate_flags_water_port(self):
+        objects = {"1": {"name": "HeadShave"}, "2": {"name": "NoShave"}}
+        port = {
+            "ok": True, "reason": "ok", "area_px": 16000,
+            "bbox_xywh_norm": [0.73, 0.39, 0.10, 0.22],
+            "object_id": "1", "name": "HeadShave", "retry_nearby": False,
+        }
+        left = {
+            "ok": True, "reason": "ok", "area_px": 22000,
+            "bbox_xywh_norm": [0.17, 0.42, 0.20, 0.28],
+            "object_id": "2", "name": "NoShave", "retry_nearby": False,
+        }
+        summary = agent.finalize_segmentation_eval(objects, [port, left])
+        self.assertFalse(summary["ok"])
+        by_id = {p["object_id"]: p["reason"] for p in summary["objects"]}
+        self.assertIn("likely_water_port", by_id["1"])
+
+    def test_evaluate_accepts_opposite_sides(self):
+        objects = {"1": {"name": "HeadShave"}, "2": {"name": "NoShave"}}
+        right = {
+            "ok": True, "reason": "ok", "area_px": 26000,
+            "bbox_xywh_norm": [0.61, 0.36, 0.10, 0.23],
+            "object_id": "1", "name": "HeadShave", "retry_nearby": False,
+        }
+        left = {
+            "ok": True, "reason": "ok", "area_px": 22000,
+            "bbox_xywh_norm": [0.17, 0.42, 0.20, 0.28],
+            "object_id": "2", "name": "NoShave", "retry_nearby": False,
+        }
+        summary = agent.finalize_segmentation_eval(objects, [right, left])
+        self.assertTrue(summary["ok"])
+        self.assertFalse(summary["incomplete"])
+
 
 class TestProjectOverview(unittest.TestCase):
     def test_overview_lists_videos_and_current(self):
@@ -88,6 +219,28 @@ class TestProjectOverview(unittest.TestCase):
         current = next(r for r in ov["videos"] if r["is_current"])
         self.assertEqual(current["object_count"], 1)
         self.assertEqual(current["prompted_frame_count"], 1)
+        other = next(r for r in ov["videos"] if not r["is_current"])
+        self.assertNotIn("prompted_frame_count", other)
+        self.assertIn("name", other)
+
+    def test_detections_from_numpy_outputs(self):
+        mask = np.zeros((8, 8), dtype=np.uint8)
+        mask[2:6, 2:6] = 1
+        dets = agent._detections_from_sam_outputs({
+            "out_obj_ids": np.array([3]),
+            "out_binary_masks": np.array([mask]),
+            "out_boxes_xywh": np.array([[0.1, 0.2, 0.3, 0.4]]),
+            "out_probs": np.array([0.9]),
+        })
+        self.assertEqual(len(dets), 1)
+        self.assertEqual(dets[0]["score"], 0.9)
+        self.assertEqual(dets[0]["mask"].shape, (8, 8))
+
+    def test_detections_empty_numpy_is_not_ambiguous(self):
+        self.assertEqual(agent._detections_from_sam_outputs({
+            "out_obj_ids": np.array([]),
+            "out_binary_masks": np.array([]),
+        }), [])
 
 
 class TestToolSurface(unittest.TestCase):
@@ -111,8 +264,10 @@ class TestToolSurface(unittest.TestCase):
 
     def test_system_prompt_covers_workflow(self):
         p = agent.SYSTEM_PROMPT.lower()
-        for needle in ("every nth", "nearby", "text", "point", "propagation", "inspect"):
+        for needle in ("every nth", "nearby", "text", "point", "propagation", "inspect", "n mice"):
             self.assertIn(needle, p)
+        self.assertIn("reuse existing", p)
+        self.assertNotIn("0.78", p)
 
     def test_initial_messages_include_context(self):
         msgs = agent.build_initial_messages(
@@ -140,7 +295,21 @@ class TestLLMConfig(unittest.TestCase):
         }
         if extra:
             env.update(extra)
-        return mock.patch.dict(os.environ, env, clear=False)
+        ctx = mock.patch.dict(os.environ, env, clear=False)
+
+        class _Cleared:
+            def __enter__(self):
+                self._cm = ctx
+                inner = self._cm.__enter__()
+                for k in ("AGENT_LLM_THINKING", "AGENT_LLM_PROFILE"):
+                    if extra is None or k not in extra:
+                        os.environ.pop(k, None)
+                return inner
+
+            def __exit__(self, *args):
+                return self._cm.__exit__(*args)
+
+        return _Cleared()
 
     def test_missing_local_and_cloud(self):
         with self._clear_llm_env({"AGENT_LLM_PROVIDER": "openai", "AGENT_LLM_MODEL": "gpt-4o"}):
@@ -184,6 +353,31 @@ class TestLLMConfig(unittest.TestCase):
         self.assertEqual(cfg.base_url, "http://127.0.0.1:8001/v1")
         self.assertEqual(cfg.model, "Qwen/Qwen3-VL-8B-Thinking")
 
+    def test_vllm_profile_a100_defaults_to_32b_instruct(self):
+        with self._clear_llm_env({"AGENT_LLM_PROVIDER": "vllm", "AGENT_LLM_PROFILE": "a100"}):
+            for k in ("AGENT_LLM_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+                os.environ.pop(k, None)
+            with mock.patch.object(agent, "discover_local_llm", return_value=None):
+                cfg = agent.load_llm_config(probe=False)
+        self.assertEqual(cfg.model, "Qwen/Qwen3-VL-32B-Instruct")
+        self.assertEqual(agent.default_vllm_model("a100"), "Qwen/Qwen3-VL-32B-Instruct")
+        self.assertEqual(
+            agent.default_vllm_model("a100", thinking=True),
+            "Qwen/Qwen3-VL-32B-Thinking",
+        )
+
+    def test_vllm_profile_h100x4_defaults_to_72b(self):
+        with self._clear_llm_env({"AGENT_LLM_PROVIDER": "vllm", "AGENT_LLM_PROFILE": "h100x4"}):
+            with mock.patch.object(agent, "discover_local_llm", return_value=None):
+                cfg = agent.load_llm_config(probe=False)
+        self.assertEqual(cfg.model, "Qwen/Qwen2.5-VL-72B-Instruct")
+        self.assertEqual(agent.normalize_llm_profile("cluster"), "h100x4")
+        self.assertEqual(agent.normalize_llm_profile("workstation"), "a100")
+
+    def test_vllm_profile_shared_stays_8b(self):
+        self.assertEqual(agent.default_vllm_model("a100-shared"), "Qwen/Qwen3-VL-8B-Instruct")
+        self.assertEqual(agent.default_vllm_model("demo"), "Qwen/Qwen3-VL-8B-Thinking")
+
     def test_ollama_autodetect(self):
         found = {
             "provider": "ollama",
@@ -209,6 +403,88 @@ class TestLLMConfig(unittest.TestCase):
             agent._normalize_openai_base("http://127.0.0.1:11434", "ollama"),
             "http://127.0.0.1:11434/v1",
         )
+
+
+class TestContextPruning(unittest.TestCase):
+    def test_keeps_only_last_two_inspect_images(self):
+        msgs = [{"role": "system", "content": "sys"}]
+        for i in range(4):
+            msgs.append({
+                "role": "user",
+                "content": f"Visual frame {i}",
+                "images": [{"jpeg_b64": f"fake{i}", "frame_idx": i}],
+            })
+        dropped = agent.prune_stale_inspect_images(msgs, keep=2)
+        self.assertEqual(dropped, 2)
+        with_images = [m for m in msgs if m.get("images")]
+        self.assertEqual(len(with_images), 2)
+        self.assertEqual(with_images[0]["images"][0]["frame_idx"], 2)
+        self.assertEqual(with_images[1]["images"][0]["frame_idx"], 3)
+        self.assertIn("dropped", msgs[1]["content"])
+
+    def test_inspect_jpegs_in_messages_lists_kept_frames(self):
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {
+                "role": "user",
+                "content": "Visual",
+                "images": [{"jpeg_b64": "abc", "frame_idx": 160, "video_id": "vid1"}],
+            },
+        ]
+        kept = agent.inspect_jpegs_in_messages(msgs)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0]["frame_idx"], 160)
+        self.assertEqual(kept[0]["video_id"], "vid1")
+
+    def test_write_agent_context_dump_saves_markdown_and_jpeg(self):
+        dump = Path(tempfile.mkdtemp(prefix="sam3wt_agent_dump_"))
+        jpeg = base64.b64encode(b"\xff\xd8fakejpeg").decode()
+        cfg = agent.LLMConfig(
+            provider="vllm",
+            api_key="DUMMY_API_KEY",
+            model="Qwen/Qwen3-VL-8B-Instruct",
+            base_url="http://127.0.0.1:8001/v1",
+            configured=True,
+            local=True,
+        )
+        messages = [
+            {"role": "system", "content": agent.SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": "Visual",
+                "images": [{"jpeg_b64": jpeg, "frame_idx": 7, "video_id": "v1"}],
+            },
+        ]
+        summary = agent.write_agent_context_dump(
+            dump,
+            system_prompt=agent.SYSTEM_PROMPT,
+            overview={"project_name": "demo", "videos": []},
+            user_text="inspect and segment two mice",
+            messages=messages,
+            events=[
+                {"event": "tool_call", "data": {"name": "inspect_frame", "arguments": {"frame_idx": 7}, "step": 1}},
+                {"event": "tool_result", "data": {"name": "inspect_frame", "ok": True, "result": {"frame_idx": 7}, "elapsed_ms": 12, "step": 1}},
+            ],
+            llm_turns=[{"step": 1, "inspect_jpegs_in_context": agent.inspect_jpegs_in_messages(messages)}],
+            cfg=cfg,
+            inspect_images=[{"jpeg_b64": jpeg, "frame_idx": 7, "video_id": "v1"}],
+        )
+        self.assertTrue((dump / "context.md").is_file())
+        self.assertTrue((dump / "context.json").is_file())
+        self.assertTrue(summary["inspect_jpegs_seen"])
+        jpeg_path = dump / summary["inspect_jpegs_seen"][0]["file"]
+        self.assertTrue(jpeg_path.is_file())
+        md = (dump / "context.md").read_text()
+        self.assertIn("System prompt", md)
+        self.assertIn("Retrieved project JSON", md)
+        self.assertIn("inspect_frame", md)
+        self.assertIn("in final LLM context", md)
+        last = agent.get_last_agent_dump()
+        self.assertEqual(last["dump_dir"], str(dump))
+
+    def test_agent_max_tokens_is_below_8k_window(self):
+        self.assertLessEqual(agent.AGENT_MAX_TOKENS, 2048)
+        self.assertEqual(agent.KEEP_INSPECT_IMAGES, 2)
 
 
 class TestSyntheticVideoFixture(unittest.TestCase):

@@ -1,0 +1,39 @@
+{
+  "dump_dir": "/opt/software/Grounded-SAM3-Instruct-WebTrack/reports/agent-runs/20260816-173144",
+  "context_md": "/opt/software/Grounded-SAM3-Instruct-WebTrack/reports/agent-runs/20260816-173144/context.md",
+  "context_json": "/opt/software/Grounded-SAM3-Instruct-WebTrack/reports/agent-runs/20260816-173144/context.json",
+  "inspect_jpegs_seen": [
+    {
+      "file": "inspect_vid-f09434ac_frame-160.jpg",
+      "frame_idx": 160,
+      "video_id": "f09434ac",
+      "in_final_llm_context": true
+    }
+  ],
+  "inspect_jpegs_in_final_context": [
+    {
+      "message_index": 4,
+      "image_index": 0,
+      "role": "user",
+      "frame_idx": 160,
+      "video_id": "f09434ac",
+      "has_jpeg": true
+    },
+    {
+      "message_index": 15,
+      "image_index": 0,
+      "role": "user",
+      "frame_idx": 160,
+      "video_id": "f09434ac",
+      "has_jpeg": true
+    }
+  ],
+  "llm": {
+    "provider": "vllm",
+    "model": "Qwen/Qwen3-VL-8B-Instruct",
+    "base_url": "http://127.0.0.1:8001/v1",
+    "profile": "a100",
+    "local": true
+  },
+  "tool_call_count": 10
+}

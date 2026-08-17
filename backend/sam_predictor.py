@@ -617,8 +617,16 @@ class SAMPredictor:
         try:
             from sam3.model.sam3_image_processor import Sam3Processor
             predictor = _get_predictor()
-            # Video predictor may already expose the underlying image model.
-            image_model = getattr(predictor, "model", None) or getattr(predictor, "image_model", None)
+            # Video predictor is Sam3VideoInference*; the grounding model is `.detector`
+            # (has `.backbone`). Passing the video object into Sam3Processor raises
+            # `'Sam3VideoInferenceWithInstanceInteractivity' object has no attribute 'backbone'`.
+            image_model = None
+            if hasattr(predictor, "detector") and hasattr(predictor.detector, "backbone"):
+                image_model = predictor.detector
+            else:
+                cand = getattr(predictor, "model", None) or getattr(predictor, "image_model", None)
+                if cand is not None and hasattr(cand, "backbone"):
+                    image_model = cand
             if image_model is not None:
                 processor = Sam3Processor(image_model)
         except Exception as e:
@@ -644,21 +652,29 @@ class SAMPredictor:
         if masks is None:
             return []
 
-        if hasattr(masks, "cpu"):
-            masks = masks.cpu().numpy()
+        def _to_numpy(t):
+            if t is None:
+                return None
+            if hasattr(t, "detach"):
+                t = t.detach()
+            if hasattr(t, "float"):
+                t = t.float()
+            if hasattr(t, "cpu"):
+                t = t.cpu()
+            return t.numpy() if hasattr(t, "numpy") else np.asarray(t)
+
+        masks = _to_numpy(masks)
         masks = np.asarray(masks)
         if masks.ndim == 2:
             masks = masks[None, ...]
         n = masks.shape[0]
         score_list = []
         if scores is not None:
-            if hasattr(scores, "cpu"):
-                scores = scores.cpu().numpy()
+            scores = _to_numpy(scores)
             score_list = [float(s) for s in np.asarray(scores).reshape(-1)]
         box_list = []
         if boxes is not None:
-            if hasattr(boxes, "cpu"):
-                boxes = boxes.cpu().numpy()
+            boxes = _to_numpy(boxes)
             box_list = np.asarray(boxes).reshape(-1, 4)
 
         for i in range(n):

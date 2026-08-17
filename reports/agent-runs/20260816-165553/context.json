@@ -1,0 +1,975 @@
+{
+  "llm": {
+    "provider": "vllm",
+    "model": "Qwen/Qwen3-VL-8B-Instruct",
+    "base_url": "http://127.0.0.1:8001/v1",
+    "profile": "a100",
+    "local": true
+  },
+  "user_text": "This home-cage frame has exactly two mice. Each mouse is ONE object: head, body, AND tail in a single connected mask. Do not split body and tail. Do not create extra objects. Shaved HeadShave is on the FAR RIGHT (torso about 0.78, 0.50). Unshaved NoShave is on the LEFT (torso about 0.32, 0.50). Inspect first. The canvas should be empty of old points. Then add_point_prompt once per existing object: 1) NoShave (object 2): one positive click on the left mouse torso. Include the tail in that same mask \u2014 never put a negative click on its tail. 2) HeadShave (object 1): one positive click on the right mouse torso. Do not click the circular water-bottle port (~0.85, 0.42) or empty bedding (x=0.50\u20130.70). evaluate_segmentation. If split_components, add another positive point on the missing tail/body, still on the same object id. Do not finish until both mice have compact connected masks on opposite sides. Do not start propagation.",
+  "system_prompt": "You are the SAM3 Web Tracker agent. You annotate and track objects in behavior videos by calling tools. The user watches a live chat of your reasoning and actions while the main canvas updates the same way a human annotation would.\n\n## What you know\n- The project may contain many videos. Always check get_project_overview if you are unsure which video you are on, how many videos exist, or what they are named.\n- Each video has a frame count, fps, start_frame, objects (id, name, description), saved point prompts, and optional propagation state.\n- Frames are 0-indexed. The UI shows JPEG frames when paused; you must goto_frame / inspect_frame so the backend extracts the frame before SAM can run.\n- Object ids are strings (\"1\", \"2\", \u2026). Names like BackShave are display names \u2014 create them with create_object and keep using the returned id.\n- SAM3 tracker mode stores **point prompts**. Text segmentation finds a mask, then we convert it to points and persist them so tracking/propagation behaves normally.\n- Propagation (Track Objects) needs at least one point prompt. After you have labeled the planned frames, call start_propagation if the user asked to track.\n\n## How to work\n1. Orient: get_project_overview (and get_video_details for the active video).\n2. Plan: if the user says \"every Nth frame\", call plan_frames. Typical interval is 1000 (or the video's anchor_batch_size).\n3. For each planned frame:\n   a. goto_frame then inspect_frame so you can see animals, occlusion, blur, and identity cues.\n   b. create_object once per identity (reuse existing objects with the same name).\n   c. text_segment once per identity with a phrase that includes count/side/shave-state (e.g. \"unshaved mouse on the left\" vs \"shaved mouse on the right near the water port\"). Reuse existing object ids.\n   d. evaluate_segmentation. If confidence is low, the frame is empty, identities are swapped, or animals overlap badly: think, then try nearby frames (\u00b120, then \u00b140) via plan_frames(around_frame=..., nearby_offset=20). If the result is incomplete / missing_mask, stay on this frame and segment the remaining animals.\n   e. If text segmentation is weak but you can see the animal, add_point_prompt at a chest/back point (positive=1). Use a negative point (0) on the *other* animal if they touch \u2014 never on the same animal's tail.\n   f. commit_anchor when the frame is a planned grid/anchor frame and the masks look right.\n4. Adapt. Do not blindly march the grid if a frame is unusable. Skip to a clearer neighbor, then continue the plan.\n5. After the requested frames are labeled, start_propagation if the user wants tracking. Do not start it for a single-frame-only request.\n\n## Text vs points\n- Prefer text_segment when the description is visually distinctive (shaved patch, color, size).\n- Prefer inspect_frame + add_point_prompt when animals look similar, are overlapping, or text confidence is low.\n- Never invent coordinates without having inspected the frame (or a text_segment result that returned a bbox).\n- If the user says there are N mice/animals, that count is ground truth. Call text_segment once per identity. Put side and shave-state in the phrase. The backend binds the leftmost or rightmost detection when the phrase or object name (NoShave / HeadShave) implies a side. Do not finish until evaluate_segmentation reports masked_object_count >= N and no missing_mask. One mask is a failure.\n- If evaluate_segmentation returns incomplete or missing_mask, stay on this frame and segment the remaining object. A blob on empty bedding is not a mouse \u2014 re-inspect and click the animal that still has no mask. In top-down home-cage videos the two mice are often on opposite sides; a \"second\" mask around x=0.60\u20130.67 is frequently bedding, not the far-right animal. A click on the circular water-bottle port (far-right wall) makes SAM fill most of the cage \u2014 click the animal's torso instead, and add a negative point on the other mouse.\n- When using add_point_prompt, place a new positive point on that animal's torso from the inspect JPEG. Do not copy another object's point list.\n- One animal = one connected mask that includes head, body, and tail. Never put a negative click on the same mouse's tail (that splits body and tail into two blobs). If evaluate_segmentation reports split_components, add another positive point on the missing part (usually the tail), do not create a new object.\n\n## Style\n- Call think before multi-step plans and after failures.\n- Keep user-facing messages short. Put detail in think / tool results.\n- Do not reset or delete the user's existing objects unless they ask.\n- Stay on the video the user specified; if they said \"this video\" use the current one.\n- If the tracking mode is pose_tracking, say you only handle segmentation/tracking objects here.\n",
+  "retrieved_project_json": {
+    "project_id": "9f8a7b6c",
+    "project_name": "sandbox_Home-Cage-Interactions-0126-test-day",
+    "tracking_mode": "segmentation_tracking",
+    "video_count": 47,
+    "current_video_id": "f09434ac",
+    "current_frame": 160,
+    "videos": [
+      {
+        "id": "f09434ac",
+        "name": "1A_video_test1a_20260130_090255.mp4",
+        "num_frames": 59443,
+        "fps": 30.0,
+        "width": 1920,
+        "height": 1080,
+        "start_frame": 160,
+        "anchor_batch_size": null,
+        "object_count": 2,
+        "objects": [
+          {
+            "id": "1",
+            "name": "HeadShave",
+            "description": "",
+            "color": "#5B8DD9"
+          },
+          {
+            "id": "2",
+            "name": "NoShave",
+            "description": "",
+            "color": "#E8A445"
+          }
+        ],
+        "prompted_frame_count": 0,
+        "prompted_frames_sample": [],
+        "annotated_anchors": [],
+        "anchor_labeling_complete": false,
+        "propagation_complete": false,
+        "propagated_frame_count": 0,
+        "is_current": true
+      },
+      {
+        "id": "6bcb3f3a",
+        "name": "1A_video_test1b_20260130_100517.mp4",
+        "num_frames": 59444,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "3b15bce1",
+        "name": "1A_video_test1c_20260130_111209.mp4",
+        "num_frames": 59444,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "f0ad21e9",
+        "name": "1A_video_test1d_20260130_121202.mp4",
+        "num_frames": 59444,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "f04b915c",
+        "name": "1A_video_test1e_20260130_131549.mp4",
+        "num_frames": 59444,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "99d4a9cf",
+        "name": "1A_video_test1f_20260130_140736.mp4",
+        "num_frames": 59444,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "963b9700",
+        "name": "1B_video_test1a_20260130_090255.mp4",
+        "num_frames": 59444,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "a34f6ae6",
+        "name": "1B_video_test1b_20260130_100517.mp4",
+        "num_frames": 59443,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "9bb72f59",
+        "name": "1B_video_test1c_20260130_111209.mp4",
+        "num_frames": 59444,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "570b06d1",
+        "name": "1B_video_test1d_20260130_121202.mp4",
+        "num_frames": 59444,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "b5791e07",
+        "name": "1B_video_test1e_20260130_131549.mp4",
+        "num_frames": 59443,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "4c48a42f",
+        "name": "1B_video_test1f_20260130_140736.mp4",
+        "num_frames": 59444,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "946d42eb",
+        "name": "2A_video_test1a_20260130_090255.mp4",
+        "num_frames": 59442,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "9cda62c1",
+        "name": "2A_video_test1b_20260130_100517.mp4",
+        "num_frames": 59443,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "e100b21f",
+        "name": "2A_video_test1c_20260130_111209.mp4",
+        "num_frames": 59443,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "3bdd1043",
+        "name": "2A_video_test1d_20260130_121202.mp4",
+        "num_frames": 59443,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "8486b200",
+        "name": "2A_video_test1e_20260130_131549.mp4",
+        "num_frames": 59444,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "2a349693",
+        "name": "2A_video_test1f_20260130_140736.mp4",
+        "num_frames": 59438,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "daa91132",
+        "name": "2B_video_test1a_20260130_090255.mp4",
+        "num_frames": 59432,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "93f96275",
+        "name": "2B_video_test1b_20260130_100517.mp4",
+        "num_frames": 59444,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "7bf3ec98",
+        "name": "2B_video_test1c_20260130_111209.mp4",
+        "num_frames": 59433,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "e5099689",
+        "name": "2B_video_test1d_20260130_121202.mp4",
+        "num_frames": 59435,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "596eacb4",
+        "name": "2B_video_test1e_20260130_131549.mp4",
+        "num_frames": 59435,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "1641a5f6",
+        "name": "2B_video_test1f_20260130_140736.mp4",
+        "num_frames": 59432,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "9465c0b2",
+        "name": "3A_video_test1a_20260130_090255.mp4",
+        "num_frames": 59444,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "9bd13c70",
+        "name": "3A_video_test1b_20260130_100517.mp4",
+        "num_frames": 59444,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "757e9f04",
+        "name": "3A_video_test1c_20260130_111209.mp4",
+        "num_frames": 59444,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "00d48b80",
+        "name": "3A_video_test1d_20260130_121202.mp4",
+        "num_frames": 59444,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "4e107c2e",
+        "name": "3A_video_test1e_20260130_131549.mp4",
+        "num_frames": 59444,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "202b7239",
+        "name": "3A_video_test1f_20260130_140736.mp4",
+        "num_frames": 59444,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "baac729e",
+        "name": "3B_video_test1a_20260130_090255.mp4",
+        "num_frames": 59444,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "c0e2cab7",
+        "name": "3B_video_test1b_20260130_100517.mp4",
+        "num_frames": 59444,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "03462ba1",
+        "name": "3B_video_test1c_20260130_111209.mp4",
+        "num_frames": 59444,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "d2016605",
+        "name": "3B_video_test1d_20260130_121202.mp4",
+        "num_frames": 59444,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "6e181cda",
+        "name": "3B_video_test1e_20260130_131549.mp4",
+        "num_frames": 59444,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "03405fe3",
+        "name": "4A_video_test1a_20260130_090255.mp4",
+        "num_frames": 59444,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "96d4abf2",
+        "name": "4A_video_test1b_20260130_100517.mp4",
+        "num_frames": 59444,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "79ebb088",
+        "name": "4A_video_test1c_20260130_111209.mp4",
+        "num_frames": 59444,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "bcddef38",
+        "name": "4A_video_test1d_20260130_121202.mp4",
+        "num_frames": 59444,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "c7b1f910",
+        "name": "4A_video_test1e_20260130_131549.mp4",
+        "num_frames": 59442,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "ab6ee81b",
+        "name": "4A_video_test1f_20260130_140736.mp4",
+        "num_frames": 59444,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "affc225e",
+        "name": "4B_video_test1a_20260130_090255.mp4",
+        "num_frames": 59444,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "e27bba61",
+        "name": "4B_video_test1b_20260130_100517.mp4",
+        "num_frames": 59443,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "65285bbb",
+        "name": "4B_video_test1c_20260130_111209.mp4",
+        "num_frames": 59444,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "646538c1",
+        "name": "4B_video_test1d_20260130_121202.mp4",
+        "num_frames": 59444,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "e35f08ef",
+        "name": "4B_video_test1e_20260130_131549.mp4",
+        "num_frames": 59444,
+        "object_count": 2,
+        "is_current": false
+      },
+      {
+        "id": "03c0e06a",
+        "name": "4B_video_test1f_20260130_140736.mp4",
+        "num_frames": 59444,
+        "object_count": 2,
+        "is_current": false
+      }
+    ]
+  },
+  "events": [
+    {
+      "event": "status",
+      "data": {
+        "phase": "started",
+        "provider": "vllm",
+        "model": "Qwen/Qwen3-VL-8B-Instruct",
+        "video_id": "f09434ac",
+        "frame_idx": 160,
+        "project_name": "sandbox_Home-Cage-Interactions-0126-test-day",
+        "video_count": 47
+      }
+    },
+    {
+      "event": "status",
+      "data": {
+        "phase": "thinking",
+        "step": 1,
+        "max_steps": 36
+      }
+    },
+    {
+      "event": "tool_call",
+      "data": {
+        "id": "chatcmpl-tool-b6f984b6d1cae7fc",
+        "name": "inspect_frame",
+        "arguments": {
+          "frame_idx": 160,
+          "video_id": "f09434ac"
+        },
+        "step": 1
+      }
+    },
+    {
+      "event": "ui",
+      "data": {
+        "action": "goto_frame",
+        "video_id": "f09434ac",
+        "frame_idx": 160
+      }
+    },
+    {
+      "event": "tool_result",
+      "data": {
+        "id": "chatcmpl-tool-b6f984b6d1cae7fc",
+        "name": "inspect_frame",
+        "ok": true,
+        "result": {
+          "ok": true,
+          "video_id": "f09434ac",
+          "video_name": "1A_video_test1a_20260130_090255.mp4",
+          "frame_idx": 160,
+          "num_frames": 59443,
+          "objects": [
+            {
+              "id": "1",
+              "name": "HeadShave",
+              "description": ""
+            },
+            {
+              "id": "2",
+              "name": "NoShave",
+              "description": ""
+            }
+          ],
+          "prompts_on_frame": {},
+          "existing_mask_quality": [],
+          "image_attached": true,
+          "note": "A JPEG of this frame is attached for you to look at."
+        },
+        "elapsed_ms": 372,
+        "step": 1
+      }
+    },
+    {
+      "event": "status",
+      "data": {
+        "phase": "thinking",
+        "step": 2,
+        "max_steps": 36
+      }
+    },
+    {
+      "event": "tool_call",
+      "data": {
+        "id": "chatcmpl-tool-af7a6230539c7d13",
+        "name": "add_point_prompt",
+        "arguments": {
+          "object_id": "2",
+          "frame_idx": 160,
+          "points": [
+            [
+              0.32,
+              0.5
+            ]
+          ],
+          "labels": [
+            1
+          ],
+          "video_id": "f09434ac"
+        },
+        "step": 2
+      }
+    },
+    {
+      "event": "ui",
+      "data": {
+        "action": "goto_frame",
+        "video_id": "f09434ac",
+        "frame_idx": 160
+      }
+    },
+    {
+      "event": "ui",
+      "data": {
+        "action": "goto_frame",
+        "video_id": "f09434ac",
+        "frame_idx": 160
+      }
+    },
+    {
+      "event": "ui",
+      "data": {
+        "action": "select_object",
+        "object_id": "2",
+        "video_id": "f09434ac"
+      }
+    },
+    {
+      "event": "ui",
+      "data": {
+        "action": "set_masks",
+        "video_id": "f09434ac",
+        "frame_idx": 160,
+        "masks": {
+          "2": "iVBORw0KGgoAAAANSUhEUgAAB4AAAAQ4CAYAAADo08FDAAAv6klEQVR4nOzdS25UyRZA0WPEEJDoIsbhQcCIECMqBuFxILpIngOv8SopZ95fxP3F567VKysrMrCbW+dEBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA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AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA8L/24JAAAAAAQND/166wAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABwCY8ZZVZdO+eIAAAAASUVORK5CYII="
+        }
+      }
+    },
+    {
+      "event": "ui",
+      "data": {
+        "action": "set_points",
+        "video_id": "f09434ac",
+        "object_id": "2",
+        "frame_idx": 160,
+        "points": [
+          [
+            0.32,
+            0.5
+          ]
+        ],
+        "labels": [
+          1
+        ]
+      }
+    },
+    {
+      "event": "ui",
+      "data": {
+        "action": "refresh_project"
+      }
+    },
+    {
+      "event": "tool_result",
+      "data": {
+        "id": "chatcmpl-tool-af7a6230539c7d13",
+        "name": "add_point_prompt",
+        "ok": true,
+        "result": {
+          "ok": true,
+          "frame_idx": 160,
+          "object_id": "2",
+          "mask_ids": [
+            "2"
+          ]
+        },
+        "elapsed_ms": 3018,
+        "step": 2
+      }
+    },
+    {
+      "event": "status",
+      "data": {
+        "phase": "thinking",
+        "step": 3,
+        "max_steps": 36
+      }
+    },
+    {
+      "event": "tool_call",
+      "data": {
+        "id": "chatcmpl-tool-948aa0875a2fd718",
+        "name": "add_point_prompt",
+        "arguments": {
+          "object_id": "1",
+          "frame_idx": 160,
+          "points": [
+            [
+              0.78,
+              0.5
+            ]
+          ],
+          "labels": [
+            1
+          ],
+          "video_id": "f09434ac"
+        },
+        "step": 3
+      }
+    },
+    {
+      "event": "ui",
+      "data": {
+        "action": "goto_frame",
+        "video_id": "f09434ac",
+        "frame_idx": 160
+      }
+    },
+    {
+      "event": "ui",
+      "data": {
+        "action": "goto_frame",
+        "video_id": "f09434ac",
+        "frame_idx": 160
+      }
+    },
+    {
+      "event": "ui",
+      "data": {
+        "action": "select_object",
+        "object_id": "1",
+        "video_id": "f09434ac"
+      }
+    },
+    {
+      "event": "ui",
+      "data": {
+        "action": "set_masks",
+        "video_id": "f09434ac",
+        "frame_idx": 160,
+        "masks": {
+          "1": "iVBORw0KGgoAAAANSUhEUgAAB4AAAAQ4CAYAAADo08FDAAAt8UlEQVR4nOzdzVEjOxeAYXlqQnAELEiBjYOAMIiIMCAIb5wCCyJwDnyLW56vadTdUrt/peepouoO14OFx7vX5ygEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADYosPaBwAAAAAAgKa3y/dz7PuvT4ePZU8CAPsjAAMAAAAAsJqu2JtKFAaAnwRgAAAAAAAWlRp9j8fwHkII12t4GXqsEAwA/xGAAQAAAABYRF/4vcXeVLEoLAIDgAAMAAAAAMACYvE3N/rGCMEA8JMADAAAAADAbOYKv01dK6KFYABqJAADAAAAADC5rnXPU8ffJtPAACAAAwAAAAAwsammfm9B9977gUVgAGoiAAMAAAAAMJl2/E2Nt11rnLsM/VwRGIBaCcAAAAAAAEwiN/7mRt+YvucQgQGokQAMAAAAAMDdcuJvX/g9nz8f+p7ndHr8an9PBAaA/xOAAQAAAAC4WzMA58bfoegbkxOCRWAAaiIAAwAAAABwl5T4O1X4bYpF4K4ziMAA1EIABgAAAABgtJTVz3PE36bUaWARGIAaCMAAAAAAAIwyJv5OGX7b2iFYBAagRn/WPgAAAAAAAPuztfgb+/mxyeP2Odu/BwDsnQAMAAAAAECWLcbfrucRgQGojQAMAAAAAMBoW4q/Xc8nAgNQEwEYAAAAAIBkzVC6xfjb9bwpERgASiAAAwAAAAAwi7Xib9fzD0VgU8AAlEAABgAAAAAgSc7079rx92Yr5wCApQjAAAAAAAAUrRmBTQEDUDoBGAAAAACAQXuc/gWAGgnAAAAAAAAUzxQwALUQgAEAAAAA6FXj9K8IDMBeCcAAAAAAAHQqKYTmTAEDwF4JwAAAAAAAJClt+tcqaABKJAADAAAAABCVs/p5L/YWqQEglwAMAAAAAMDd9hRWrYIGoGQCMAAAAAAAvUpb/ZzDGmgA9kYABgAAAADgl9LDZ8nRGoC6CcAAAAAAAIxWQki1BhqAkgjAAAAAAAB0Glr/XIPSp6EBKIsADAAAAADAD7UEzxKmlwGgTQAGAAAAAGCUkgKqNdAAlEIABgAAAADgn+b0r/XPALA/AjAAAAAAACGEelY/N6VOMdf42gCwTwIwAAAAAAC/AufQ9G9J659TicAA7IEADAAAAABQudz4W6qUe4BFYAC2TgAGAAAAAOCflPhb2/Rv7DUBgK0SgAEAAAAACCHUG3+bv1PXpLMIDMBeCMAAAAAAACQpMf7G1LDuGoByCcAAAAAAAAwqPf42f79a70AGoAwCMAAAAAAAAEAhBGAAAAAAAACAQgjAAAAAAAAVe7t8P699hr3xmgGwZQIwAAAAAAA0xO77jd0LDABb9HftAwAAAAAAsL5Y4IyF0Fpcr+Gl/Zocj+F9qtckZ4r49enwMcVzAlAHARgAAAAAoFJWGf90Pn8+nE6PX3P87Hte6yn+nURkgHoIwAAAAAAA9DqfPx/WPsNS5ojAfQG3b7X0lBPYzTOIwQBlE4ABAAAAACpn/fN82vE35y7hKe4djv07xoK0KAxQDgEYAAAAAAAmFousUwTdXM3n7Iv6t/MKwQD792ftAwAAAAAAsF01rX/O0bfWeSvxN3aG9lf7Me6FBtg/E8AAAAAAADCRe1Y+r+F2vuZ0sPuCAfZNAAYAAAAAgIjrNby0A+7xGN5T70dOib99P2vJeNz1e1kNDbA/AjAAAAAAAEysK96mxuPcx+aeY+ix7ed+u3w/i8AA++AOYAAAAACACrnrtdtc9x73Bd3z+fPh9jX1c96+cv5e7I5g7xmAfTABDAAAAAAAC+sLvVNE4NPp8av9vVgEHpoQbq+GthIaYPtMAAMAAAAAVCwWAKdYPVyD9kRs6oTsXBPG7edImShOmQ6OvUfeLt/PJoIBtskEMAAAAAAAFCwWgdsTwtdreOmbBr79P3cDA2yfCWAAAAAAAKKWmFTdurFrk1N+zppi08Ep9wW7Gxhg+wRgAAAAAACoVFfkTwnBzT9bCQ2wHQIwAAAAAAC0zDX9vMWp6r77gnMicAhCMMAWCMAAAAAAAEAIoXs1dNfjYyuhQxCCAdYkAAMAAAAAwJ1Ki51d9wN3PV4IBtiOv2sfAAAAAAAA9qrkuHk+fz6cTo9fze/dInAs9ja/347Fzdfp9enwMfVZAfg/E8AAAAAAAJUpOVqurSuM7tWYu4FD6J4IDsH7D2BuAjAAAAAAAPSIxc5m3LzFzq7gORRL9yD3buCbrtdGBAaYjwAMAAAAAFCpWLAsIVbOoSsCD038lvZ65t4N3CQCAyxDAAYAAAAAgIgxE699j4+tUt6jrpXQqRPBzT+/Xb6fb18THhGgagIwAAAAAAC/lBIr7zU2Apcaf2/67gZOuR849n0RGGAah7UPAAAAAADAcpqRrW8FdGnB8l6n0+NX88859/3W8Fq2X5+boRXZIfx+zV6fDh8THQugSgIwAAAAAEBFBODxuiJw38Rrba9jVwgOoT8Gi8AA0xGAAQAAAAAqkRp/Q6gvXKbqC5xNtb9+YyaCYyFdCAbIJwADAAAAAFRCAJ5GV9z0msWlrs8OQQQGmIIADAAAAABQiVsAFn9ZWk4EDsFKaIB7/Fn7AAAAAAAAQNnaHyq4XsPL7Sv2+HYgbk6vA9BPAAYAAAAA4B/Tv8yl672VGoEBSCMAAwAAAAAAizifPx9uX83vi8AA0xGAAQAAAACAxaVG4BtroAHSCMAAAAAAAMAqrBwHmJ4ADAAAAAAArKYZgWNTwM010KaAAYYJwAAAAAAAAACFEIABAAAAAIBVmQIGmI4ADAAAAAAAAFAIARgAAAAAAFhdzhQwAN0EYAAAAAAAAIBCCMAAAAAAAMAmNKeA+7gHGKCbAAwAAAAAAABQCAEYAAAAAIB/TqfHr7XPACG4BxhgLAEYAAAAAAAAoBACMAAAAABAZYYmK00BswWxad/YexeAnwRgAAAAAAAAgEIIwAAAAAAAFXK/Knv2+nT4WPsMAFslAAMAAAAAVMh6XQAokwAMAAAAAFAZ8RcAyiUAAwAAAADww/n8+bD2GQCAcQRgAAAAAAD+EX8BYN8EYAAAAAAAAIBCCMAAAAAAAAAAhRCAAQAAAAAAAAohAAMAAAAAVODt8v289hkAgPkJwAAAAAAAwK74QANANwEYAAAAAKAix2N4b3/veg0va5wFAJieAAwAAAAAAGxO7IMJsQ8wAPCTAAwAAAAAAGzC6fT4dftv0+oA4wjAAAAAAAAAAIUQgAEAAAAAKmKtLnswNP37+nT4WPRAADsiAAMAAAAAAAAUQgAGAAAAAKiIe1XZqub9v31M/wL0E4ABAAAAAAAACiEAAwAAAAAQQgjhfP58WPsMYEod4D4CMAAAAAAAAEAhBGAAAAAAAGAzYtO+salgAOIEYAAAAAAAQgghnE6PX2ufAYa8Xb6f1z4DwJYJwAAAAAAAwOpy7qB+u3w/C8EAcQIwAAAAAEBFrNdlD1LfpyIwwG8CMAAAAABARWIRLRbbYIuOx/Defg+LwAA/CcAAAAAAAMAmNNdA930wwdQ6QDcBGAAAAAAA2CQRGCCfAAwAAAAAAGxGcwo4hO4IbHU5QJwADAAAAABQkVg0M0kJAOUQgAEAAAAAgM2KfUCh+UGG16fDx6IHAtg4ARgAAAAAoAIiGXs0FH8B+E0ABgAAAAAANillZfnb5ft5sQMB7IAADAAAAAAAbJZ7qwHyCMAAAAAAAMDuiMAAcQIwAAAAAACwGafT41fzz12h113AAHECMAAAAAAAsAniL8D9BGAAAAAAAGBzUuPv69PhY5EDAeyEAAwAAAAAAGyK+AswngAMAAAAAABsnvgLkEYABgAAAAAAACiEAAwAAAAAAGxKe9o3hO610AD8JAADAAAAAACbIwIDjCMAAwAAAADwz+n0+LX2GajX+fz5sPYZAPZOAAYAAAAAAAAohAAMAAAAAFAZq3XZg9h7MvbeBeAnARgAAAAAAACgEAIwAAAAAEAlXp8OH2ufAabgvQzQTQAGAAAAAAAAKIQADAAAAADAD6fT49faZwAAxhGAAQAAAACATfDhA4D7CcAAAAAAABW6XsNL+3vHY3hf4ywAwHQEYAAAAAAAYFNiH0aIfWgBgN8EYAAAAACAirw+HT5SHmcVLwDskwAMAAAAAACsLvVDB6kfYgColQAMAAAAAFAp9wADQHn+rn0AAAAAAACgHkOTvu7/BbiPCWAAAAAAgMpYocta3C0NMD8TwAAAAAAARJ1Oj1/n8+fD2uegDO34m7puvDn968MLAMNMAAMAAAAAALMaG38ByCcAAwAAAABULHa3qjjHnHLeX6Z/AfIJwAAAAAAAdHJnK1MaG38BSCcAAwAAAABUyDQla0iNuu3Heb8CpBOAAQAAAAAqZw00SxqKwOIvwH0EYAAAAAAAYFbn8+dD88/WOwPMRwAGAAAAAKhU6mSle4CZwtgI/Hb5fp7lQACFEoABAAAAAIBFpETg4zG8t1eQi8AA6QRgAAAAAADcA8xiUieBvf8AxhGAAQAAAAAYZA00UxKBAeYjAAMAAAAAVCz1HuAQRGCm1Y7AAExDAAYAAAAAIISQtgZaBGYqzfdS16Rv12QwAN3+rn0AAAAAAAC27XgM70IcU0n9EIH3HMA4JoABAAAAACrXXAPtLlbmFIu/sfdW+32Ys6ocoHYCMAAAAAAAPwxNXloDzRjt983xGN5TPlgg/gLkEYABAAAAABDZmFUs/nY9tvkBBO9LgHwCMAAAAAAAIYThVdDNaGcKmLFS4y8A4wjAAAAAAADAInLir+lfgHEEYAAAAAAA/smZAoZcfRO+3lsA0xCAAQAAAAAYxRpoxhCBAeb1d+0DAAAAAACwLa9Ph4+3y/fz2udYUyxun8+fD2ucpQTn8+dD8zW9XsOL2AswDwEYAAAAAIBOsVB3PIb3vinOvUmdZD6dHr9E4HHar7H4CzAfK6ABAAAAABht72ugh87fDpV7/33XkBN/S/pgAcBaBGAAAAAAAH55fTp8rH2GucXCZPvr9v2+v0c68RdgfgIwAAAAAAC9YmFu7yt8c1cSi8D3y4m/NXwAAWAuAjAAAAAAAFUZex/t3qM3AHUQgAEAAAAAiEqdwtzTNOzY+Bt7/J5+7y3oW/Hc/nd4u3w/z34ggEIJwAAAAAAA3G0PMfTe+Mv9ciIwAOMc1j4AAAAAAADb1ZzEjAW6dtA7nz8fFjhWttT4m3rf8e1xW/19tyYnvrsPGOA+JoABAAAAAEiSEkf3MAk8VfwlXTuUX6/hJfV1tA4aII8ADAAAAABAp/b05d4jcE78ZVqp09LHY3h3JzDAeAIwAAAAAAC9xkTgLRkK0mPjr/XP+c7nz4ecEDz3eQBKJAADAAAAADBo7xE4VfP3tP55fkOvZwnvKYClCcAAAAAAACRpR+A+W1kD3TzHUNDN+f2YTl8EFtwB8gnAAAAAAAAk22MEZntS1kCLvwDjCMAAAAAAAIySsgZ6KxF4zPRvqWuutyZl1bbpbIB0AjAAAAAAAKNtOQKPed63y/fz7b/dAbwN4i9AHgEYAAAAAIAsKUFuKxE4hcAIQEkEYAAAAAAAsjWjaddU7JoRuPlcYyZ5h/5Oyh22ALAGARgAAAAAgLttKQJvedqY/zT/jdy1DDAtARgAAAAAgFHaq5Ov1/Cy9p3A7Z89NMlr/fP63LUMMC0BGAAAAACA0WIBNTUCTxmCYz9vzrBoyni8e9dzA9BPAAYAAAAA4C6vT4ePlEnaWOy7N6R2heSUFcJ9Z7aWeB65/94mtAHyHdY+AAAAAAAA5Xi7fD/f/rsvmHZNeZ7Pnw8pz9MVElOfsyssNs/f9fNuPyf1rPzHem6AZfxd+wAAAAAAAJTpeg0vXUH2eAzvsQg8diJ4aDo3da3w69Phox2BuV9K/AVgGlZAAwAAAAAwmfbUZl94PR7D++1r7POl/P32GYYmS02eTis1/pr+BZiGCWAAAAAAACbVnqLtmwS+mWsiNDf+5jidHr+sgc6TEn8BuI8JYAAAAAAAJhebBF4y8sWeb46p0rErq2vUdefvEv9OADU5rH0AAAAAAADK1XWf7lITvze5UbF57q5wGft7JoJ/a0byoddS/AW4nwAMAAAAAMDsYiF4ygg8Vfi9aZ83JwKHIAQ3pdwBfHstBWCA+wnAAAAAAAAsZuqJ4KnDb1NKBB46R5faAnHqFLAADHA/ARgAAAAAgEV1ReApTB0QcyJwCPkhuE9pkfgWgQVggHkJwAAAAAAArGaqGDxnOMyNwH3uDcR7jsICMMAyBGAAAAAAABgwZQQeUmokFoABlvFn7QMAAAAAAMDWtcPklKue247H8N7+yvn7zft2AaiPCWAAAAAAAEjUtbJ6zongVLEovaVpYBPAAMsQgAEAAAAAIEPfvcVrh+C+yeS1Y3BKAA5BBAa4lwAMAAAAAAAj9cXgmKUCcVcIXjMCC8AAyxCAAQAAAADgTrkhuM/Ukbgdg9eKwM27ia2BBpiPAAwAAAAAADO7NxDfG4XXjsCp8TcEARjgXgIwAAAAAABswNyROLYWeokQ3Iy/IQjAAHMTgAEAAAAAYKOmvmN4jbuBTf8CLEsABgAAAACAHYtF4i1NA98C8FD8DUEABpjCn7UPAAAAAAAAjBeLptdreLl9xf7O8Rje20G2vap5arGz3Hu3MQC/CcAAAAAAALBzr0+Hj67p2a4IHMLvADt3BAZgflZAAwAAAABAgdqrofumbduReMp10O2o3LcK2gpogPuZAAYAAAAAgAK1Y+oak8A58ReAaQjAAAAAAABQqFgE7rsXuPnnqddBi78AyxCAAQAAAACgYLG1yl0huG9NdK5mQE6Jv9Y/A0xDAAYAAAAAgMK9Ph0+ukJw+3vNWDv1FHAX8RdgOoe1DwAAAAAAACzr7fL9fPvv1NXM5/PnQ+rPz5n+FX8BpmUCGAAAAAAAKtOMrqmroFOngZeaGgYgTgAGAAAAAAB+OR7DezsE58Zd078AyxOAAQAAAACgQqnxNScC56x+BmAeAjAAAAAAAFRuKMzeOwkcY/oXYB4CMAAAAAAAMGkEtvoZYD0CMAAAAAAAVKodYq/X8HL7ij2+LwJPMRUMwP0Oax8AAAAAAABY19vl+7nr/425y7fv75j+BZiXAAwAAAAAAPwTi8E5Edj6Z4B1WQENAAAAAAD88/p0+Iithm4/LhZ6x0wLAzAtARgAAAAAAPhlbATO+ZkATM8KaAAAAAAAoFN7JXRO9LX6GWB5JoABAAAAAIBOKZPAAGyHAAwAAAAAAPQaE4FN/wKsQwAGAAAAAAAG5URgU8IA6xGAAQAAAACAJCkRuP09078AyzqsfQAAAAAAAGBf3i7fzymPE38BlmcCGAAAAAAAyJISdsVfAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOB/7cEhAQAAAICg/6+9YQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAZgKRk4Xlk6YTEgAAAABJRU5ErkJggg==",
+          "2": "iVBORw0KGgoAAAANSUhEUgAAB4AAAAQ4CAYAAADo08FDAAAv6klEQVR4nOzdS25UyRZA0WPEEJDoIsbhQcCIECMqBuFxILpIngOv8SopZ95fxP3F567VKysrMrCbW+dEBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA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AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA8L/24JAAAAAAQND/166wAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABwCY8ZZVZdO+eIAAAAASUVORK5CYII="
+        }
+      }
+    },
+    {
+      "event": "ui",
+      "data": {
+        "action": "set_points",
+        "video_id": "f09434ac",
+        "object_id": "1",
+        "frame_idx": 160,
+        "points": [
+          [
+            0.78,
+            0.5
+          ]
+        ],
+        "labels": [
+          1
+        ]
+      }
+    },
+    {
+      "event": "ui",
+      "data": {
+        "action": "refresh_project"
+      }
+    },
+    {
+      "event": "tool_result",
+      "data": {
+        "id": "chatcmpl-tool-948aa0875a2fd718",
+        "name": "add_point_prompt",
+        "ok": true,
+        "result": {
+          "ok": true,
+          "frame_idx": 160,
+          "object_id": "1",
+          "mask_ids": [
+            "1",
+            "2"
+          ]
+        },
+        "elapsed_ms": 679,
+        "step": 3
+      }
+    },
+    {
+      "event": "status",
+      "data": {
+        "phase": "thinking",
+        "step": 4,
+        "max_steps": 36
+      }
+    },
+    {
+      "event": "tool_call",
+      "data": {
+        "id": "chatcmpl-tool-bdf9a58c0b968d97",
+        "name": "evaluate_segmentation",
+        "arguments": {
+          "frame_idx": 160,
+          "video_id": "f09434ac"
+        },
+        "step": 4
+      }
+    },
+    {
+      "event": "tool_result",
+      "data": {
+        "id": "chatcmpl-tool-bdf9a58c0b968d97",
+        "name": "evaluate_segmentation",
+        "ok": true,
+        "result": {
+          "ok": true,
+          "frame_idx": 160,
+          "video_id": "f09434ac",
+          "objects": [
+            {
+              "ok": true,
+              "confidence": 0.72,
+              "reason": "ok",
+              "area_px": 22836,
+              "coverage": 0.011013,
+              "bbox_xywh_norm": [
+                0.175,
+                0.42778,
+                0.20208,
+                0.28889
+              ],
+              "bbox_fill": 0.1886,
+              "model_score": null,
+              "retry_nearby": false,
+              "object_id": "2",
+              "name": "NoShave",
+              "overlap_px": 0
+            },
+            {
+              "ok": true,
+              "confidence": 0.72,
+              "reason": "ok",
+              "area_px": 26728,
+              "coverage": 0.01289,
+              "bbox_xywh_norm": [
+                0.73698,
+                0.39815,
+                0.09167,
+                0.21389
+              ],
+              "bbox_fill": 0.6574,
+              "model_score": null,
+              "retry_nearby": false,
+              "object_id": "1",
+              "name": "HeadShave",
+              "overlap_px": 0
+            }
+          ],
+          "object_count": 2,
+          "expected_object_count": 2,
+          "masked_object_count": 2,
+          "incomplete": false,
+          "note": null,
+          "retry_nearby": false,
+          "nearby_suggestion": [
+            180,
+            140,
+            200,
+            120
+          ]
+        },
+        "elapsed_ms": 49,
+        "step": 4
+      }
+    },
+    {
+      "event": "status",
+      "data": {
+        "phase": "thinking",
+        "step": 5,
+        "max_steps": 36
+      }
+    },
+    {
+      "event": "message",
+      "data": {
+        "text": "Both mice have compact, connected masks on opposite sides of the cage. The NoShave mouse (object 2) is on the left with a torso click at (0.32, 0.50), and the HeadShave mouse (object 1) is on the right with a torso click at (0.78, 0.50). The masks are complete and do not require additional points. No propagation has been started as requested.",
+        "step": 5
+      }
+    },
+    {
+      "event": "done",
+      "data": {
+        "text": "Both mice have compact, connected masks on opposite sides of the cage. The NoShave mouse (object 2) is on the left with a torso click at (0.32, 0.50), and the HeadShave mouse (object 1) is on the right with a torso click at (0.78, 0.50). The masks are complete and do not require additional points. No propagation has been started as requested.",
+        "steps": 5
+      }
+    }
+  ],
+  "llm_turns": [
+    {
+      "step": 1,
+      "inspect_jpegs_in_context": []
+    },
+    {
+      "step": 2,
+      "inspect_jpegs_in_context": [
+        {
+          "message_index": 4,
+          "image_index": 0,
+          "role": "user",
+          "frame_idx": 160,
+          "video_id": "f09434ac",
+          "has_jpeg": true
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "inspect_jpegs_in_context": [
+        {
+          "message_index": 4,
+          "image_index": 0,
+          "role": "user",
+          "frame_idx": 160,
+          "video_id": "f09434ac",
+          "has_jpeg": true
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "inspect_jpegs_in_context": [
+        {
+          "message_index": 4,
+          "image_index": 0,
+          "role": "user",
+          "frame_idx": 160,
+          "video_id": "f09434ac",
+          "has_jpeg": true
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "inspect_jpegs_in_context": [
+        {
+          "message_index": 4,
+          "image_index": 0,
+          "role": "user",
+          "frame_idx": 160,
+          "video_id": "f09434ac",
+          "has_jpeg": true
+        }
+      ]
+    }
+  ],
+  "inspect_jpegs_seen": [
+    {
+      "file": "inspect_vid-f09434ac_frame-160.jpg",
+      "frame_idx": 160,
+      "video_id": "f09434ac",
+      "in_final_llm_context": true
+    }
+  ],
+  "inspect_jpegs_in_final_context": [
+    {
+      "message_index": 4,
+      "image_index": 0,
+      "role": "user",
+      "frame_idx": 160,
+      "video_id": "f09434ac",
+      "has_jpeg": true
+    }
+  ],
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are the SAM3 Web Tracker agent. You annotate and track objects in behavior videos by calling tools. The user watches a live chat of your reasoning and actions while the main canvas updates the same way a human annotation would.\n\n## What you know\n- The project may contain many videos. Always check get_project_overview if you are unsure which video you are on, how many videos exist, or what they are named.\n- Each video has a frame count, fps, start_frame, objects (id, name, description), saved point prompts, and optional propagation state.\n- Frames are 0-indexed. The UI shows JPEG frames when paused; you must goto_frame / inspect_frame so the backend extracts the frame before SAM can run.\n- Object ids are strings (\"1\", \"2\", \u2026). Names like BackShave are display names \u2014 create them with create_object and keep using the returned id.\n- SAM3 tracker mode stores **point prompts**. Text segmentation finds a mask, then we convert it to points and persist them so tracking/propagation behaves normally.\n- Propagation (Track Objects) needs at least one point prompt. After you have labeled the planned frames, call start_propagation if the user asked to track.\n\n## How to work\n1. Orient: get_project_overview (and get_video_details for the active video).\n2. Plan: if the user says \"every Nth frame\", call plan_frames. Typical interval is 1000 (or the video's anchor_batch_size).\n3. For each planned frame:\n   a. goto_frame then inspect_frame so you can see animals, occlusion, blur, and identity cues.\n   b. create_object once per identity (reuse existing objects with the same name).\n   c. text_segment once per identity with a phrase that includes count/side/shave-state (e.g. \"unshaved mouse on the left\" vs \"shaved mouse on the right near the water port\"). Reuse existing object ids.\n   d. evaluate_segmentation. If confidence is low, the frame is empty, identities are swapped, or animals overlap badly: think, then try nearby frames (\u00b120, then \u00b140) via plan_frames(around_frame=..., nearby_offset=20). If the result is incomplete / missing_mask, stay on this frame and segment the remaining animals.\n   e. If text segmentation is weak but you can see the animal, add_point_prompt at a chest/back point (positive=1). Use a negative point (0) on the *other* animal if they touch \u2014 never on the same animal's tail.\n   f. commit_anchor when the frame is a planned grid/anchor frame and the masks look right.\n4. Adapt. Do not blindly march the grid if a frame is unusable. Skip to a clearer neighbor, then continue the plan.\n5. After the requested frames are labeled, start_propagation if the user wants tracking. Do not start it for a single-frame-only request.\n\n## Text vs points\n- Prefer text_segment when the description is visually distinctive (shaved patch, color, size).\n- Prefer inspect_frame + add_point_prompt when animals look similar, are overlapping, or text confidence is low.\n- Never invent coordinates without having inspected the frame (or a text_segment result that returned a bbox).\n- If the user says there are N mice/animals, that count is ground truth. Call text_segment once per identity. Put side and shave-state in the phrase. The backend binds the leftmost or rightmost detection when the phrase or object name (NoShave / HeadShave) implies a side. Do not finish until evaluate_segmentation reports masked_object_count >= N and no missing_mask. One mask is a failure.\n- If evaluate_segmentation returns incomplete or missing_mask, stay on this frame and segment the remaining object. A blob on empty bedding is not a mouse \u2014 re-inspect and click the animal that still has no mask. In top-down home-cage videos the two mice are often on opposite sides; a \"second\" mask around x=0.60\u20130.67 is frequently bedding, not the far-right animal. A click on the circular water-bottle port (far-right wall) makes SAM fill most of the cage \u2014 click the animal's torso instead, and add a negative point on the other mouse.\n- When using add_point_prompt, place a new positive point on that animal's torso from the inspect JPEG. Do not copy another object's point list.\n- One animal = one connected mask that includes head, body, and tail. Never put a negative click on the same mouse's tail (that splits body and tail into two blobs). If evaluate_segmentation reports split_components, add another positive point on the missing part (usually the tail), do not create a new object.\n\n## Style\n- Call think before multi-step plans and after failures.\n- Keep user-facing messages short. Put detail in think / tool results.\n- Do not reset or delete the user's existing objects unless they ask.\n- Stay on the video the user specified; if they said \"this video\" use the current one.\n- If the tracking mode is pose_tracking, say you only handle segmentation/tracking objects here.\n"
+    },
+    {
+      "role": "user",
+      "content": "Current project context (JSON):\n```json\n{\n  \"project_id\": \"9f8a7b6c\",\n  \"project_name\": \"sandbox_Home-Cage-Interactions-0126-test-day\",\n  \"tracking_mode\": \"segmentation_tracking\",\n  \"video_count\": 47,\n  \"current_video_id\": \"f09434ac\",\n  \"current_frame\": 160,\n  \"videos\": [\n    {\n      \"id\": \"f09434ac\",\n      \"name\": \"1A_video_test1a_20260130_090255.mp4\",\n      \"num_frames\": 59443,\n      \"fps\": 30.0,\n      \"width\": 1920,\n      \"height\": 1080,\n      \"start_frame\": 160,\n      \"anchor_batch_size\": null,\n      \"object_count\": 2,\n      \"objects\": [\n        {\n          \"id\": \"1\",\n          \"name\": \"HeadShave\",\n          \"description\": \"\",\n          \"color\": \"#5B8DD9\"\n        },\n        {\n          \"id\": \"2\",\n          \"name\": \"NoShave\",\n          \"description\": \"\",\n          \"color\": \"#E8A445\"\n        }\n      ],\n      \"prompted_frame_count\": 0,\n      \"prompted_frames_sample\": [],\n      \"annotated_anchors\": [],\n      \"anchor_labeling_complete\": false,\n      \"propagation_complete\": false,\n      \"propagated_frame_count\": 0,\n      \"is_current\": true\n    },\n    {\n      \"id\": \"6bcb3f3a\",\n      \"name\": \"1A_video_test1b_20260130_100517.mp4\",\n      \"num_frames\": 59444,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"3b15bce1\",\n      \"name\": \"1A_video_test1c_20260130_111209.mp4\",\n      \"num_frames\": 59444,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"f0ad21e9\",\n      \"name\": \"1A_video_test1d_20260130_121202.mp4\",\n      \"num_frames\": 59444,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"f04b915c\",\n      \"name\": \"1A_video_test1e_20260130_131549.mp4\",\n      \"num_frames\": 59444,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"99d4a9cf\",\n      \"name\": \"1A_video_test1f_20260130_140736.mp4\",\n      \"num_frames\": 59444,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"963b9700\",\n      \"name\": \"1B_video_test1a_20260130_090255.mp4\",\n      \"num_frames\": 59444,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"a34f6ae6\",\n      \"name\": \"1B_video_test1b_20260130_100517.mp4\",\n      \"num_frames\": 59443,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"9bb72f59\",\n      \"name\": \"1B_video_test1c_20260130_111209.mp4\",\n      \"num_frames\": 59444,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"570b06d1\",\n      \"name\": \"1B_video_test1d_20260130_121202.mp4\",\n      \"num_frames\": 59444,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"b5791e07\",\n      \"name\": \"1B_video_test1e_20260130_131549.mp4\",\n      \"num_frames\": 59443,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"4c48a42f\",\n      \"name\": \"1B_video_test1f_20260130_140736.mp4\",\n      \"num_frames\": 59444,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"946d42eb\",\n      \"name\": \"2A_video_test1a_20260130_090255.mp4\",\n      \"num_frames\": 59442,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"9cda62c1\",\n      \"name\": \"2A_video_test1b_20260130_100517.mp4\",\n      \"num_frames\": 59443,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"e100b21f\",\n      \"name\": \"2A_video_test1c_20260130_111209.mp4\",\n      \"num_frames\": 59443,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"3bdd1043\",\n      \"name\": \"2A_video_test1d_20260130_121202.mp4\",\n      \"num_frames\": 59443,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"8486b200\",\n      \"name\": \"2A_video_test1e_20260130_131549.mp4\",\n      \"num_frames\": 59444,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"2a349693\",\n      \"name\": \"2A_video_test1f_20260130_140736.mp4\",\n      \"num_frames\": 59438,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"daa91132\",\n      \"name\": \"2B_video_test1a_20260130_090255.mp4\",\n      \"num_frames\": 59432,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"93f96275\",\n      \"name\": \"2B_video_test1b_20260130_100517.mp4\",\n      \"num_frames\": 59444,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"7bf3ec98\",\n      \"name\": \"2B_video_test1c_20260130_111209.mp4\",\n      \"num_frames\": 59433,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"e5099689\",\n      \"name\": \"2B_video_test1d_20260130_121202.mp4\",\n      \"num_frames\": 59435,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"596eacb4\",\n      \"name\": \"2B_video_test1e_20260130_131549.mp4\",\n      \"num_frames\": 59435,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"1641a5f6\",\n      \"name\": \"2B_video_test1f_20260130_140736.mp4\",\n      \"num_frames\": 59432,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"9465c0b2\",\n      \"name\": \"3A_video_test1a_20260130_090255.mp4\",\n      \"num_frames\": 59444,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"9bd13c70\",\n      \"name\": \"3A_video_test1b_20260130_100517.mp4\",\n      \"num_frames\": 59444,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"757e9f04\",\n      \"name\": \"3A_video_test1c_20260130_111209.mp4\",\n      \"num_frames\": 59444,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"00d48b80\",\n      \"name\": \"3A_video_test1d_20260130_121202.mp4\",\n      \"num_frames\": 59444,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"4e107c2e\",\n      \"name\": \"3A_video_test1e_20260130_131549.mp4\",\n      \"num_frames\": 59444,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"202b7239\",\n      \"name\": \"3A_video_test1f_20260130_140736.mp4\",\n      \"num_frames\": 59444,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"baac729e\",\n      \"name\": \"3B_video_test1a_20260130_090255.mp4\",\n      \"num_frames\": 59444,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"c0e2cab7\",\n      \"name\": \"3B_video_test1b_20260130_100517.mp4\",\n      \"num_frames\": 59444,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"03462ba1\",\n      \"name\": \"3B_video_test1c_20260130_111209.mp4\",\n      \"num_frames\": 59444,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"d2016605\",\n      \"name\": \"3B_video_test1d_20260130_121202.mp4\",\n      \"num_frames\": 59444,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"6e181cda\",\n      \"name\": \"3B_video_test1e_20260130_131549.mp4\",\n      \"num_frames\": 59444,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"03405fe3\",\n      \"name\": \"4A_video_test1a_20260130_090255.mp4\",\n      \"num_frames\": 59444,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"96d4abf2\",\n      \"name\": \"4A_video_test1b_20260130_100517.mp4\",\n      \"num_frames\": 59444,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"79ebb088\",\n      \"name\": \"4A_video_test1c_20260130_111209.mp4\",\n      \"num_frames\": 59444,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"bcddef38\",\n      \"name\": \"4A_video_test1d_20260130_121202.mp4\",\n      \"num_frames\": 59444,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"c7b1f910\",\n      \"name\": \"4A_video_test1e_20260130_131549.mp4\",\n      \"num_frames\": 59442,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"ab6ee81b\",\n      \"name\": \"4A_video_test1f_20260130_140736.mp4\",\n      \"num_frames\": 59444,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"affc225e\",\n      \"name\": \"4B_video_test1a_20260130_090255.mp4\",\n      \"num_frames\": 59444,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"e27bba61\",\n      \"name\": \"4B_video_test1b_20260130_100517.mp4\",\n      \"num_frames\": 59443,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"65285bbb\",\n      \"name\": \"4B_video_test1c_20260130_111209.mp4\",\n      \"num_frames\": 59444,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"646538c1\",\n      \"name\": \"4B_video_test1d_20260130_121202.mp4\",\n      \"num_frames\": 59444,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"e35f08ef\",\n      \"name\": \"4B_video_test1e_20260130_131549.mp4\",\n      \"num_frames\": 59444,\n      \"object_count\": 2,\n      \"is_current\": false\n    },\n    {\n      \"id\": \"03c0e06a\",\n      \"name\": \"4B_video_test1f_20260130_140736.mp4\",\n      \"num_frames\": 59444,\n      \"object_count\": 2,\n      \"is_current\": false\n    }\n  ]\n}\n```\n\nUser request:\nThis home-cage frame has exactly two mice. Each mouse is ONE object: head, body, AND tail in a single connected mask. Do not split body and tail. Do not create extra objects. Shaved HeadShave is on the FAR RIGHT (torso about 0.78, 0.50). Unshaved NoShave is on the LEFT (torso about 0.32, 0.50). Inspect first. The canvas should be empty of old points. Then add_point_prompt once per existing object: 1) NoShave (object 2): one positive click on the left mouse torso. Include the tail in that same mask \u2014 never put a negative click on its tail. 2) HeadShave (object 1): one positive click on the right mouse torso. Do not click the circular water-bottle port (~0.85, 0.42) or empty bedding (x=0.50\u20130.70). evaluate_segmentation. If split_components, add another positive point on the missing tail/body, still on the same object id. Do not finish until both mice have compact connected masks on opposite sides. Do not start propagation."
+    },
+    {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+        {
+          "id": "chatcmpl-tool-b6f984b6d1cae7fc",
+          "name": "inspect_frame",
+          "arguments": {
+            "frame_idx": 160,
+            "video_id": "f09434ac"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "chatcmpl-tool-b6f984b6d1cae7fc",
+      "name": "inspect_frame",
+      "content": "{\"ok\": true, \"video_id\": \"f09434ac\", \"video_name\": \"1A_video_test1a_20260130_090255.mp4\", \"frame_idx\": 160, \"num_frames\": 59443, \"objects\": [{\"id\": \"1\", \"name\": \"HeadShave\", \"description\": \"\"}, {\"id\": \"2\", \"name\": \"NoShave\", \"description\": \"\"}], \"prompts_on_frame\": {}, \"existing_mask_quality\": [], \"image_attached\": true, \"note\": \"A JPEG of this frame is attached for you to look at.\"}"
+    },
+    {
+      "role": "user",
+      "content": "Visual: JPEG(s) of the inspected frame(s) are attached.",
+      "images": [
+        {
+          "frame_idx": 160,
+          "video_id": "f09434ac",
+          "jpeg_chars": 19820
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+        {
+          "id": "chatcmpl-tool-af7a6230539c7d13",
+          "name": "add_point_prompt",
+          "arguments": {
+            "object_id": "2",
+            "frame_idx": 160,
+            "points": [
+              [
+                0.32,
+                0.5
+              ]
+            ],
+            "labels": [
+              1
+            ],
+            "video_id": "f09434ac"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "chatcmpl-tool-af7a6230539c7d13",
+      "name": "add_point_prompt",
+      "content": "{\"ok\": true, \"frame_idx\": 160, \"object_id\": \"2\", \"mask_ids\": [\"2\"]}"
+    },
+    {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+        {
+          "id": "chatcmpl-tool-948aa0875a2fd718",
+          "name": "add_point_prompt",
+          "arguments": {
+            "object_id": "1",
+            "frame_idx": 160,
+            "points": [
+              [
+                0.78,
+                0.5
+              ]
+            ],
+            "labels": [
+              1
+            ],
+            "video_id": "f09434ac"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "chatcmpl-tool-948aa0875a2fd718",
+      "name": "add_point_prompt",
+      "content": "{\"ok\": true, \"frame_idx\": 160, \"object_id\": \"1\", \"mask_ids\": [\"1\", \"2\"]}"
+    },
+    {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+        {
+          "id": "chatcmpl-tool-bdf9a58c0b968d97",
+          "name": "evaluate_segmentation",
+          "arguments": {
+            "frame_idx": 160,
+            "video_id": "f09434ac"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "chatcmpl-tool-bdf9a58c0b968d97",
+      "name": "evaluate_segmentation",
+      "content": "{\"ok\": true, \"frame_idx\": 160, \"video_id\": \"f09434ac\", \"objects\": [{\"ok\": true, \"confidence\": 0.72, \"reason\": \"ok\", \"area_px\": 22836, \"coverage\": 0.011013, \"bbox_xywh_norm\": [0.175, 0.42778, 0.20208, 0.28889], \"bbox_fill\": 0.1886, \"model_score\": null, \"retry_nearby\": false, \"object_id\": \"2\", \"name\": \"NoShave\", \"overlap_px\": 0}, {\"ok\": true, \"confidence\": 0.72, \"reason\": \"ok\", \"area_px\": 26728, \"coverage\": 0.01289, \"bbox_xywh_norm\": [0.73698, 0.39815, 0.09167, 0.21389], \"bbox_fill\": 0.6574, \"model_score\": null, \"retry_nearby\": false, \"object_id\": \"1\", \"name\": \"HeadShave\", \"overlap_px\": 0}], \"object_count\": 2, \"expected_object_count\": 2, \"masked_object_count\": 2, \"incomplete\": false, \"note\": null, \"retry_nearby\": false, \"nearby_suggestion\": [180, 140, 200, 120]}"
+    }
+  ],
+  "keep_inspect_images": 2,
+  "max_tokens": 2048,
+  "dump_dir": "/opt/software/Grounded-SAM3-Instruct-WebTrack/reports/agent-runs/20260816-165553"
+}

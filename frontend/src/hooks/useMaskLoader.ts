@@ -26,6 +26,11 @@ export function useMaskLoader(): void {
   const vid = currentVideoId ?? ''
   const lastFrameRef = useRef(currentFrame)
   const loadSeqRef = useRef(0)
+  const promptEpoch = video
+    ? Object.values(video.point_prompts ?? {}).reduce((n, fmap) => {
+      return n + Object.keys((fmap || {}) as object).length
+    }, 0)
+    : 0
 
   useEffect(() => {
     if (!pid || !vid || registrationMode) return
@@ -87,5 +92,5 @@ export function useMaskLoader(): void {
       window.clearTimeout(displayTimer)
       window.clearTimeout(objectTimer)
     }
-  }, [pid, vid, currentFrame, video?.propagated_frames, registrationMode, setSavedMask])
+  }, [pid, vid, currentFrame, video?.propagated_frames, registrationMode, setSavedMask, promptEpoch])
 }

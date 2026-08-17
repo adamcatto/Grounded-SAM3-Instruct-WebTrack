@@ -36,11 +36,12 @@ cd e2e && npm install && npx playwright install chromium
 | Project id | `9f8a7b6c` |
 | Name | `sandbox_Home-Cage-Interactions-0126-test-day` |
 | Video id | `f09434ac` |
-| Anchor frame | `160` (has point prompts) |
-| Non-anchor frame | `500` (propagated mask only) |
+| Anchor frame | `160` |
 | Objects | `1` HeadShave, `2` NoShave |
 
 Path: `/opt/projects/segmentation_tracking_projects/9f8a7b6c-sandbox_Home-Cage-Interactions-0126-test-day`
+
+Agent E2E (`agent-e2e.spec.ts`) **resets the sandbox video** before and after the run: masks, point prompts, SAM session, and propagation state are wiped; the source video and HeadShave/NoShave objects are kept. Other videos in the project are left alone. Mask-swap tests still snapshot/restore and do not reset.
 
 ## Run tests
 
@@ -51,6 +52,14 @@ cd e2e
 ```
 
 Or: `bash e2e/run-tests.sh mask-clear.spec.ts` (uses Node 22 npx directly).
+
+Agent UI (needs vLLM on :8001 and SAM loaded):
+
+```
+bash e2e/run-tests.sh agent-e2e.spec.ts
+```
+
+API-only verification (disk + config + session):
 
 API-only verification (disk + config + session):
 
