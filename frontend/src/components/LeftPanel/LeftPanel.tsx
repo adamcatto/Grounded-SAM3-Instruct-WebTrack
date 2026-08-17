@@ -10,11 +10,13 @@ import {
   getSavedMask,
   extractFrame,
   restoreMaskFrames,
+  replaceFramePromptsData,
   predictFrame,
   type ClearMasksMode,
 } from '../../api/client'
 import { getObjectColor } from '../../utils/colors'
 import { clearMaskCache } from '../../utils/maskUtils'
+import { clearCompositeCache, evictCompositeFrame } from '../../utils/compositeMaskCache'
 import {
   ANCHOR_BATCH_SIZE_MAX,
   ANCHOR_BATCH_SIZE_MIN,
@@ -1202,6 +1204,55 @@ export default function LeftPanel() {
 
   // ── Clear Masks ──────────────────────────────────────────────────────────────
 
+  type PointsSnapshot = Record<string, Record<string, { points: [number, number][]; labels: number[] }>>
+
+  // Capture the point prompts that a clear of `mode` will delete, so undo can
+  // restore them (clearing masks now also clears the prompts that made them).
+  function _snapshotPointsForClear(mode: ClearMasksMode | 'this_frame'): PointsSnapshot {
+    const pp = (video?.point_prompts ?? {}) as PointsSnapshot
+    const rangeFrom = parseInt(clearRangeFrom)
+    const rangeTo = parseInt(clearRangeTo)
+    const inScope = (f: number): boolean => {
+      if (mode === 'this_frame') return f === currentFrame
+      if (mode === 'from_frame') return f >= currentFrame
+      if (mode === 'range') return !isNaN(rangeFrom) && !isNaN(rangeTo) && f >= rangeFrom && f <= rangeTo
+      return true // 'all'
+    }
+    const out: PointsSnapshot = {}
+    for (const [oid, frameMap] of Object.entries(pp)) {
+      for (const [fk, data] of Object.entries(frameMap)) {
+        if (inScope(Number(fk))) {
+          (out[oid] ??= {})[fk] = { points: data.points, labels: data.labels }
+        }
+      }
+    }
+    return out
+  }
+
+  async function _restorePointsSnapshot(snap: PointsSnapshot) {
+    for (const [oid, frameMap] of Object.entries(snap)) {
+      for (const [fk, data] of Object.entries(frameMap)) {
+        try {
+          await replaceFramePromptsData(pid, vid, oid, Number(fk), data.points, data.labels)
+        } catch { /* ignore individual prompt restore failures */ }
+      }
+    }
+  }
+
+  // Rebuild the store's localAnnotations from the authoritative project config
+  // so cleared points disappear from the canvas (and don't regenerate masks).
+  function _syncLocalAnnotationsFromProject(proj: Awaited<ReturnType<typeof getProject>>) {
+    const pp = (proj.videos[vid]?.point_prompts ?? {}) as PointsSnapshot
+    const local: Record<string, Record<string, { points: { x: number; y: number; label: 0 | 1 }[] }>> = {}
+    for (const [oid, frameMap] of Object.entries(pp)) {
+      local[oid] = {}
+      for (const [fk, { points, labels }] of Object.entries(frameMap)) {
+        local[oid][fk] = { points: points.map(([x, y], i) => ({ x, y, label: labels[i] as 0 | 1 })) }
+      }
+    }
+    useStore.setState({ localAnnotations: local })
+  }
+
   function handleClearFrameMasks() {
     setShowClearMasksModal(true)
   }
@@ -1210,6 +1261,7 @@ export default function LeftPanel() {
     setShowClearMasksModal(false)
     const frames = _framesToSnapshotForClear(mode)
     const snapshots = await _snapshotMasksForFrames(frames)
+    const pointsSnapshot = _snapshotPointsForClear(mode)
     const f0 = currentFrame
     const rangeFrom = parseInt(clearRangeFrom)
     const rangeTo = parseInt(clearRangeTo)
@@ -1228,18 +1280,38 @@ export default function LeftPanel() {
       } else if (mode === 'all') {
         await clearMasksBulk(pid, vid, 'all')
       }
+      // Drop the cleared frames from every client-side mask cache. The canvas
+      // prefers the composite display bitmap over the store, so evicting only
+      // the store cache leaves the old overlay on screen.
+      for (const f of frames) {
+        evictCompositeFrame(pid, vid, f)
+        setSavedMask(f, {})
+      }
+      if (frames.includes(currentFrame)) setCurrentFrameMasks({}, null)
       clearMaskCache()
       const fresh = await getProject(pid)
       setProject(fresh)
+      _syncLocalAnnotationsFromProject(fresh)
       addToast('Masks cleared', 'success')
       useStore.getState().pushHistory({
         labelUndo: 'Clear masks',
         labelRedo: 'Clear masks',
         undo: async () => {
-          if (Object.keys(snapshots).length === 0) return
-          await restoreMaskFrames(pid, vid, snapshots)
+          const hadMasks = Object.keys(snapshots).length > 0
+          const hadPoints = Object.keys(pointsSnapshot).length > 0
+          if (!hadMasks && !hadPoints) return
+          await _restorePointsSnapshot(pointsSnapshot)
+          if (hadMasks) await restoreMaskFrames(pid, vid, snapshots)
+          for (const fk of Object.keys(snapshots)) {
+            const f = Number(fk)
+            evictCompositeFrame(pid, vid, f)
+            setSavedMask(f, snapshots[fk])
+          }
+          setCurrentFrameMasks({}, null)
           clearMaskCache()
-          setProject(await getProject(pid))
+          const restored = await getProject(pid)
+          setProject(restored)
+          _syncLocalAnnotationsFromProject(restored)
         },
         redo: async () => {
           try {
@@ -1254,8 +1326,15 @@ export default function LeftPanel() {
               await clearMasksBulk(pid, vid, 'all')
             }
           } catch { /* ignore */ }
+          for (const f of frames) {
+            evictCompositeFrame(pid, vid, f)
+            setSavedMask(f, {})
+          }
+          if (frames.includes(f0)) setCurrentFrameMasks({}, null)
           clearMaskCache()
-          setProject(await getProject(pid))
+          const recleared = await getProject(pid)
+          setProject(recleared)
+          _syncLocalAnnotationsFromProject(recleared)
         },
       })
     } catch (e: unknown) {
@@ -1308,6 +1387,7 @@ export default function LeftPanel() {
     activeEsRef.current?.close()
     activeEsRef.current = null
     clearMaskCache()
+    clearCompositeCache()
     await resetVideo(pid, vid)
     const fresh = await getProject(pid)
     setProject(fresh)
