@@ -1394,6 +1394,9 @@ class AgentSession:
     # Set only while a native batch tool is running.  It streams child tool
     # traces/UI events instead of buffering them until the batch completes.
     progress: Optional[Callable[[str, dict], None]] = None
+    # The model-selected outer tool. Native child phases inherit this id so
+    # traces can distinguish deterministic implementation from LLM choices.
+    active_tool_id: Optional[str] = None
 
     def emit_ui(self, action: str, **payload: Any) -> dict:
         ev = {"action": action, **payload}
@@ -1499,7 +1502,10 @@ def _run_native_phase(
     if session.cancel.is_set():
         raise InterruptedError("Cancelled")
     if session.progress is not None:
-        session.progress("tool_call", {"id": phase_id, "name": name, "arguments": arguments})
+        session.progress("tool_call", {
+            "id": phase_id, "name": name, "arguments": arguments,
+            "parent_id": session.active_tool_id, "deterministic": True,
+        })
     t0 = time.time()
     result = action()
     _flush_native_ui(session)
@@ -1507,6 +1513,8 @@ def _run_native_phase(
         session.progress("tool_result", {
             "id": phase_id,
             "name": name,
+            "parent_id": session.active_tool_id,
+            "deterministic": True,
             "ok": bool(result.get("ok", True)),
             "result": {k: v for k, v in result.items() if k != "masks"},
             "elapsed_ms": int((time.time() - t0) * 1000),
@@ -3113,10 +3121,12 @@ def run_agent_sync(
             # Native batch tools use this callback to stream their child
             # goto/text/evaluate/commit work as it happens.
             session.progress = lambda event, payload: emit_and_record(event, payload)
+            session.active_tool_id = tc.get("id") or tname
             try:
                 result, ui_events = execute_tool(tname, targs, session)
             finally:
                 session.progress = None
+                session.active_tool_id = None
             dt = int((time.time() - t0) * 1000)
             for ui in ui_events:
                 emit_and_record("ui", ui)

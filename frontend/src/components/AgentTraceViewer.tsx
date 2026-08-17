@@ -3,6 +3,30 @@ import { Bot, ChevronDown, ChevronRight, Code2, Database, Eye, Loader, MessageSq
 import { displayMaskUrl, frameUrl, getAgentTrace, getAgentTraces, type AgentTrace, type AgentTraceSummary } from '../api/client'
 
 type TraceEvent = { event: string; data: Record<string, unknown> }
+type TraceNode = { id: string; event: TraceEvent; result?: TraceEvent; children: TraceNode[] }
+const MACRO_TOOLS = new Set(['segment_text_interval', 'anchor_frame_labeling_loop'])
+
+function eventId(event: TraceEvent, index: number) { return String(event.data?.id || `event-${index}`) }
+
+function buildTraceTree(events: TraceEvent[]): TraceNode[] {
+  const roots: TraceNode[] = []
+  const byId = new Map<string, TraceNode>()
+  events.forEach((event, index) => {
+    const id = eventId(event, index)
+    const data = event.data || {}
+    if (event.event === 'tool_result') {
+      const existing = byId.get(id)
+      if (existing) { existing.result = event; return }
+    }
+    const node: TraceNode = { id, event, children: [] }
+    if (event.event === 'tool_call') byId.set(id, node)
+    const parentId = typeof data.parent_id === 'string' ? data.parent_id : undefined
+    const parent = parentId ? byId.get(parentId) : undefined
+    if (parent) parent.children.push(node)
+    else roots.push(node)
+  })
+  return roots
+}
 
 function JsonBlock({ value }: { value: unknown }) {
   return <pre className="max-h-64 overflow-auto rounded-md bg-[#0b0b0b] border border-[#292929] p-3 text-[11px] leading-relaxed text-[#a9b4c5] whitespace-pre-wrap">{JSON.stringify(value, null, 2)}</pre>
@@ -84,6 +108,35 @@ function TraceEventCard({ event, trace }: { event: TraceEvent; trace: AgentTrace
   </article>
 }
 
+function TimelineRail({ nodes }: { nodes: TraceNode[] }) {
+  const entries = nodes.filter(node => node.event.event !== 'ui' && node.event.event !== 'usage')
+  return <nav className="w-52 shrink-0 sticky top-0 self-start max-h-[calc(100vh-10rem)] overflow-auto pr-4 border-r border-[#292929]">
+    <div className="mb-2 text-[10px] uppercase tracking-widest text-[#666]">Execution map</div>
+    <div className="space-y-1 border-l border-[#383838] pl-3">
+      {entries.map((node, i) => {
+        const d = node.event.data || {}
+        const name = node.event.event === 'tool_call' ? String(d.name || 'tool') : node.event.event
+        const macro = MACRO_TOOLS.has(name)
+        return <button key={node.id} onClick={() => document.getElementById(`trace-node-${node.id}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' })} className="w-full text-left py-1.5 text-[11px] text-[#888] hover:text-white">
+          <span className={macro ? 'text-violet-300 font-medium' : ''}>{i + 1}. {name}</span>
+          {node.children.length > 0 && <span className="block ml-2 mt-0.5 text-[10px] text-[#5f5f5f]">↳ {node.children.length} deterministic steps</span>}
+        </button>
+      })}
+    </div>
+  </nav>
+}
+
+function TraceNodeView({ node, trace }: { node: TraceNode; trace: AgentTrace }) {
+  const d = node.event.data || {}
+  const name = String(d.name || '')
+  const macro = node.event.event === 'tool_call' && MACRO_TOOLS.has(name)
+  if (!macro) return <div id={`trace-node-${node.id}`} className="scroll-mt-4"><TraceEventCard event={node.event} trace={trace} />{node.result && <TraceEventCard event={node.result} trace={trace} />}</div>
+  return <section id={`trace-node-${node.id}`} className="scroll-mt-4 rounded-xl border border-violet-500/35 bg-violet-500/[0.04] overflow-hidden">
+    <div className="px-4 py-3 border-b border-violet-500/20 flex items-center gap-2"><Wrench size={15} className="text-violet-300" /><div><div className="font-mono text-sm text-violet-100">{name}</div><div className="text-[11px] text-violet-300/70">Model-selected macro · deterministic child steps are grouped below</div></div></div>
+    <div className="p-3 space-y-3"><TraceEventCard event={node.event} trace={trace} /><div className="ml-4 pl-4 border-l-2 border-violet-500/30 space-y-3">{node.children.map(child => <TraceNodeView key={child.id} node={child} trace={trace} />)}</div>{node.result && <TraceEventCard event={node.result} trace={trace} />}</div>
+  </section>
+}
+
 export default function AgentTraceViewer() {
   const [data, setData] = useState<{ traces: AgentTraceSummary[]; projects: { id: string; name: string }[]; videos: { project_id: string; id: string; name: string }[] }>({ traces: [], projects: [], videos: [] })
   const [projectId, setProjectId] = useState('')
@@ -108,6 +161,7 @@ export default function AgentTraceViewer() {
 
   const visibleVideos = useMemo(() => data.videos.filter(v => !projectId || v.project_id === projectId), [data.videos, projectId])
   const events = (trace?.trace_json || []) as TraceEvent[]
+  const nodes = useMemo(() => buildTraceTree(events), [events])
   const effectiveSystemPrompt = useMemo(() => {
     const message = trace?.messages_json?.find(m => m.role === 'system')
     return typeof message?.content === 'string' ? message.content : trace?.system_prompt || ''
@@ -124,7 +178,7 @@ export default function AgentTraceViewer() {
       <Disclosure title="Effective system prompt · policy + hidden project metadata" icon={<Sparkles size={13} />} defaultOpen><pre className="whitespace-pre-wrap text-xs leading-relaxed text-[#c8c8c8]">{effectiveSystemPrompt || '(none)'}</pre></Disclosure>
       <Disclosure title="Project-configured prompt (editable portion)" icon={<Code2 size={13} />}><pre className="whitespace-pre-wrap text-xs leading-relaxed text-[#c8c8c8]">{trace.system_prompt || '(no project-specific prompt)'}</pre></Disclosure>
       <Disclosure title={`Full LLM transcript (${trace.messages_json?.length || 0} messages)`} icon={<MessageSquareText size={13} />}><JsonBlock value={trace.messages_json} /></Disclosure>
-      <section><div className="mb-2 text-xs font-semibold uppercase tracking-wider text-[#777]">Execution timeline · {events.length} events</div><div className="space-y-3">{events.map((event, i) => <TraceEventCard key={`${i}-${event.event}`} event={event} trace={trace} />)}</div></section>
+      <section><div className="mb-2 text-xs font-semibold uppercase tracking-wider text-[#777]">Execution timeline · {events.length} events</div><div className="flex gap-5 items-start"><TimelineRail nodes={nodes} /><div className="min-w-0 flex-1 space-y-3">{nodes.map(node => <TraceNodeView key={node.id} node={node} trace={trace} />)}</div></div></section>
     </div>}</main>
   </div>
 }
