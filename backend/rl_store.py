@@ -87,6 +87,50 @@ class RLDatasetStore:
             (n,) = conn.execute("SELECT COUNT(*) FROM rl_samples").fetchone()
             return int(n)
 
+    def find_by_dump_dir(self, dump_dir: str) -> Optional[int]:
+        if not dump_dir:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM rl_samples WHERE dump_dir=? ORDER BY id DESC LIMIT 1",
+                (dump_dir,),
+            ).fetchone()
+        return int(row["id"]) if row else None
+
+    def list_samples(
+        self, *, project_id: Optional[str] = None, video_id: Optional[str] = None, limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        where: list[str] = []
+        vals: list[Any] = []
+        if project_id:
+            where.append("project_id=?")
+            vals.append(project_id)
+        if video_id:
+            where.append("video_id=?")
+            vals.append(video_id)
+        clause = f" WHERE {' AND '.join(where)}" if where else ""
+        vals.append(max(1, min(int(limit), 1000)))
+        sql = (
+            "SELECT id, created_at, project_id, video_id, frame_idx, provider, model, user_text, "
+            "reward, label, notes, dump_dir FROM rl_samples" + clause + " ORDER BY id DESC LIMIT ?"
+        )
+        with self._connect() as conn:
+            rows = conn.execute(sql, vals).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_sample(self, sample_id: int) -> Optional[dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM rl_samples WHERE id=?", (int(sample_id),)).fetchone()
+        if row is None:
+            return None
+        out = dict(row)
+        for key in ("state_json", "trace_json", "messages_json", "images_json"):
+            try:
+                out[key] = json.loads(out[key]) if out.get(key) else ([] if key != "state_json" else {})
+            except (TypeError, json.JSONDecodeError):
+                out[key] = [] if key != "state_json" else {}
+        return out
+
     def stats(self) -> dict[str, Any]:
         with self._connect() as conn:
             (n,) = conn.execute("SELECT COUNT(*) FROM rl_samples").fetchone()

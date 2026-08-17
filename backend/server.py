@@ -4493,6 +4493,59 @@ def agent_rl_dataset_stats():
     return rl_store.get_store().stats()
 
 
+@app.get("/api/agent/traces")
+def list_agent_traces(
+    project_id: Optional[str] = None,
+    video_id: Optional[str] = None,
+    limit: int = 200,
+):
+    """Saved agent runs for the in-app trace explorer; filters are optional for cross-project review."""
+    import rl_store
+    rows = rl_store.get_store().list_samples(project_id=project_id, video_id=video_id, limit=limit)
+    projects: dict[str, str] = {}
+    videos: dict[str, str] = {}
+    for row in rows:
+        state = {}
+        # Summary rows deliberately omit the full state blob; read only enough
+        # metadata to give the filter UI meaningful labels when it is available.
+        try:
+            with rl_store.get_store()._connect() as conn:
+                raw = conn.execute("SELECT state_json FROM rl_samples WHERE id=?", (row["id"],)).fetchone()
+            state = json.loads(raw["state_json"] or "{}") if raw else {}
+        except Exception:
+            pass
+        pid = str(row.get("project_id") or "")
+        vid = str(row.get("video_id") or "")
+        if pid:
+            projects[pid] = str(state.get("project_name") or pid)
+        if vid:
+            name = vid
+            for v in state.get("videos") or []:
+                if str(v.get("id")) == vid:
+                    name = str(v.get("name") or vid)
+                    break
+            videos[f"{pid}:{vid}"] = name
+        row["project_name"] = projects.get(pid, pid)
+        row["video_name"] = videos.get(f"{pid}:{vid}", vid)
+    return {
+        "traces": rows,
+        "projects": [{"id": pid, "name": name} for pid, name in sorted(projects.items(), key=lambda x: x[1].lower())],
+        "videos": [
+            {"project_id": key.split(":", 1)[0], "id": key.split(":", 1)[1], "name": name}
+            for key, name in sorted(videos.items(), key=lambda x: x[1].lower())
+        ],
+    }
+
+
+@app.get("/api/agent/traces/{sample_id}")
+def get_agent_trace(sample_id: int):
+    import rl_store
+    sample = rl_store.get_store().get_sample(sample_id)
+    if sample is None:
+        raise HTTPException(404, "Saved agent trace not found")
+    return sample
+
+
 @app.post("/api/projects/{pid}/agent/rl_sample")
 def save_agent_rl_sample(pid: str, req: RLSampleRequest):
     """Persist the most recent agent run as an RL sample (trace + state + images)."""
@@ -4542,8 +4595,11 @@ def save_agent_rl_sample(pid: str, req: RLSampleRequest):
         "notes": req.notes,
     }
     store = rl_store.get_store()
-    sample_id = store.insert_sample(sample)
-    return {"id": sample_id, "count": store.count(), "db_path": str(store.db_path), "images": len(images)}
+    sample_id = store.find_by_dump_dir(str(dump_dir))
+    created = sample_id is None
+    if sample_id is None:
+        sample_id = store.insert_sample(sample)
+    return {"id": sample_id, "created": created, "count": store.count(), "db_path": str(store.db_path), "images": len(images)}
 
 
 @app.get("/api/projects/{pid}/agent/status")

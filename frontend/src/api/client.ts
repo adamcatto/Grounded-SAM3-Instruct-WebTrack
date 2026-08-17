@@ -650,6 +650,7 @@ export const getAgentSystemPrompt = (pid: string) =>
 
 export interface RLSampleResult {
   id: number
+  created?: boolean
   count: number
   db_path: string
   images: number
@@ -660,6 +661,45 @@ export const saveAgentRlSample = (
   body: { reward?: number | null; label?: string | null; notes?: string | null } = {},
 ) =>
   api.post<RLSampleResult>(`/projects/${pid}/agent/rl_sample`, body).then(r => r.data)
+
+export interface AgentTraceSummary {
+  id: number
+  created_at: string
+  project_id: string | null
+  project_name?: string
+  video_id: string | null
+  video_name?: string
+  frame_idx: number | null
+  provider: string | null
+  model: string | null
+  user_text: string | null
+  reward: number | null
+  label: string | null
+  notes: string | null
+  dump_dir: string | null
+}
+
+export interface AgentTraceList {
+  traces: AgentTraceSummary[]
+  projects: { id: string; name: string }[]
+  videos: { project_id: string; id: string; name: string }[]
+}
+
+export interface AgentTrace extends AgentTraceSummary {
+  system_prompt: string | null
+  state_json: Record<string, unknown>
+  trace_json: { event: string; data: Record<string, unknown> }[]
+  messages_json: Record<string, unknown>[]
+  images_json: { file: string; path: string; frame_idx?: number; video_id?: string }[]
+}
+
+export const getAgentTraces = (filters: { projectId?: string; videoId?: string; limit?: number } = {}) =>
+  api.get<AgentTraceList>('/agent/traces', {
+    params: { project_id: filters.projectId, video_id: filters.videoId, limit: filters.limit ?? 200 },
+  }).then(r => r.data)
+
+export const getAgentTrace = (id: number) =>
+  api.get<AgentTrace>(`/agent/traces/${id}`).then(r => r.data)
 
 export const setAgentSystemPrompt = (pid: string, prompt: string) =>
   api.put<AgentSystemPromptState>(`/projects/${pid}/agent/system_prompt`, { prompt }).then(r => r.data)

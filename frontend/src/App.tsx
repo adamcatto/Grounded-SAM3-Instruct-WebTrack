@@ -2,7 +2,7 @@ import React, { useEffect, useState, useCallback } from 'react'
 import { useStore, currentVideo as selectCurrentVideo } from './store/useStore'
 import type { ViewerTab } from './store/useStore'
 import { listProjects } from './api/client'
-import { Crosshair, PlayCircle, BrainCircuit, Settings2 } from 'lucide-react'
+import { Crosshair, PlayCircle, BrainCircuit, Settings2, ListTree } from 'lucide-react'
 import AgentChat from './components/AgentChat/AgentChat'
 import Header from './components/Header'
 import ProjectDrawer from './components/ProjectDrawer'
@@ -11,6 +11,7 @@ import LeftPanel from './components/LeftPanel/LeftPanel'
 import FrameViewer from './components/FrameViewer/FrameViewer'
 import VideoPlayer from './components/VideoPlayer/VideoPlayer'
 import InferenceStatePanel from './components/InferenceStatePanel'
+import AgentTraceViewer from './components/AgentTraceViewer'
 import ConfigPanel from './components/ConfigPanel'
 import Timeline from './components/Timeline/Timeline'
 import LoadingScreen from './components/LoadingScreen'
@@ -153,6 +154,12 @@ export default function App() {
                 />}
               </>
             )}
+            <TabButton
+              active={viewerTab === 'traces'}
+              icon={<ListTree size={14} />}
+              label="Agent traces"
+              onClick={() => handleSetViewerTab('traces')}
+            />
             <div className="flex-1" />
             <TabButton
               active={viewerTab === 'config'}
@@ -166,6 +173,7 @@ export default function App() {
           {viewerTab === 'annotate' && <FrameViewer />}
           {viewerTab === 'player' && <VideoPlayer />}
           {viewerTab === 'inference' && <InferenceStatePanel />}
+          {viewerTab === 'traces' && <AgentTraceViewer />}
           {viewerTab === 'config' && <ConfigPanel />}
 
           {/* Horizontal resize handle between viewer and timeline */}
