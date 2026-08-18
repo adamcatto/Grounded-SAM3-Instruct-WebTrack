@@ -311,6 +311,7 @@ export default function AgentChat() {
     const ac = new AbortController()
     abortRef.current = ac
     let assistantParts: string[] = []
+    let terminalRun = false
     const upsertTool = (id: string, patch: Partial<TraceItem>) => {
       setItems(prev => {
         const idx = prev.findIndex(it => it.id === id)
@@ -412,6 +413,7 @@ export default function AgentChat() {
             return
           }
           if (event === 'error') {
+            terminalRun = true
             setItems(prev => [...prev, {
               id: `e-${Date.now()}`,
               kind: 'error',
@@ -420,6 +422,7 @@ export default function AgentChat() {
             return
           }
           if (event === 'done') {
+            terminalRun = true
             const textVal = String(data.text || '').trim()
             if (textVal && !assistantParts.includes(textVal)) {
               assistantParts.push(textVal)
@@ -441,6 +444,11 @@ export default function AgentChat() {
       }
     } finally {
       try { await uiTail } catch { /* ignore */ }
+      // Every completed run is saved as a trace. The backend deduplicates by
+      // dump directory, so the explicit Save button remains safe to use.
+      if (terminalRun) {
+        try { await saveAgentRlSample(pid) } catch { /* trace persistence is best-effort */ }
+      }
       const s = useStore.getState()
       await hydrateSavedMasks(pid, s.currentVideoId ?? undefined, s.currentFrame)
       const joined = assistantParts.join('\n').trim()

@@ -15,7 +15,7 @@ let _savedMaskCacheOrder: number[] = []
 export type PointMode = 'add' | 'remove' | null
 export type PropagationStatus = 'idle' | 'running' | 'paused' | 'done' | 'error'
 export type AppStep = 'upload' | 'annotate' | 'review'
-export type ViewerTab = 'annotate' | 'player' | 'inference' | 'config'
+export type ViewerTab = 'annotate' | 'player' | 'inference' | 'traces' | 'config'
 
 // ─── App config ───────────────────────────────────────────────────────────────
 
