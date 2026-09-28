@@ -50,3 +50,9 @@ sam3_agent.ipynb
 
 # logs
 logs/
+
+# Agent run reports, E2E dumps, RL dataset (local artifacts; keep out of git for now)
+reports/
+
+# scratch
+sanbdox/
