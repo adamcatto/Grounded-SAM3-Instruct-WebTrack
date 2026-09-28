@@ -41,7 +41,9 @@ sleep 0.3
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR/backend"
 
+# The frontend reaches the API through the Vite proxy, so the backend only
+# needs to listen on localhost. Override with BACKEND_HOST if you must.
 exec python -m uvicorn server:app \
-    --host 0.0.0.0 \
+    --host "${BACKEND_HOST:-127.0.0.1}" \
     --port 8000 \
     --reload

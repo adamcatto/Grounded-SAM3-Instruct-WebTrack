@@ -12,6 +12,7 @@ import logging
 import shutil
 import tempfile
 import threading
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -71,11 +72,29 @@ def _video_ds_params(video: dict) -> tuple[Optional[int], Optional[float]]:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="SAM3 Web Tracker", version="1.0.0")
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    _start_model_load()
+    yield
+
+
+app = FastAPI(title="SAM3 Web Tracker", version="1.0.0", lifespan=_lifespan)
+
+# The browser talks to the backend through the Vite proxy (same origin), so CORS
+# is only needed when VITE_BACKEND_URL points the UI straight at this server.
+# Never use "*": the API can browse the server filesystem and delete projects,
+# and a wildcard would let any web page the user visits read those responses.
+_CORS_ORIGINS = [
+    o.strip()
+    for o in os.environ.get(
+        "CORS_ALLOW_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
+    ).split(",")
+    if o.strip() and o.strip() != "*"
+]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_CORS_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["Content-Range", "Accept-Ranges", "Content-Length", "Content-Type"],
@@ -742,10 +761,8 @@ def _get_prop_state(pid: str, vid: str) -> PropagationState:
 
 # ─── Startup: eagerly load SAM model ─────────────────────────────────────────
 
-@app.on_event("startup")
-async def startup_load_model():
+def _start_model_load():
     """Load the SAM model into GPU memory at server startup."""
-    import threading
 
     def _load():
         global _model_loading, _model_load_error

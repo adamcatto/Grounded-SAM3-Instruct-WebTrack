@@ -4,6 +4,7 @@ Lossless segmentation blob codec for masks.sqlite (v1: zlib + pickle + COCO RLE)
 
 from __future__ import annotations
 
+import io
 import pickle
 import zlib
 from typing import Any
@@ -13,6 +14,18 @@ from pycocotools import mask as mask_util
 
 MAGIC = b"SAM3WT01"
 VERSION_U32 = 1
+
+
+class _PlainDataUnpickler(pickle.Unpickler):
+    """Unpickler that refuses every global lookup.
+
+    Payloads only hold dicts/lists/str/bytes/ints, which pickle without any
+    GLOBAL opcode. Rejecting find_class means a crafted masks.sqlite (e.g. from
+    a project folder shared by someone else) cannot execute code on load.
+    """
+
+    def find_class(self, module: str, name: str):
+        raise pickle.UnpicklingError(f"seg_blob may not reference {module}.{name}")
 
 
 def encode_masks_blob(masks: dict[str, np.ndarray]) -> bytes:
@@ -42,7 +55,7 @@ def _unpack_rle_payload(blob: bytes) -> dict:
     if ver != VERSION_U32:
         raise ValueError(f"unsupported seg_blob version {ver}")
     raw = zlib.decompress(blob[len(MAGIC) + 4 :])
-    return pickle.loads(raw)
+    return _PlainDataUnpickler(io.BytesIO(raw)).load()
 
 
 def _pack_rle_payload(payload: dict) -> bytes:

@@ -53,4 +53,8 @@ npm install
 # Run vite directly (avoid broken .bin wrappers)
 # --------------------------------------------------
 
-node node_modules/vite/bin/vite.js --host 0.0.0.0
+# The app has no authentication and can browse the server filesystem, so only
+# listen on localhost by default. Use an SSH tunnel for remote access, or set
+# FRONTEND_HOST=0.0.0.0 to expose it to the network deliberately.
+FRONTEND_HOST="${FRONTEND_HOST:-127.0.0.1}"
+node node_modules/vite/bin/vite.js --host "$FRONTEND_HOST"
