@@ -20,6 +20,9 @@ else
     elif [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
         source "$HOME/miniconda3/etc/profile.d/conda.sh"
 
+    elif command -v conda >/dev/null 2>&1; then
+        source "$(conda info --base)/etc/profile.d/conda.sh"
+
     else
         echo "ERROR: Could not locate user conda install"
         exit 1

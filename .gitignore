@@ -56,3 +56,7 @@ reports/
 
 # scratch
 sanbdox/
+
+# Jupyter / npm debris
+.ipynb_checkpoints/
+npm-debug.log*

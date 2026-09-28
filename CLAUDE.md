@@ -31,12 +31,14 @@ npm run preview  # Preview production build
 
 **Backend runs** inside the `sam3` conda env via uvicorn:
 ```
-uvicorn server:app --host 0.0.0.0 --port 8000 --reload
+uvicorn server:app --host 127.0.0.1 --port 8000 --reload
 ```
 (The start script handles conda activation and LD_LIBRARY_PATH.)
 
-**Environment variables** (frontend):
-- `VITE_BACKEND_URL`: Override the backend URL for video/SSE direct connections (default: `http://localhost:8000`)
+**Environment variables:**
+- `VITE_BACKEND_URL`: Override the backend URL for direct API/video/SSE connections (default: empty, use the Vite `/api` proxy)
+- `FRONTEND_HOST` / `BACKEND_HOST`: bind interfaces (default `127.0.0.1`; the app has no auth)
+- `CORS_ALLOW_ORIGINS`: comma-separated allowed origins for direct API calls (no `*`)
 
 There are no automated tests.
 
@@ -94,7 +96,7 @@ The app has three phases:
 | `components/LeftPanel/` | Object list, propagation controls, SSE event handling |
 | `components/Timeline/` | Playback controls, thumbnail strip, per-object progress rows |
 
-**Frame display strategy**: `FrameViewer` switches between JPEG frames (for annotation precision when paused) and an HTML5 `<video>` element (for smooth playback). The video source endpoint supports HTTP 206 range requests for seeking. In dev mode, the video `src` bypasses Vite's proxy and hits the backend directly (CORS is `allow_origins=["*"]`) to avoid proxy buffering that breaks Range requests. SSE propagation events also bypass the proxy.
+**Frame display strategy**: `FrameViewer` switches between JPEG frames (for annotation precision when paused) and an HTML5 `<video>` element (for smooth playback). The video source endpoint supports HTTP 206 range requests for seeking. Video `src`, SSE propagation and agent streams all go through the Vite `/api` proxy (which passes Range requests and unbuffered SSE); set `VITE_BACKEND_URL` only to bypass it, and add that origin to `CORS_ALLOW_ORIGINS`.
 
 **Coordinate system**: Frontend sends normalized [0,1] point coordinates. Backend receives and passes them directly to SAM. Saved masks are full-resolution `(H, W)` binary uint8 arrays.
 

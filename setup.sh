@@ -11,13 +11,20 @@ echo "  SAM3 Web Tracker — Environment Setup"
 echo "=========================================="
 
 # ── Activate sam3 conda env ────────────────────────────────────────────────
-source /home/adam/miniconda3/etc/profile.d/conda.sh
+if ! command -v conda >/dev/null 2>&1; then
+    echo "ERROR: conda not found on PATH. Install Miniconda/Miniforge first."
+    exit 1
+fi
+source "$(conda info --base)/etc/profile.d/conda.sh"
+if ! conda env list | awk '{print $1}' | grep -qx sam3; then
+    echo "Creating conda env 'sam3' (Python 3.12)..."
+    conda create -y -n sam3 python=3.12
+fi
 conda activate sam3
 
 echo ""
 echo "Step 1/4: Installing Python backend dependencies..."
-pip install fastapi uvicorn[standard] sse-starlette python-multipart aiofiles \
-    numpy opencv-python-headless Pillow huggingface_hub
+pip install -r "$SCRIPT_DIR/backend/requirements.txt"
 
 echo ""
 echo "Step 2/4: Installing SAM3 from GitHub..."

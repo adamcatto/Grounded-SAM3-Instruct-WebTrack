@@ -25,6 +25,7 @@ also supports `COTRACKER3_CHECKPOINT` or automatic Hugging Face download.
   - [One-Time Setup](#one-time-setup)
   - [Start the Application](#start-the-application)
   - [Stop](#stop)
+  - [Network access and security](#network-access-and-security)
 - [Usage Workflow](#usage-workflow)
 
 </details>
@@ -191,7 +192,7 @@ The system consists of three layers:
 ### Prerequisites
 
 - Python 3.10+ with conda
-- Node.js 18+ (or via nvm)
+- Node.js 20.19+ or 22.12+ (or via nvm)
 - CUDA-capable GPU (recommended; CPU works but is slow)
 - HuggingFace account with access to [SAM3](https://huggingface.co/facebook/sam3) (gated model)
 
@@ -226,6 +227,23 @@ Open `http://localhost:5173` in your browser.
 ```bash
 bash stop.sh
 ```
+
+### Network access and security
+
+The app has **no authentication**, and its API can browse the server's filesystem, import files from arbitrary paths, and delete projects. For that reason both servers listen on `127.0.0.1` by default:
+
+- **Remote use (recommended):** forward the frontend port over SSH and browse to `http://localhost:5173` locally:
+  `ssh -L 5173:localhost:5173 you@gpu-node`
+- **Expose on a trusted network:** `FRONTEND_HOST=0.0.0.0 bash start_frontend.sh`. Anyone who can reach the port gets full access to the app.
+- The browser only ever talks to the Vite server; `/api` is proxied to the backend on `127.0.0.1:8000`, so the backend never needs to be exposed.
+
+| Variable             | Default                                         | Purpose                                                          |
+| -------------------- | ----------------------------------------------- | ---------------------------------------------------------------- |
+| `FRONTEND_HOST`      | `127.0.0.1`                                     | Interface the Vite server binds to                               |
+| `BACKEND_HOST`       | `127.0.0.1`                                     | Interface uvicorn binds to                                       |
+| `CORS_ALLOW_ORIGINS` | `http://localhost:5173,http://127.0.0.1:5173`   | Comma-separated origins allowed to call the API directly (`*` is ignored) |
+
+Only open project folders you trust. Mask data is decoded with a restricted unpickler, but project folders are still arbitrary files on disk.
 
 ---
 
@@ -304,7 +322,7 @@ React 18 + TypeScript + Vite, styled with Tailwind CSS.
 
 | Variable           | Default                 | Purpose                                                            |
 | ------------------ | ----------------------- | ------------------------------------------------------------------ |
-| `VITE_BACKEND_URL` | `http://localhost:8000` | Backend URL for direct video/SSE connections (bypasses Vite proxy) |
+| `VITE_BACKEND_URL` | _(empty: use the Vite `/api` proxy)_ | Backend URL for direct API/video/SSE connections, bypassing the proxy |
 
 
 ---
@@ -573,11 +591,7 @@ Use this checklist when configuring a new machine (laptop, lab workstation, or H
 git clone https://github.com/adamcatto/Grounded-SAM3-Instruct-WebTrack.git
 cd Grounded-SAM3-Instruct-WebTrack
 
-# 2. Create / activate the sam3 conda environment (Python 3.10+)
-conda create -n sam3 python=3.10 -y
-conda activate sam3
-
-# 3. Run setup (edit conda path inside setup.sh if yours differs from the default)
+# 2-3. Run setup (creates the `sam3` conda env if it does not exist)
 bash setup.sh
 
 # 4. Point project storage at a writable location (see below)
@@ -612,7 +626,7 @@ On shared HPC filesystems, prefer a project directory under your allocation (e.g
 | `SAM3_PROJECTS_DIR`          | (same as above)         | Backend, downstream analysis | Legacy alias; if both are set, `SAM3_TRACKING_PROJECTS_DIR` wins.                                                                                         |
 | `HF_TOKEN`                   | —                       | `scripts/download_model.py`  | HuggingFace token for downloading gated SAM3 weights.                                                                                                     |
 | `SAM3_ENV_YAML`              | `configs/env.yaml`      | Parallel tracking scripts    | Path to YAML config for HPC propagation workers (see below).                                                                                              |
-| `VITE_BACKEND_URL`           | `http://localhost:8000` | Frontend (build-time)        | Backend URL for video Range requests and SSE propagation when not using the Vite dev proxy. Set when the UI runs on a different host than the GPU server. |
+| `VITE_BACKEND_URL`           | _(empty)_               | Frontend (build-time)        | Backend URL for direct API calls, bypassing the Vite dev proxy. Normally leave unset and use an SSH tunnel (see [Network access and security](#network-access-and-security)). |
 
 
 **Example — shared lab storage on Minerva:**
@@ -625,12 +639,11 @@ export HF_TOKEN=hf_...
 **Example — frontend on laptop, backend on GPU node:**
 
 ```bash
-# On the GPU machine
-bash start_backend.sh   # listens on 0.0.0.0:8000
+# On the GPU machine: run both servers (they bind to 127.0.0.1)
+bash start.sh
 
-# On your laptop (before npm run dev / start_frontend.sh)
-export VITE_BACKEND_URL=http://gpu-node.your.cluster:8000
-bash start_frontend.sh
+# On your laptop: tunnel the UI port, then open http://localhost:5173
+ssh -L 5173:localhost:5173 you@gpu-node.your.cluster
 ```
 
 The backend reads `SAM3_TRACKING_PROJECTS_DIR` at startup. You can also change the active projects root at runtime from the UI (project drawer → set projects folder); that override applies to the running server process only and does not change downstream CLI behavior — CLIs always use the env var.
