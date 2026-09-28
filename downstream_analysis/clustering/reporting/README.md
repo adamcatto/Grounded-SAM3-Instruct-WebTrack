@@ -2,13 +2,12 @@
 
 Turn a completed clustering run into a **focused** report + editable slide deck,
 driven by a small human-curated `ReportSpec` (JSON) rather than dumping every
-plot. See the `behavior-quant-reporting` agent skill
-(`.agents/skills/behavior-quant-reporting/SKILL.md`) for the full workflow.
+plot.
 
 ## Quick start
 
 ```bash
-cd /sc/arion/projects/KennyComputational/Behavior/Grounded-SAM3-Instruct-WebTrack
+cd /path/to/Grounded-SAM3-Instruct-WebTrack
 PD=/path/to/project
 
 # 0. Do videos encode their condition in the filename?
@@ -45,5 +44,5 @@ conda run --no-capture-output -n sam3 python -m downstream_analysis.clustering.r
 
 The generators only do **layout**; all editorial content (which findings are the
 headline, what each figure shows, the takeaways) lives in the spec. Re-rendering
-never recomputes the pipeline. Run the LSF quantification step with
-`scripts/bsub_behavior_quantification.bsub`.
+never recomputes the pipeline. Run the quantification step as a batch job
+with `python scripts/hpc_submit.py behavior-quant /path/to/project`.

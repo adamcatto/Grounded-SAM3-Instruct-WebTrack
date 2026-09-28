@@ -23,7 +23,7 @@
 #
 # Example:
 #   bash scripts/sync_project_from_remote.sh \
-#     cattoa01@minerva.hpc.mssm.edu:/sc/arion/.../3c9bddf2-Home-Cage-Interactions-0126-test-day \
+#     user@cluster.example.edu:/path/to/projects/3c9bddf2-Home-Cage-Interactions-0126-test-day \
 #     /opt/projects/Adam/2026/tracked_behavior_projects \
 #     --link-sources-from /opt/projects/segmentation_tracking_projects/3c9bddf2-Home-Cage-Interactions-0126-test-day
 #

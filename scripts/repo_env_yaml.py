@@ -59,7 +59,3 @@ def parallel_tracking_section(cfg: dict[str, Any]) -> dict[str, Any]:
     s = cfg.get("parallel_tracking")
     return dict(s) if isinstance(s, dict) else {}
 
-
-def lsf_parallel_tracking_section(cfg: dict[str, Any]) -> dict[str, Any]:
-    s = cfg.get("lsf_parallel_tracking")
-    return dict(s) if isinstance(s, dict) else {}

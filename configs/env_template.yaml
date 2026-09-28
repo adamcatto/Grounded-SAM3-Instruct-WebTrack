@@ -28,85 +28,51 @@ parallel_tracking:
   max_concurrent_propagations_per_gpu: 1
   oom_reduce_concurrency: true
 
-# Used only by scripts/parallel_tracking_launcher.py when submitting IBM Spectrum LSF jobs.
-lsf_parallel_tracking:
-  submit_count: 1 # identical bsub submits (embarrassingly parallel workers)
+# Batch jobs on Slurm or LSF, submitted with scripts/hpc_submit.py:
+#   python scripts/hpc_submit.py tracking PROJECT_DIR [--count N]   (GPU; N-element job array)
+#   python scripts/hpc_submit.py features PROJECT_DIR [--skip-cached] (one CPU job per video)
+#   python scripts/hpc_submit.py behavior-quant PROJECT_DIR          (CPU clustering)
+# Add --dry-run to print the generated #SBATCH / #BSUB script without submitting.
+hpc:
+  scheduler: auto   # auto (detect sbatch / bsub on PATH) | slurm | lsf
+  account: ""       # Slurm --account / LSF -P
+  queue: ""         # Slurm --partition / LSF -q
+  log_dir: logs/hpc # repo-relative or absolute; generated job scripts go in <log_dir>/jobs/
 
-  job_name: sam3-partrack
-  job_array_spec: null # example: "1-40" -> bsub -J "sam3-partrack[1-40]"; null = single job name only
+  # Resource defaults for every job type (built-in per-type defaults apply when omitted):
+  #   tracking:       cpus 8,  mem_mb 32000, gpus 1, walltime 24:00
+  #   features:       cpus 8,  mem_mb 16000, gpus 0, walltime 08:00
+  #   behavior_quant: cpus 32, mem_mb 64000, gpus 0, walltime 12:00
+  # cpus: 8
+  # mem_mb: 16000   # LSF: rusage[mem=...] units follow your site's LSF_UNIT_FOR_LIMITS
+  # gpus: 1         # tracking with gpus > 1 runs one backend + worker per GPU in the job
+  # walltime: "24:00"   # HH:MM, HH:MM:SS or D-HH:MM
 
-  num_process_slots: 1 # -n
-  queue_project: "" # -P (e.g. acc_YourProject); omit or "" to skip
-  queue: "" # -q (e.g. gpu); omit or "" to skip — was extra_bsub_args only before
-  run_limit: "48:00" # -W wall clock (site-specific syntax)
-
-  resources: []
-  # Each entry becomes one -R string. Example Minerva / academic LSF:
-  #  - 'rusage[mem=16000]'
-  #  - 'span[hosts=1]'
-  #  - 'h100nvl'
-
-  # Becomes: bsub ... -gpu num=4 ... (Spectrum LSF). Omit or "" to skip.
-  gpu_allocation: ""
-
-  # If true: use -oo / -eo for stdout/stderr (overwrite). If false: -o / -e.
-  log_overwrite: false
-
-  stdout: logs/sam3-partrack_%J.out # repo-relative to clone; mkdir -p logs; use %J for job id
-  stderr: logs/sam3-partrack_%J.err
-
-  working_directory: "" # optional: -cwd for bsub (empty = omit)
-
-  # How the job command is executed on the compute node.
-  # The launcher submits: <job_shell> -lc "<cd repo> && <mkdir logs> && <shell_preamble...> && <python worker...>"
-  job_shell: "bash"
-  shell_login: true # bash -lc (true) vs bash -c (false)
-  run_in_repo: true # ensures the job runs from the repo root
-
-  # Put site-specific environment activation here (module load, conda activate, etc.).
+  # Per-job-type overrides (same keys, plus extra_directives):
+  jobs:
+    tracking: {}
+    features: {}
+    behavior_quant: {}
   # Example:
+  # jobs:
+  #   tracking:
+  #     queue: gpu
+  #     walltime: "2-00:00"
+  #     extra_directives: ["--constraint=a100"]      # Slurm
+  #     # extra_directives: ['-R "select[a100]"']    # LSF
+
+  # Raw scheduler options appended to every job (written after #SBATCH / #BSUB).
+  extra_directives: []
+
+  # Shell lines run on the compute node before the job (module load, conda activate, ...).
+  # Empty = re-activate the conda env you submitted from.
+  shell_preamble: []
   # shell_preamble:
-  #   - "source ~/.bashrc"
   #   - "module load cuda/12.1"
   #   - "source $(conda info --base)/etc/profile.d/conda.sh && conda activate sam3"
-  shell_preamble: []
 
-  # Fallback / escape hatch (parsed last): odd flags or site-specific tokens not covered above.
-  extra_bsub_args: []
-
-  # --- Example (commented): align with a #BSUB script like ----------
-  # #BSUB -J tracking
-  # #BSUB -P acc_YourProject
-  # #BSUB -q gpu
-  # #BSUB -n 64
-  # #BSUB -R "rusage[mem=16000]"
-  # #BSUB -R "span[hosts=1]"
-  # #BSUB -R h100nvl
-  # #BSUB -gpu num=4
-  # #BSUB -W 144:00
-  # #BSUB -oo /path/logs/%J.out
-  # #BSUB -eo /path/logs/%J.err
-  #
-  # job_name: tracking
-  # queue_project: acc_YourProject
-  # queue: gpu
-  # num_process_slots: 64
-  # run_limit: "144:00"
-  # resources:
-  #   - 'rusage[mem=16000]'
-  #   - 'span[hosts=1]'
-  #   - 'h100nvl'
-  # gpu_allocation: "num=4"
-  # log_overwrite: true
-  # stdout: "/sc/arion/projects/YourProject/logs/%J.out"
-  # stderr: "/sc/arion/projects/YourProject/logs/%J.err"
-
-  # Python used inside the batch job (conda env); empty = "python3" on PATH
-  worker_python: ""
-
-  # Additional environment variables for the submitted job (merged into os.environ)
-  environment: {}
-  # SAM3_BACKEND_URL: "http://inference-host:8000"
+  python: ""        # interpreter inside the job; empty = "python" on PATH after the preamble
+  environment: {}   # extra exported variables, e.g. {SAM3_TRACKING_PROJECTS_DIR: /data/projects}
 
 # Local vision LLM for the Agent chat pane (same idea as SAM 3 Agent + vLLM).
 # The backend auto-detects a running server; these are the defaults it probes.

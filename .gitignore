@@ -60,3 +60,11 @@ sanbdox/
 # Jupyter / npm debris
 .ipynb_checkpoints/
 npm-debug.log*
+
+# Research / lab-local material not shipped in releases (kept on disk)
+experiments/
+notes-for-paper/
+.agents/
+.cursor/
+scripts/bsub_*.bsub
+scripts/bsub_*.sh

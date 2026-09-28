@@ -66,8 +66,8 @@ also supports `COTRACKER3_CHECKPOINT` or automatic Hugging Face download.
 <summary><strong>HPC &amp; automation</strong></summary>
 
 - [HPC Batch Processing](#hpc-batch-processing)
-  - [Generate and Submit Jobs](#generate-and-submit-jobs)
   - [Parallel Tracking (Propagation)](#parallel-tracking-propagation)
+  - [Feature Extraction and Behavior Quantification](#feature-extraction-and-behavior-quantification)
 - [Scripts &amp; Utilities](#scripts--utilities)
 
 </details>
@@ -86,7 +86,6 @@ also supports `COTRACKER3_CHECKPOINT` or automatic Hugging Face download.
   - [Project directory → experiment name mapping](#1-project-directory--experiment-name-mapping)
   - [Identity registry (<code>experiment_registry.csv</code>)](#2-identity-registry-experiment_registrycsv)
   - [Batch definition and correction](#3-batch-definition-and-correction)
-- [Feature-extraction bsub jobs](#feature-extraction-bsub-jobs)
 - [Configuration quick reference](#configuration-quick-reference)
 
 </details>
@@ -126,6 +125,17 @@ The system consists of three layers:
 - Multi-object support: track multiple objects simultaneously with distinct colors and IDs
 - Anchor frame system: annotate key frames, propagate between them for long videos
 - Pause/resume propagation mid-video
+
+**Agent & Text Prompting**
+
+- Chat pane that segments objects from text ("the dark mouse on the left") and drives annotation tools
+- Works with a local vision LLM (vLLM / Ollama) or a cloud API; editable per-project system prompt
+- In-app trace viewer for past agent runs
+
+**Pose & Registration**
+
+- Point/pose tracking with CoTracker3 (optional, non-commercial license)
+- Multi-view video registration
 
 **Video Management**
 
@@ -385,9 +395,8 @@ Sequence features (33-dim per sliding window):
 #### Single-Project Pipeline
 
 ```bash
-# Step 1: Extract features (parallelizable across videos via bsub)
-conda run -n sam3 python -m downstream_analysis.clustering.generate_bsub_jobs \
-  --project-dir /path/to/project --submit-all
+# Step 1: Extract features (one Slurm/LSF job per video; see HPC Batch Processing)
+python scripts/hpc_submit.py features /path/to/project
 
 # Step 2: Cluster + compare (after all feature jobs complete)
 conda run --no-capture-output -n sam3 python -m downstream_analysis.clustering \
@@ -484,32 +493,43 @@ conda run --no-capture-output -n sam3 python -m downstream_analysis.clustering.m
 
 ## HPC Batch Processing
 
-Feature extraction is the bottleneck (~55 min/video). The pipeline supports HPC parallelization via LSF (bsub).
-
-### Generate and Submit Jobs
+Tracking and feature extraction parallelize across videos on **Slurm** or **LSF**. `scripts/hpc_submit.py` renders an `#SBATCH` / `#BSUB` script from the `hpc:` block of `configs/env.yaml` and submits it; the scheduler is auto-detected from `sbatch` / `bsub` on `PATH` (or set `hpc.scheduler`). See [HPC configuration](#hpc-configuration-configsenvyaml).
 
 ```bash
-# Generate .lsf files for all videos in a project
-conda run -n sam3 python -m downstream_analysis.clustering.generate_bsub_jobs \
-  --project-dir /path/to/project
+cp configs/env_template.yaml configs/env.yaml   # set account, queue/partition, resources
 
-# Submit all jobs
-conda run -n sam3 python -m downstream_analysis.clustering.generate_bsub_jobs \
-  --project-dir /path/to/project --submit-all
+# Preview the generated job script without submitting
+python scripts/hpc_submit.py tracking /path/to/project --dry-run
 ```
 
 ### Parallel Tracking (Propagation)
 
-For running SAM propagation on many videos without the web UI:
+```bash
+# 8 GPU jobs (one job array) share the project's videos via a claims file
+python scripts/hpc_submit.py tracking /path/to/project --count 8
+
+# Worker options go after --
+python scripts/hpc_submit.py tracking /path/to/project -- --quiet-sse
+```
+
+Each job starts its own backend on a free port on the compute node and runs `scripts/parallel_tracking_worker.py` against it (`scripts/hpc/tracking_job.sh`). With `gpus: N > 1` the job runs one backend + worker per GPU instead. The job body is scheduler-independent, so it also runs directly on any GPU machine:
 
 ```bash
-# Launch parallel tracking across all incomplete videos in a project
-python scripts/parallel_tracking_launcher.py \
-  --project-dir /path/to/project
-
-# Or submit as a batch job
-bsub < scripts/bsub_parallel_project_tracking.bsub
+bash scripts/hpc/tracking_job.sh /path/to/project
 ```
+
+### Feature Extraction and Behavior Quantification
+
+Feature extraction is the bottleneck of the clustering pipeline (~55 min/video), so it runs as one CPU job per tracked video:
+
+```bash
+python scripts/hpc_submit.py features /path/to/project                 # all tracked videos
+python scripts/hpc_submit.py features /path/to/project --skip-cached   # only what's missing
+python scripts/hpc_submit.py behavior-quant /path/to/project           # clustering, after features finish
+python scripts/hpc_submit.py behavior-quant /path/to/project -- --single-animal
+```
+
+Re-running `features --skip-cached --dry-run` reports how many videos are still missing.
 
 For a **single project on one machine** (sequential propagation, or a dry-run before launching
 workers), use `scripts/run_pending_inference.py`. It prints a RUN/SKIP plan for each video, then
@@ -525,7 +545,7 @@ examples including `--list-only`.
 | Script                                  | Purpose                                                               |
 | --------------------------------------- | --------------------------------------------------------------------- |
 | `scripts/download_model.py`             | Download SAM3/SAM2 checkpoints from HuggingFace (requires `HF_TOKEN`) |
-| `scripts/parallel_tracking_launcher.py` | Orchestrate batch propagation across projects                         |
+| `scripts/hpc_submit.py`                 | Submit tracking / feature / clustering jobs to Slurm or LSF           |
 | `scripts/parallel_tracking_worker.py`   | Single-video propagation worker process                               |
 | `scripts/run_pending_inference.py`      | CLI propagation for eligible videos (dry-run with `--list-only`, or run sequentially) |
 | `scripts/merge_projects.py`             | Merge two SAM3 projects (combine configs, videos)                     |
@@ -601,9 +621,9 @@ export SAM3_TRACKING_PROJECTS_DIR=/path/to/your/projects
 export HF_TOKEN=hf_your_token_here
 conda run -n sam3 python scripts/download_model.py
 
-# 6. For HPC batch propagation / feature extraction, create a local env file:
+# 6. For Slurm/LSF batch jobs (tracking, feature extraction), create a local env file:
 cp configs/env_template.yaml configs/env.yaml
-# Edit configs/env.yaml — queue, account, conda path, log directories
+# Edit configs/env.yaml → hpc: scheduler, account, queue, resources, preamble
 
 # 7. Verify the web app
 bash start_backend.sh    # terminal 1
@@ -613,7 +633,7 @@ bash start_frontend.sh   # terminal 2
 
 Add the `export SAM3_TRACKING_PROJECTS_DIR=...` line to your `~/.bashrc` (or job preamble) so the backend, downstream CLIs, and HPC workers all resolve the same project folders.
 
-On shared HPC filesystems, prefer a project directory under your allocation (e.g. `/sc/arion/projects/YourLab/Behavior/projects/`) rather than `/opt/projects/segmentation_tracking_projects`, so jobs on compute nodes see the same data as your interactive sessions.
+On shared HPC filesystems, prefer a project directory under your allocation (e.g. `/path/to/lab/projects/`) rather than `/opt/projects/segmentation_tracking_projects`, so jobs on compute nodes see the same data as your interactive sessions.
 
 ---
 
@@ -629,10 +649,10 @@ On shared HPC filesystems, prefer a project directory under your allocation (e.g
 | `VITE_BACKEND_URL`           | _(empty)_               | Frontend (build-time)        | Backend URL for direct API calls, bypassing the Vite dev proxy. Normally leave unset and use an SSH tunnel (see [Network access and security](#network-access-and-security)). |
 
 
-**Example — shared lab storage on Minerva:**
+**Example — shared lab storage on a cluster:**
 
 ```bash
-export SAM3_TRACKING_PROJECTS_DIR=/sc/arion/projects/KennyComputational/Behavior/projects
+export SAM3_TRACKING_PROJECTS_DIR=/shared/lab/behavior/projects
 export HF_TOKEN=hf_...
 ```
 
@@ -714,7 +734,7 @@ Both paths are relative to the repo root. The backend loads whichever checkpoint
 
 ### HPC configuration (`configs/env.yaml`)
 
-Batch propagation and LSF job submission use a **per-clone, gitignored** YAML file. Copy the template and customize for your cluster:
+Batch jobs use a **per-clone, gitignored** YAML file. Copy the template and customize for your cluster:
 
 ```bash
 cp configs/env_template.yaml configs/env.yaml
@@ -723,8 +743,27 @@ cp configs/env_template.yaml configs/env.yaml
 Alternatively, point at a shared config elsewhere:
 
 ```bash
-export SAM3_ENV_YAML=/sc/arion/projects/YourLab/sam3-env.yaml
+export SAM3_ENV_YAML=/path/to/shared/sam3-env.yaml
 ```
+
+**`hpc`** — read by `scripts/hpc_submit.py`:
+
+
+| Key                | Example                     | Slurm                        | LSF                      |
+| ------------------ | --------------------------- | ---------------------------- | ------------------------ |
+| `scheduler`        | `auto` / `slurm` / `lsf`    |                              |                          |
+| `account`          | `my_lab`                    | `--account`                  | `-P`                     |
+| `queue`            | `gpu`                       | `--partition`                | `-q`                     |
+| `cpus`             | `8`                         | `--cpus-per-task`            | `-n` + `span[hosts=1]`   |
+| `mem_mb`           | `32000`                     | `--mem=…M`                   | `-R "rusage[mem=…]"`     |
+| `gpus`             | `1`                         | `--gres=gpu:N`               | `-gpu "num=N"`           |
+| `walltime`         | `24:00`, `2-00:00`          | `--time`                     | `-W`                     |
+| `extra_directives` | `["--constraint=a100"]`     | appended `#SBATCH` lines     | appended `#BSUB` lines   |
+| `shell_preamble`   | `["module load cuda/12.1"]` | run before the job body      | run before the job body  |
+| `log_dir`          | `logs/hpc`                  | job logs; scripts in `jobs/` | same                     |
+
+
+Resource keys can be overridden per job type under `hpc.jobs.tracking`, `hpc.jobs.features` and `hpc.jobs.behavior_quant`. With an empty `shell_preamble`, jobs re-activate the conda env you submitted from.
 
 **`parallel_tracking`** — read by `scripts/parallel_tracking_worker.py`:
 
@@ -739,33 +778,7 @@ export SAM3_ENV_YAML=/sc/arion/projects/YourLab/sam3-env.yaml
 | `idle_loops_before_exit`    | `288`                            | Worker exits after N idle polls (for batch arrays)          |
 
 
-**`lsf_parallel_tracking`** — read by `scripts/parallel_tracking_launcher.py`:
-
-
-| Key                 | Example (Minerva)                               | Maps to                        |
-| ------------------- | ----------------------------------------------- | ------------------------------ |
-| `queue_project`     | `acc_KennyComputational`                        | `bsub -P`                      |
-| `queue`             | `gpu`                                           | `bsub -q`                      |
-| `num_process_slots` | `32`                                            | `bsub -n`                      |
-| `resources`         | `rusage[mem=16000]`, `span[hosts=1]`, `h100nvl` | `bsub -R` (one per entry)      |
-| `gpu_allocation`    | `num=1`                                         | `bsub -gpu`                    |
-| `run_limit`         | `144:00`                                        | `bsub -W`                      |
-| `stdout` / `stderr` | `/sc/arion/.../logs/%J.out`                     | Log paths (`%J` = job id)      |
-| `shell_preamble`    | `conda activate ...`                            | Commands run before the worker |
-| `worker_python`     | `/path/to/envs/sam3/bin/python`                 | Python in batch jobs           |
-
-
-**Submit parallel tracking:**
-
-```bash
-# Edit configs/env.yaml first, then:
-python scripts/parallel_tracking_launcher.py /path/to/project
-
-# Or run locally without LSF:
-python scripts/parallel_tracking_launcher.py --local /path/to/project
-```
-
-CLI flags on the worker/launcher override YAML values when provided.
+CLI flags on the worker override YAML values when provided.
 
 ---
 
@@ -862,24 +875,6 @@ Use `--batch-correction zscore_per_batch` if some batches are very small (<10 wi
 
 ---
 
-### Feature-extraction bsub jobs
-
-`downstream_analysis/clustering/generate_bsub_jobs.py` has **site-specific constants** at the top of the file (account, queue, walltime, conda path in the generated LSF scripts). Edit these for your cluster, or override at generation time:
-
-```bash
-conda run -n sam3 python -m downstream_analysis.clustering.generate_bsub_jobs \
-  --project-dir /path/to/project \
-  --account acc_YourProject \
-  --queue premium \
-  --walltime 08:00 \
-  --mem 16000 \
-  --submit-all
-```
-
-Generated scripts land in `<project>/analysis_of_tracking_data/clustering/bsub_jobs/` with logs in `bsub_logs/`. See `downstream_analysis/clustering/RUN_PIPELINE.md` for the full step-by-step.
-
----
-
 ### Configuration quick reference
 
 
@@ -887,9 +882,8 @@ Generated scripts land in `<project>/analysis_of_tracking_data/clustering/bsub_j
 | -------------------------------- | ------------------------------------------------------------------- |
 | Store projects on shared disk    | `SAM3_TRACKING_PROJECTS_DIR`                                        |
 | Download SAM3 weights            | `HF_TOKEN` + `scripts/download_model.py`                            |
-| UI on laptop, GPU backend remote | `VITE_BACKEND_URL`                                                  |
-| HPC parallel propagation         | `configs/env.yaml` (from `env_template.yaml`)                       |
-| LSF queue/account/memory         | `configs/env.yaml → lsf_parallel_tracking`                          |
+| UI on laptop, GPU server remote  | SSH tunnel to port 5173 (see Network access and security)           |
+| HPC jobs (Slurm / LSF)           | `configs/env.yaml → hpc` (from `env_template.yaml`)                 |
 | Multi-GPU on one node            | `parallel_tracking.local_gpu_workers` + `auto_start_local_backends` |
 | Fewer/more behavior clusters     | `--resolution` (re-run clustering only)                             |
 | New mouse cohort / study         | Custom `experiment_registry.csv` + uuid map                         |
@@ -921,6 +915,8 @@ Grounded-SAM3-Instruct-WebTrack/
     tracking_io.py            # Load masks via VideoMaskStorage
     pipeline.py               # Locomotion analysis pipeline
   scripts/                    # Utilities and batch processing
+    hpc_submit.py             # Slurm/LSF job submission
+    hpc/                      # Scheduler-agnostic job bodies
   pretrained_models/          # SAM3/SAM2 checkpoints
   .sam3_src/                  # SAM3 source (cloned during setup)
   setup.sh                    # One-time environment setup
@@ -944,4 +940,16 @@ The backend will run on CPU but inference will be significantly slower. Propagat
 
 ## License
 
-This project builds on [SAM 3](https://github.com/facebookresearch/sam3) by Meta AI Research, which is released under the Apache 2.0 license.
+Copyright 2026 Adam Catto. Licensed under the [Apache License, Version 2.0](LICENSE).
+
+### Third-party models
+
+Model code and weights are downloaded at setup time, are not part of this repository, and keep their own licenses:
+
+| Component | License | Notes |
+| --- | --- | --- |
+| [SAM 3](https://github.com/facebookresearch/sam3) (Meta) | [SAM License](https://github.com/facebookresearch/sam3/blob/main/LICENSE) | Default segmentation/tracking model; gated on Hugging Face |
+| [SAM 2](https://github.com/facebookresearch/sam2) (Meta) | Apache-2.0 | Fallback when SAM 3 weights are absent |
+| [CoTracker3](https://github.com/facebookresearch/co-tracker) (Meta) | CC BY-NC 4.0 | Optional pose/point tracking; **non-commercial use only** |
+
+Using these models means accepting their terms, which may be more restrictive than this project's license.

@@ -3,49 +3,46 @@
 ## Overview
 
 The pipeline has two phases:
-1. **Frame feature extraction** (slow, parallelizable via bsub) -- ~55 min per video
+1. **Frame feature extraction** (slow, one Slurm/LSF job per video) -- ~55 min per video
 2. **Clustering + comparison** (fast, single process) -- ~5 min total
 
-## Step 1: Generate and submit bsub jobs for frame feature extraction
+Cluster settings (scheduler, account, queue, resources) come from the `hpc:` block
+of `configs/env.yaml`; see the "HPC Batch Processing" section of the top-level README.
+
+## Step 1: Submit frame feature extraction jobs
 
 ```bash
-# Generate .lsf files + submit all 47 jobs in one command:
-conda run -n sam3 python \
-  /sc/arion/projects/KennyComputational/Behavior/Grounded-SAM3-Instruct-WebTrack/downstream_analysis/clustering/generate_bsub_jobs.py \
-  --project-dir /sc/arion/projects/KennyComputational/Behavior/projects/3c9bddf2-Home-Cage-Interactions-0126-test-day \
-  --submit-all
-```
+# Preview the generated #SBATCH / #BSUB scripts:
+python scripts/hpc_submit.py features /path/to/project --dry-run
 
-Or do it in two steps (generate first, review, then submit):
-```bash
-# Generate only:
-conda run -n sam3 python .../generate_bsub_jobs.py --project-dir /path/to/project --dry-run
-
-# Then submit:
-bash /path/to/project/analysis_of_tracking_data/clustering/bsub_jobs/submit_all.sh
+# Submit one job per tracked video:
+python scripts/hpc_submit.py features /path/to/project
 ```
 
 ## Step 2: Monitor progress
 
 ```bash
-# Quick status:
-bjobs -w | grep feat_
+squeue --me -n feat_     # Slurm   (LSF: bjobs -w | grep feat_)
 
-# Detailed check (cached count, running jobs, errors):
-bash /path/to/project/analysis_of_tracking_data/clustering/bsub_jobs/check_status.sh
+# Videos still missing cached features:
+python scripts/hpc_submit.py features /path/to/project --skip-cached --dry-run
 ```
 
-Logs are in `<project>/analysis_of_tracking_data/clustering/bsub_logs/`.
+Logs are in `logs/hpc/` (or `hpc.log_dir`); generated job scripts in `logs/hpc/jobs/`.
 
 ## Step 3: Run clustering (after all jobs complete)
 
-Once all 47 videos have cached features:
+Once every video has cached features, either submit it as a job:
 
 ```bash
-cd /sc/arion/projects/KennyComputational/Behavior/Grounded-SAM3-Instruct-WebTrack
+python scripts/hpc_submit.py behavior-quant /path/to/project
+```
 
+or run it directly:
+
+```bash
 conda run --no-capture-output -n sam3 python -m downstream_analysis.clustering \
-  --project-dir /sc/arion/projects/KennyComputational/Behavior/projects/3c9bddf2-Home-Cage-Interactions-0126-test-day \
+  --project-dir /path/to/project \
   --skip-mask-verification
 ```
 
@@ -121,8 +118,6 @@ plots/
   enrichment_bars.png
   feature_violins.png
   ethograms/ethogram_<vid>.png     # per-video behavioral timelines
-bsub_jobs/                         # generated .lsf files
-bsub_logs/                         # stdout/stderr from jobs
 summary.json                       # run metadata and cluster counts
 clustering_report.xlsx             # Excel workbook (tables + embedded plots)
 ```
@@ -133,10 +128,7 @@ Multi-project merged runs use the same layout under ``--output-dir`` (typically
 
 ## Troubleshooting
 
-- **Job failed?** Check `bsub_logs/feat_<vid>.err`. Re-submit individual jobs:
-  `bsub < bsub_jobs/feat_<vid>.lsf`
-
-- **Skip already-cached videos when re-submitting:**
-  `python generate_bsub_jobs.py --project-dir /path --skip-cached --submit-all`
+- **Job failed?** Check `logs/hpc/feat_<vid>_<jobid>.err`, then re-submit only
+  what's missing: `python scripts/hpc_submit.py features /path --skip-cached`
 
 - **No output from pipeline?** Use `conda run --no-capture-output` (conda buffers stderr).

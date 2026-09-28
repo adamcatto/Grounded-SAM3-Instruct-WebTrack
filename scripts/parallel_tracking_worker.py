@@ -15,7 +15,8 @@ Multi-GPU on one node (parallel_tracking.local_gpu_workers in env.yaml):
     the run if oom_reduce_concurrency is true. The FastAPI server is not multi-job-safe for all
     workloads — start with 1.
 
-Submit many LSF jobs with the same project directory for cross-node parallelism; combine with
+Submit many jobs against the same project directory for cross-node parallelism
+(`scripts/hpc_submit.py tracking PROJECT --count N`, Slurm or LSF); combine with
 local_gpu_workers for within-node parallelism.
 
 Claims file: one video id per line while in flight; released after success or failure.

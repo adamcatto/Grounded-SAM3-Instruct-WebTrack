@@ -14,10 +14,7 @@ else
 
     # ONLY do discovery if absolutely necessary
 
-    if [ -f "/sc/arion/work/$USER/miniconda3/etc/profile.d/conda.sh" ]; then
-        source "/sc/arion/work/$USER/miniconda3/etc/profile.d/conda.sh"
-
-    elif [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+    if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
         source "$HOME/miniconda3/etc/profile.d/conda.sh"
 
     elif command -v conda >/dev/null 2>&1; then

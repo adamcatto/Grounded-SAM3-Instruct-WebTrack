@@ -5,7 +5,7 @@ Run whole-video propagation (tracking) from the CLI for eligible videos in one p
 Use this when anchor frames are labeled in the web UI (or on disk) but propagation has not
 finished — e.g. after closing the browser, on a login node, or to retry failed jobs without
 clicking "Track Objects" again. For many videos in parallel on HPC, prefer
-``parallel_tracking_launcher.py`` (which calls ``parallel_tracking_worker.py`` over the same
+``hpc_submit.py tracking`` (which runs ``parallel_tracking_worker.py`` over the same
 HTTP/SSE propagate path).
 
 Eligibility (per video)
