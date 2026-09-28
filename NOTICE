@@ -1,0 +1,14 @@
+SAM3 WebTrack
+Copyright 2026 Adam Catto
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It downloads and uses third-party models that are NOT covered by that
+license and are not distributed with this repository:
+
+  - SAM 3 (Meta Platforms, Inc.) - SAM License
+    https://github.com/facebookresearch/sam3
+  - SAM 2 (Meta Platforms, Inc.) - Apache License 2.0
+    https://github.com/facebookresearch/sam2
+  - CoTracker3 (Meta Platforms, Inc.) - CC BY-NC 4.0 (non-commercial use only)
+    https://github.com/facebookresearch/co-tracker

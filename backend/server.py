@@ -78,7 +78,7 @@ async def _lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="SAM3 Web Tracker", version="1.0.0", lifespan=_lifespan)
+app = FastAPI(title="SAM3 Web Tracker", version=(Path(__file__).resolve().parents[1] / "VERSION").read_text().strip(), lifespan=_lifespan)
 
 # The browser talks to the backend through the Vite proxy (same origin), so CORS
 # is only needed when VITE_BACKEND_URL points the UI straight at this server.
