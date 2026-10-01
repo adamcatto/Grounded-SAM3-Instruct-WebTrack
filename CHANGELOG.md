@@ -5,6 +5,16 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/). Before 1.0, minor versions may
 change the API and on-disk project format.
 
+## [0.1.2] - 2026-10-01
+
+### Documentation
+
+- Added a copy-pasteable workflow for uploading a local project to an HPC
+  cluster, including an `rsync` dry run, transfer verification, symlink
+  behavior, and cluster-side `.env` configuration.
+- Added the project upload workflow to the README table of contents and aligned
+  the configuration reference with the `SAM3_PROJECTS_DIR` `.env` setup.
+
 ## [0.1.1] - 2026-10-01
 
 ### Changed
@@ -53,3 +63,4 @@ First tagged release.
 
 [0.1.0]: https://github.com/adamcatto/Grounded-SAM3-Instruct-WebTrack/releases/tag/v0.1.0
 [0.1.1]: https://github.com/adamcatto/Grounded-SAM3-Instruct-WebTrack/compare/v0.1.0...v0.1.1
+[0.1.2]: https://github.com/adamcatto/Grounded-SAM3-Instruct-WebTrack/compare/v0.1.1...v0.1.2
