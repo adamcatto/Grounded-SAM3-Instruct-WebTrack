@@ -53,8 +53,11 @@ npm install
 # Run vite directly (avoid broken .bin wrappers)
 # --------------------------------------------------
 
-# The app has no authentication and can browse the server filesystem, so only
-# listen on localhost by default. Use an SSH tunnel for remote access, or set
-# FRONTEND_HOST=0.0.0.0 to expose it to the network deliberately.
-FRONTEND_HOST="${FRONTEND_HOST:-127.0.0.1}"
+# Support the established lab/VPN workflow by listening on every interface.
+# The app has no authentication, so use FRONTEND_HOST=127.0.0.1 when the host
+# is not on a trusted network and access it through an SSH tunnel instead.
+FRONTEND_HOST="${FRONTEND_HOST:-0.0.0.0}"
+if [ "$FRONTEND_HOST" != "127.0.0.1" ] && [ "$FRONTEND_HOST" != "localhost" ]; then
+    echo "WARNING: Frontend has no authentication and will listen on $FRONTEND_HOST:5173"
+fi
 node node_modules/vite/bin/vite.js --host "$FRONTEND_HOST"

@@ -32,8 +32,13 @@ echo "Python: $(which python)"
 echo "Conda prefix: $CONDA_PREFIX"
 
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
-export SAM3_TRACKING_PROJECTS_DIR="${SAM3_TRACKING_PROJECTS_DIR:-/opt/projects/segmentation_tracking_projects/}"
-echo "SAM3 projects dir: $SAM3_TRACKING_PROJECTS_DIR"
+# Keep the documented precedence in backend/project_manager.py: an explicit
+# SAM3_TRACKING_PROJECTS_DIR wins, otherwise SAM3_PROJECTS_DIR supplies the
+# project root. Export the legacy name as the portable default so setting only
+# SAM3_PROJECTS_DIR is not shadowed by a launcher-provided tracking override.
+export SAM3_PROJECTS_DIR="${SAM3_PROJECTS_DIR:-/opt/projects/segmentation_tracking_projects}"
+ACTIVE_SAM3_PROJECTS_DIR="${SAM3_TRACKING_PROJECTS_DIR:-$SAM3_PROJECTS_DIR}"
+echo "SAM3 projects dir: $ACTIVE_SAM3_PROJECTS_DIR"
 
 fuser -k 8000/tcp >/dev/null 2>&1 || true
 sleep 0.3

@@ -230,7 +230,8 @@ bash start_backend.sh
 bash start_frontend.sh
 ```
 
-Open `http://localhost:5173` in your browser.
+Open `http://localhost:5173` on the server or `http://<server-ip>:5173` from a
+client that can reach the server network.
 
 ### Stop
 
@@ -240,16 +241,16 @@ bash stop.sh
 
 ### Network access and security
 
-The app has **no authentication**, and its API can browse the server's filesystem, import files from arbitrary paths, and delete projects. For that reason both servers listen on `127.0.0.1` by default:
+The app has **no authentication**, and its API can browse the server's filesystem, import files from arbitrary paths, and delete projects. The backend listens on `127.0.0.1`, while the frontend listens on all interfaces by default to support the established trusted lab/VPN workflow:
 
-- **Remote use (recommended):** forward the frontend port over SSH and browse to `http://localhost:5173` locally:
+- **Trusted lab/VPN:** browse to `http://<server-ip>:5173`. Anyone who can reach the port gets full access to the app.
+- **Local-only/SSH (recommended for untrusted networks):** launch with `FRONTEND_HOST=127.0.0.1 bash start_frontend.sh`, forward the port, and browse to `http://localhost:5173` locally:
   `ssh -L 5173:localhost:5173 you@gpu-node`
-- **Expose on a trusted network:** `FRONTEND_HOST=0.0.0.0 bash start_frontend.sh`. Anyone who can reach the port gets full access to the app.
 - The browser only ever talks to the Vite server; `/api` is proxied to the backend on `127.0.0.1:8000`, so the backend never needs to be exposed.
 
 | Variable             | Default                                         | Purpose                                                          |
 | -------------------- | ----------------------------------------------- | ---------------------------------------------------------------- |
-| `FRONTEND_HOST`      | `127.0.0.1`                                     | Interface the Vite server binds to                               |
+| `FRONTEND_HOST`      | `0.0.0.0`                                       | Interface the Vite server binds to                               |
 | `BACKEND_HOST`       | `127.0.0.1`                                     | Interface uvicorn binds to                                       |
 | `CORS_ALLOW_ORIGINS` | `http://localhost:5173,http://127.0.0.1:5173`   | Comma-separated origins allowed to call the API directly (`*` is ignored) |
 
@@ -628,7 +629,7 @@ cp configs/env_template.yaml configs/env.yaml
 # 7. Verify the web app
 bash start_backend.sh    # terminal 1
 bash start_frontend.sh   # terminal 2
-# Open http://localhost:5173
+# Open http://localhost:5173 or http://<server-ip>:5173
 ```
 
 Add the `export SAM3_TRACKING_PROJECTS_DIR=...` line to your `~/.bashrc` (or job preamble) so the backend, downstream CLIs, and HPC workers all resolve the same project folders.
@@ -659,8 +660,8 @@ export HF_TOKEN=hf_...
 **Example — frontend on laptop, backend on GPU node:**
 
 ```bash
-# On the GPU machine: run both servers (they bind to 127.0.0.1)
-bash start.sh
+# On the GPU machine: keep the frontend local-only for the SSH tunnel
+FRONTEND_HOST=127.0.0.1 bash start.sh
 
 # On your laptop: tunnel the UI port, then open http://localhost:5173
 ssh -L 5173:localhost:5173 you@gpu-node.your.cluster
@@ -882,7 +883,7 @@ Use `--batch-correction zscore_per_batch` if some batches are very small (<10 wi
 | -------------------------------- | ------------------------------------------------------------------- |
 | Store projects on shared disk    | `SAM3_TRACKING_PROJECTS_DIR`                                        |
 | Download SAM3 weights            | `HF_TOKEN` + `scripts/download_model.py`                            |
-| UI on laptop, GPU server remote  | SSH tunnel to port 5173 (see Network access and security)           |
+| UI on laptop, GPU server remote  | Server IP over trusted VPN, or SSH tunnel to port 5173              |
 | HPC jobs (Slurm / LSF)           | `configs/env.yaml → hpc` (from `env_template.yaml`)                 |
 | Multi-GPU on one node            | `parallel_tracking.local_gpu_workers` + `auto_start_local_backends` |
 | Fewer/more behavior clusters     | `--resolution` (re-run clustering only)                             |
