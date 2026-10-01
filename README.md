@@ -216,7 +216,11 @@ cd Grounded-SAM3-Instruct-WebTrack
 # 2. Run the setup script (installs backend deps, SAM3, frontend deps)
 bash setup.sh
 
-# 3. Download model weights (requires HuggingFace token)
+# 3. Configure the machine-local projects directory
+cp .env.example .env
+# Edit .env and replace /path/to/projects/folder with your projects directory.
+
+# 4. Download model weights (requires HuggingFace token)
 HF_TOKEN=hf_your_token conda run -n sam3 python scripts/download_model.py
 ```
 
@@ -250,9 +254,16 @@ The app has **no authentication**, and its API can browse the server's filesyste
 
 | Variable             | Default                                         | Purpose                                                          |
 | -------------------- | ----------------------------------------------- | ---------------------------------------------------------------- |
+| `SAM3_PROJECTS_DIR`  | `.env`, when configured                         | Directory containing SAM3 project folders                        |
+| `SAM3_TRACKING_PROJECTS_DIR` | _(unset)_                              | Higher-priority override for the projects directory               |
 | `FRONTEND_HOST`      | `0.0.0.0`                                       | Interface the Vite server binds to                               |
 | `BACKEND_HOST`       | `127.0.0.1`                                     | Interface uvicorn binds to                                       |
 | `CORS_ALLOW_ORIGINS` | `http://localhost:5173,http://127.0.0.1:5173`   | Comma-separated origins allowed to call the API directly (`*` is ignored) |
+
+`start_backend.sh` loads `SAM3_PROJECTS_DIR` from the gitignored root `.env`
+when the variable is not already present in the shell. Copy `.env.example` to
+`.env` for each installation; command-line environment variables take
+precedence, and `SAM3_TRACKING_PROJECTS_DIR` takes precedence over both.
 
 Only open project folders you trust. Mask data is decoded with a restricted unpickler, but project folders are still arbitrary files on disk.
 

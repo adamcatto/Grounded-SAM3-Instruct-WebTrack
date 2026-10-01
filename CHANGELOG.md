@@ -5,6 +5,21 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/). Before 1.0, minor versions may
 change the API and on-disk project format.
 
+## [0.1.1] - 2026-10-01
+
+### Changed
+
+- Restored remote frontend access for trusted lab/VPN networks by listening on
+  `0.0.0.0` by default, while retaining `FRONTEND_HOST=127.0.0.1` for local or
+  SSH-tunneled access.
+- Added machine-local project-root configuration through a gitignored `.env`
+  file, with a portable `.env.example` template and shell-variable overrides.
+
+### Security
+
+- Added a startup warning and documentation that remotely exposing the
+  frontend grants unauthenticated access to the application.
+
 ## [0.1.0] - 2026-09-28
 
 First tagged release.
@@ -37,3 +52,4 @@ First tagged release.
   python-multipart, Pillow, Vite 7, axios); `npm audit` clean.
 
 [0.1.0]: https://github.com/adamcatto/Grounded-SAM3-Instruct-WebTrack/releases/tag/v0.1.0
+[0.1.1]: https://github.com/adamcatto/Grounded-SAM3-Instruct-WebTrack/compare/v0.1.0...v0.1.1
