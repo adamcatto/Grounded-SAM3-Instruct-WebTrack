@@ -65,6 +65,7 @@ also supports `COTRACKER3_CHECKPOINT` or automatic Hugging Face download.
 <details>
 <summary><strong>HPC &amp; automation</strong></summary>
 
+- [Upload a Project to an HPC Cluster](#upload-a-project-to-an-hpc-cluster)
 - [HPC Batch Processing](#hpc-batch-processing)
   - [Parallel Tracking (Propagation)](#parallel-tracking-propagation)
   - [Feature Extraction and Behavior Quantification](#feature-extraction-and-behavior-quantification)
@@ -503,6 +504,58 @@ conda run --no-capture-output -n sam3 python -m downstream_analysis.clustering.m
 
 ---
 
+## Upload a Project to an HPC Cluster
+
+A SAM3 project is the directory that contains `config.json`. From the repository
+on your **local machine**, use the included `rsync` helper to copy one project to
+the cluster. This requires working SSH access and `rsync` on both machines.
+
+```bash
+# Replace these three example values.
+LOCAL_PROJECT=/path/to/local/projects/ab12-my-project
+CLUSTER_PROJECTS=user@cluster.example.edu:/path/to/shared/sam3-projects
+
+# Create the destination parent once.
+ssh user@cluster.example.edu 'mkdir -p /path/to/shared/sam3-projects'
+
+# Preview the upload without changing the cluster.
+RSYNC_EXTRA="--dry-run" bash scripts/sync_project_to_remote.sh \
+  "$LOCAL_PROJECT" "$CLUSTER_PROJECTS"
+
+# Upload the project.
+bash scripts/sync_project_to_remote.sh "$LOCAL_PROJECT" "$CLUSTER_PROJECTS"
+```
+
+The destination will be
+`/path/to/shared/sam3-projects/ab12-my-project/`. The helper copies the actual
+contents of symlinked source videos, so check the dry-run output and available
+cluster storage before a large transfer. It is safe to rerun the same command;
+`rsync` transfers only files that still differ.
+
+Verify the upload from the local machine:
+
+```bash
+ssh user@cluster.example.edu \
+  'test -f /path/to/shared/sam3-projects/ab12-my-project/config.json && du -sh /path/to/shared/sam3-projects/ab12-my-project'
+```
+
+Finally, in the repository clone **on the cluster**, copy `.env.example` to
+`.env` and set the remote projects parent:
+
+```bash
+cd /path/to/Grounded-SAM3-Instruct-WebTrack
+cp .env.example .env
+```
+
+```dotenv
+SAM3_PROJECTS_DIR=/path/to/shared/sam3-projects
+```
+
+You can then open the uploaded project in the web app or pass its full path to
+the [HPC batch commands](#hpc-batch-processing).
+
+---
+
 ## HPC Batch Processing
 
 Tracking and feature extraction parallelize across videos on **Slurm** or **LSF**. `scripts/hpc_submit.py` renders an `#SBATCH` / `#BSUB` script from the `hpc:` block of `configs/env.yaml` and submits it; the scheduler is auto-detected from `sbatch` / `bsub` on `PATH` (or set `hpc.scheduler`). See [HPC configuration](#hpc-configuration-configsenvyaml).
@@ -562,6 +615,8 @@ examples including `--list-only`.
 | `scripts/run_pending_inference.py`      | CLI propagation for eligible videos (dry-run with `--list-only`, or run sequentially) |
 | `scripts/merge_projects.py`             | Merge two SAM3 projects (combine configs, videos)                     |
 | `scripts/migrate_masks_sqlite.py`       | Migrate legacy NPZ/JSON masks to SQLite storage                       |
+| `scripts/sync_project_to_remote.sh`     | Upload one complete project to a remote machine with `rsync`          |
+| `scripts/sync_project_from_remote.sh`   | Pull tracked project data back and repair local video references      |
 
 ### `run_pending_inference.py`
 
@@ -627,7 +682,8 @@ cd Grounded-SAM3-Instruct-WebTrack
 bash setup.sh
 
 # 4. Point project storage at a writable location (see below)
-export SAM3_TRACKING_PROJECTS_DIR=/path/to/your/projects
+cp .env.example .env
+# Edit .env: SAM3_PROJECTS_DIR=/path/to/your/projects
 
 # 5. Download model weights (requires HuggingFace access to facebook/sam3)
 export HF_TOKEN=hf_your_token_here
@@ -643,7 +699,13 @@ bash start_frontend.sh   # terminal 2
 # Open http://localhost:5173 or http://<server-ip>:5173
 ```
 
-Add the `export SAM3_TRACKING_PROJECTS_DIR=...` line to your `~/.bashrc` (or job preamble) so the backend, downstream CLIs, and HPC workers all resolve the same project folders.
+The gitignored `.env` configures `start_backend.sh` on each machine. For batch
+jobs or commands that do not launch through that script, export the same value
+in the job preamble so every process resolves the same project folders:
+
+```bash
+export SAM3_PROJECTS_DIR=/path/to/your/projects
+```
 
 On shared HPC filesystems, prefer a project directory under your allocation (e.g. `/path/to/lab/projects/`) rather than `/opt/projects/segmentation_tracking_projects`, so jobs on compute nodes see the same data as your interactive sessions.
 
@@ -654,8 +716,8 @@ On shared HPC filesystems, prefer a project directory under your allocation (e.g
 
 | Variable                     | Default                 | Used by                      | Description                                                                                                                                               |
 | ---------------------------- | ----------------------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `SAM3_TRACKING_PROJECTS_DIR` | `/opt/projects/segmentation_tracking_projects` | Backend, downstream analysis | Root folder for all SAM3 project directories. **Set this first** on any machine that runs tracking or analysis.                                           |
-| `SAM3_PROJECTS_DIR`          | (same as above)         | Backend, downstream analysis | Legacy alias; if both are set, `SAM3_TRACKING_PROJECTS_DIR` wins.                                                                                         |
+| `SAM3_PROJECTS_DIR`          | `.env`, when configured | Backend, downstream analysis | Root folder for all SAM3 project directories. `start_backend.sh` loads it from the repository's gitignored `.env`.                                        |
+| `SAM3_TRACKING_PROJECTS_DIR` | _(unset)_                | Backend, downstream analysis | Higher-priority override for the project root; useful in a batch-job preamble.                                                                             |
 | `HF_TOKEN`                   | —                       | `scripts/download_model.py`  | HuggingFace token for downloading gated SAM3 weights.                                                                                                     |
 | `SAM3_ENV_YAML`              | `configs/env.yaml`      | Parallel tracking scripts    | Path to YAML config for HPC propagation workers (see below).                                                                                              |
 | `VITE_BACKEND_URL`           | _(empty)_               | Frontend (build-time)        | Backend URL for direct API calls, bypassing the Vite dev proxy. Normally leave unset and use an SSH tunnel (see [Network access and security](#network-access-and-security)). |
@@ -678,7 +740,11 @@ FRONTEND_HOST=127.0.0.1 bash start.sh
 ssh -L 5173:localhost:5173 you@gpu-node.your.cluster
 ```
 
-The backend reads `SAM3_TRACKING_PROJECTS_DIR` at startup. You can also change the active projects root at runtime from the UI (project drawer → set projects folder); that override applies to the running server process only and does not change downstream CLI behavior — CLIs always use the env var.
+The backend reads `SAM3_TRACKING_PROJECTS_DIR` or `SAM3_PROJECTS_DIR` at
+startup, in that priority order. You can also change the active projects root
+at runtime from the UI (project drawer → set projects folder); that override
+applies to the running server process only and does not change downstream CLI
+behavior — CLIs always use the environment variable.
 
 ---
 
@@ -892,7 +958,7 @@ Use `--batch-correction zscore_per_batch` if some batches are very small (<10 wi
 
 | Goal                             | What to configure                                                   |
 | -------------------------------- | ------------------------------------------------------------------- |
-| Store projects on shared disk    | `SAM3_TRACKING_PROJECTS_DIR`                                        |
+| Store projects on shared disk    | `.env` → `SAM3_PROJECTS_DIR`                                        |
 | Download SAM3 weights            | `HF_TOKEN` + `scripts/download_model.py`                            |
 | UI on laptop, GPU server remote  | Server IP over trusted VPN, or SSH tunnel to port 5173              |
 | HPC jobs (Slurm / LSF)           | `configs/env.yaml → hpc` (from `env_template.yaml`)                 |
