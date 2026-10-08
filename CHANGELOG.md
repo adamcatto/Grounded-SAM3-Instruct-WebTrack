@@ -5,6 +5,26 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/). Before 1.0, minor versions may
 change the API and on-disk project format.
 
+## [0.2.0] - 2026-10-08
+
+### Added
+
+- `start_backend.sh` now launches the chat agent's vLLM server on port 8001
+  (detached, survives backend restarts) when it is not already running.
+  Select the model with `AGENT_LLM_PROFILE` (`a100-shared` default, `a100`,
+  `h100x4`) and skip with `AGENT_LLM_AUTOSTART=0`. Logs go to
+  `logs/vllm_agent.log`.
+
+### Fixed
+
+- Cleared masks no longer reappear after clearing a range or using Start Over:
+  the backend cancels running propagation, anchor-remainder and agent tasks
+  before wiping, mask responses are no longer cached as `immutable`, recreated
+  mask stores never reuse an old ETag, and in-flight mask fetches issued before
+  a clear are discarded.
+- Clearing masks over a range now includes annotated frames that were never
+  propagated.
+
 ## [0.1.2] - 2026-10-01
 
 ### Documentation
@@ -64,3 +84,4 @@ First tagged release.
 [0.1.0]: https://github.com/adamcatto/Grounded-SAM3-Instruct-WebTrack/releases/tag/v0.1.0
 [0.1.1]: https://github.com/adamcatto/Grounded-SAM3-Instruct-WebTrack/compare/v0.1.0...v0.1.1
 [0.1.2]: https://github.com/adamcatto/Grounded-SAM3-Instruct-WebTrack/compare/v0.1.1...v0.1.2
+[0.2.0]: https://github.com/adamcatto/Grounded-SAM3-Instruct-WebTrack/compare/v0.1.2...v0.2.0
