@@ -53,6 +53,32 @@ else
     echo "Tip: cp .env.example .env and edit SAM3_PROJECTS_DIR"
 fi
 
+# --------------------------------------------------
+# Agent LLM (vLLM on :8001)
+# --------------------------------------------------
+# The chat agent auto-detects vLLM on :8001 and otherwise falls back to
+# Ollama, so start vLLM alongside the backend. It runs detached and survives
+# backend restarts (model load takes minutes). Set AGENT_LLM_AUTOSTART=0 to
+# skip, e.g. when AGENT_LLM_BASE_URL points at a remote server.
+# a100-shared fits next to SAM3 on one 80GB GPU; use a100/h100x4 for a
+# dedicated LLM GPU.
+export AGENT_LLM_PROFILE="${AGENT_LLM_PROFILE:-a100-shared}"
+VLLM_PORT="${VLLM_PORT:-8001}"
+if [ "${AGENT_LLM_AUTOSTART:-1}" != "0" ]; then
+    if fuser "$VLLM_PORT/tcp" >/dev/null 2>&1 || pgrep -u "$(id -u)" -f "vllm serve" >/dev/null 2>&1; then
+        echo "Agent LLM: vLLM already running (port $VLLM_PORT)"
+    else
+        mkdir -p "$SCRIPT_DIR/logs"
+        echo "Agent LLM: starting vLLM (profile $AGENT_LLM_PROFILE) on :$VLLM_PORT"
+        echo "  log: $SCRIPT_DIR/logs/vllm_agent.log"
+        # Clean LD_LIBRARY_PATH: the sam3 env libs exported above must not
+        # shadow the vllm env (serve_agent_llm.sh adds its own lib dir).
+        LD_LIBRARY_PATH="" VLLM_PORT="$VLLM_PORT" setsid nohup bash "$SCRIPT_DIR/scripts/serve_agent_llm.sh" vllm \
+            --profile "$AGENT_LLM_PROFILE" \
+            > "$SCRIPT_DIR/logs/vllm_agent.log" 2>&1 < /dev/null &
+    fi
+fi
+
 fuser -k 8000/tcp >/dev/null 2>&1 || true
 sleep 0.3
 

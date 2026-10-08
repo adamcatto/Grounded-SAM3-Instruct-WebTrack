@@ -14,6 +14,18 @@ type InFlightKey = string
 const inFlightPerObject = new Map<InFlightKey, Promise<MaskData | null>>()
 const inFlightDisplay = new Map<InFlightKey, Promise<ImageBitmap | null>>()
 
+// Bumped whenever masks are cleared / the video is reset. Responses to requests
+// issued under an older generation are dropped, so a fetch that was in flight
+// during the clear cannot repopulate the caches with the cleared masks.
+let generation = 0
+
+/** Forget all in-flight mask requests and discard their results when they land. */
+export function invalidateMaskLoader(): void {
+  generation += 1
+  inFlightPerObject.clear()
+  inFlightDisplay.clear()
+}
+
 function perObjectKey(pid: string, vid: string, fidx: number): InFlightKey {
   return `obj:${pid}/${vid}/${fidx}`
 }
@@ -32,13 +44,15 @@ export async function loadPerObjectMasks(
   const existing = inFlightPerObject.get(k)
   if (existing) return existing
 
+  const gen = generation
   const promise = getSavedMask(pid, vid, fidx)
     .then(data => {
+      if (gen !== generation) return null
       const masks = data.masks ?? {}
       return Object.keys(masks).length > 0 ? masks : null
     })
     .catch(() => null)
-    .finally(() => { inFlightPerObject.delete(k) })
+    .finally(() => { if (inFlightPerObject.get(k) === promise) inFlightPerObject.delete(k) })
 
   inFlightPerObject.set(k, promise)
   return promise
@@ -59,18 +73,23 @@ export async function loadDisplayBitmap(
   const existing = inFlightDisplay.get(k)
   if (existing) return existing
 
+  const gen = generation
   const promise = fetch(displayMaskUrl(pid, vid, fidx), { cache: 'no-store', signal })
     .then(async resp => {
       if (resp.status === 404) return null
       if (!resp.ok) throw new Error(`display ${resp.status}`)
       const blob = await resp.blob()
-      if (blob.size === 0) return null
+      if (blob.size === 0 || gen !== generation) return null
       const bitmap = await createImageBitmap(blob)
+      if (gen !== generation) {
+        bitmap.close()
+        return null
+      }
       setCompositeBitmap(pid, vid, fidx, bitmap)
       return bitmap
     })
     .catch(() => null)
-    .finally(() => { inFlightDisplay.delete(k) })
+    .finally(() => { if (inFlightDisplay.get(k) === promise) inFlightDisplay.delete(k) })
 
   inFlightDisplay.set(k, promise)
   return promise

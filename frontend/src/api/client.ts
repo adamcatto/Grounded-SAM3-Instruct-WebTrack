@@ -313,7 +313,7 @@ export interface CacheManifest {
 }
 
 export const getCacheManifest = (pid: string, vid: string) =>
-  api.get<CacheManifest>(`/projects/${pid}/videos/${vid}/cache/manifest`).then(r => r.data)
+  getJsonRevalidated<CacheManifest>(`/projects/${pid}/videos/${vid}/cache/manifest`)
 
 export const thumbUrl = frameUrl
 
@@ -450,9 +450,17 @@ export const swapObjectMasks = (
     { obj_a: objA, obj_b: objB, ...(fromFrame != null ? { from_frame: fromFrame } : {}), ...(toFrame != null ? { to_frame: toFrame } : {}) }
   ).then(r => r.data)
 
+// Masks change on clear / reset under the same URL, so always revalidate with
+// the server (ETag → cheap 304). `cache: 'no-cache'` also overrides entries a
+// browser stored as `immutable` before the backend stopped sending that.
+async function getJsonRevalidated<T>(path: string): Promise<T> {
+  const resp = await fetch(`/api${path}`, { cache: 'no-cache' })
+  if (!resp.ok) throw new Error(`GET ${path} failed: ${resp.status}`)
+  return resp.json() as Promise<T>
+}
+
 export const getSavedMask = (pid: string, vid: string, fidx: number) =>
-  api.get<{ frame_idx: number; masks: MaskData }>(`/projects/${pid}/videos/${vid}/masks/${fidx}`)
-    .then(r => r.data)
+  getJsonRevalidated<{ frame_idx: number; masks: MaskData }>(`/projects/${pid}/videos/${vid}/masks/${fidx}`)
 
 /**
  * Predict masks for all objects on a single frame using the annotated inference
