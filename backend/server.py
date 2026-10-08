@@ -23,6 +23,7 @@ import io
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
@@ -654,6 +655,32 @@ def _drop_session_after_prompt_clear(pid: str, vid: str) -> None:
         logger.warning(f"Failed to drop SAM session after prompt clear: {e}")
 
 
+async def _stop_background_inference(pid: str, vid: str) -> None:
+    """Cancel propagation / anchor-remainder tasks for a video and wait for them.
+
+    Both run as background tasks independent of their SSE stream, and persist
+    masks as they go — so clearing masks or resetting a video while one runs
+    would have the cleared masks written straight back.
+    """
+    prop = _get_prop_state(pid, vid)
+    rm = _get_anchor_remainder_state(pid, vid)
+    tasks = [t for t in (prop.task, rm.task) if t is not None and not t.done()]
+    for t in tasks:
+        t.cancel()
+    if tasks:
+        logger.info(f"Stopping {len(tasks)} background inference task(s) for {pid}/{vid}")
+        await asyncio.wait(tasks, timeout=30)
+        # Cancelled tasks publish no terminal event; tell open SSE streams.
+        stopped = {"event": "error", "data": json.dumps({"error": "Tracking stopped: masks were cleared"})}
+        await prop.publish(stopped)
+        await rm.publish(stopped)
+    prop.is_running = False
+    prop.is_paused = False
+    prop.paused_at_frame = -1
+    rm.is_running = False
+    rm.waiting_review = False
+
+
 def _mask_storage_etag(pid: str, vid: str, fidx: int) -> str:
     """Stable ETag from on-disk mask storage revision (invalidates on edit)."""
     ms = VideoMaskStorage(pm.video_dir(pid, vid))
@@ -662,9 +689,12 @@ def _mask_storage_etag(pid: str, vid: str, fidx: int) -> str:
 
 
 def _mask_cache_headers(etag: str) -> dict[str, str]:
+    # These URLs are not versioned and their content changes on clear/reset, so
+    # the browser must revalidate every time (a 304 keeps it cheap). Never mark
+    # them immutable: cleared masks would keep reappearing from the HTTP cache.
     return {
         "ETag": etag,
-        "Cache-Control": "public, max-age=86400, immutable",
+        "Cache-Control": "private, no-cache",
     }
 
 
@@ -1954,7 +1984,7 @@ def remove_video(pid: str, vid: str):
 
 
 @app.post("/api/projects/{pid}/videos/{vid}/reset", status_code=200)
-def reset_video(pid: str, vid: str, keep_objects: bool = False):
+async def reset_video(pid: str, vid: str, keep_objects: bool = False):
     """
     Clear all annotations and tracking data for a video while keeping the
     video file itself.  Removes:
@@ -1962,9 +1992,26 @@ def reset_video(pid: str, vid: str, keep_objects: bool = False):
       - Annotated frames (annotated_frames/) and preview frames (frames/)
       - Active SAM session, propagation flags, in-memory mask cache
     Objects are deleted unless keep_objects=true (E2E / re-annotate in place).
+
+    Running propagation / anchor-remainder tasks and agent runs are stopped
+    first, otherwise they keep writing masks (or objects) after the wipe.
     """
     logger.info(f"=== RESET VIDEO {vid} in project {pid} keep_objects={keep_objects} ===")
 
+    if pm.get_video(pid, vid) is None:
+        raise HTTPException(404, "Video not found")
+
+    if not keep_objects:
+        try:
+            from agent import cancel_agent_run
+            cancel_agent_run(pid)
+        except Exception as e:
+            logger.warning(f"Could not cancel agent run on reset: {e}")
+    await _stop_background_inference(pid, vid)
+    return await run_in_threadpool(_reset_video_sync, pid, vid, keep_objects)
+
+
+def _reset_video_sync(pid: str, vid: str, keep_objects: bool) -> dict:
     video = pm.get_video(pid, vid)
     if video is None:
         raise HTTPException(404, "Video not found")
@@ -3514,8 +3561,16 @@ def _delete_masks_in_range(
 
 
 @app.delete("/api/projects/{pid}/videos/{vid}/masks/{fidx}")
-def delete_frame_masks(pid: str, vid: str, fidx: int):
+async def delete_frame_masks(pid: str, vid: str, fidx: int):
     """Delete saved masks for a single frame (.npz and .json bbox files)."""
+    if pm.get_video(pid, vid) is None:
+        raise HTTPException(404, "Video not found")
+    # A running propagation would write this frame's masks straight back.
+    await _stop_background_inference(pid, vid)
+    return await run_in_threadpool(_delete_frame_masks_sync, pid, vid, fidx)
+
+
+def _delete_frame_masks_sync(pid: str, vid: str, fidx: int):
     video = pm.get_video(pid, vid)
     if video is None:
         raise HTTPException(404, "Video not found")
@@ -3558,7 +3613,7 @@ def delete_frame_masks(pid: str, vid: str, fidx: int):
 
 
 @app.delete("/api/projects/{pid}/videos/{vid}/masks")
-def bulk_delete_masks(
+async def bulk_delete_masks(
     pid: str, vid: str,
     mode: str = "all",
     from_frame: Optional[int] = None,
@@ -3573,6 +3628,19 @@ def bulk_delete_masks(
       to_frame   – delete from start to to_frame
       range      – delete from from_frame to to_frame (inclusive)
     """
+    if pm.get_video(pid, vid) is None:
+        raise HTTPException(404, "Video not found")
+    # A running propagation would write the cleared masks straight back.
+    await _stop_background_inference(pid, vid)
+    return await run_in_threadpool(_bulk_delete_masks_sync, pid, vid, mode, from_frame, to_frame)
+
+
+def _bulk_delete_masks_sync(
+    pid: str, vid: str,
+    mode: str,
+    from_frame: Optional[int],
+    to_frame: Optional[int],
+):
     video = pm.get_video(pid, vid)
     if video is None:
         raise HTTPException(404, "Video not found")

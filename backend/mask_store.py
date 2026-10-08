@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import time
 from pathlib import Path
 
 import numpy as np
@@ -76,8 +77,12 @@ class VideoMaskStorage:
         conn.execute(
             "INSERT OR IGNORE INTO mask_store_meta(key,value) VALUES ('seg_codec','rle_picklezlib_v1')"
         )
+        # Seed the revision from the clock (µs, still JSON-safe) so a store that
+        # is wiped and recreated never reuses a revision — and therefore an
+        # ETag — that a browser may still hold for the old masks.
         conn.execute(
-            "INSERT OR IGNORE INTO mask_store_meta(key,value) VALUES ('cache_revision','0')"
+            "INSERT OR IGNORE INTO mask_store_meta(key,value) VALUES ('cache_revision', ?)",
+            (str(time.time_ns() // 1000),),
         )
         conn.commit()
 

@@ -11,7 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 **Start everything:**
 ```bash
 bash start.sh                  # Launches backend + frontend together
-bash start_backend.sh          # Backend only (port 8000)
+bash start_backend.sh          # Backend only (port 8000); also starts the agent vLLM on :8001 if not running (AGENT_LLM_AUTOSTART=0 to skip)
 bash start_frontend.sh         # Frontend only (port 5173)
 bash stop.sh                   # Kill both servers
 ```

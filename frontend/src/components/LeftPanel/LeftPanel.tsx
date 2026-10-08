@@ -16,6 +16,7 @@ import {
 } from '../../api/client'
 import { getObjectColor } from '../../utils/colors'
 import { clearMaskCache } from '../../utils/maskUtils'
+import { invalidateMaskLoader } from '../../utils/maskLoader'
 import { clearCompositeCache, evictCompositeFrame } from '../../utils/compositeMaskCache'
 import {
   ANCHOR_BATCH_SIZE_MAX,
@@ -1190,6 +1191,10 @@ export default function LeftPanel() {
     if (mode === 'this_frame') return [f0]
     const pool = new Set<number>([...(video?.propagated_frames ?? [])])
     for (const k of Object.keys(savedMaskCache)) pool.add(Number(k))
+    // Annotated-but-not-propagated frames also carry masks (from their prompts).
+    for (const fmap of Object.values(video?.point_prompts ?? {})) {
+      for (const k of Object.keys((fmap || {}) as object)) pool.add(Number(k))
+    }
     const sorted = [...pool].filter(f => f >= 0 && f <= cap).sort((a, b) => a - b)
     if (mode === 'from_frame') return sorted.filter(f => f >= f0)
     if (mode === 'all') return sorted
@@ -1282,7 +1287,9 @@ export default function LeftPanel() {
       }
       // Drop the cleared frames from every client-side mask cache. The canvas
       // prefers the composite display bitmap over the store, so evicting only
-      // the store cache leaves the old overlay on screen.
+      // the store cache leaves the old overlay on screen. In-flight fetches
+      // are invalidated too, or they land afterwards and restore the masks.
+      invalidateMaskLoader()
       for (const f of frames) {
         evictCompositeFrame(pid, vid, f)
         setSavedMask(f, {})
@@ -1326,6 +1333,7 @@ export default function LeftPanel() {
               await clearMasksBulk(pid, vid, 'all')
             }
           } catch { /* ignore */ }
+          invalidateMaskLoader()
           for (const f of frames) {
             evictCompositeFrame(pid, vid, f)
             setSavedMask(f, {})
@@ -1382,16 +1390,26 @@ export default function LeftPanel() {
 
   // ── Start Over ───────────────────────────────────────────────────────────────
 
+  function _dropAllClientMasks() {
+    invalidateMaskLoader()
+    clearMaskCache()
+    clearCompositeCache()
+    resetVideoState()
+  }
+
   async function handleStartOver() {
     if (!pid || !vid) return
     activeEsRef.current?.close()
     activeEsRef.current = null
-    clearMaskCache()
-    clearCompositeCache()
+    _dropAllClientMasks()
+    // The backend stops any running propagation / agent run before wiping, so
+    // nothing writes masks back afterwards.
     await resetVideo(pid, vid)
+    // Drop again: requests issued while the reset was in flight (scrubbing,
+    // prefetch) may have repopulated the caches with pre-reset masks.
+    _dropAllClientMasks()
     const fresh = await getProject(pid)
     setProject(fresh)
-    resetVideoState()
   }
 
   if (!video) return null
